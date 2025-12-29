@@ -62,8 +62,8 @@ class ODDDataset(Dataset):
         targets: dict,
         scale_dict_path: str,
         num_events: int = -1,
-        num_objects: int = 150,
-        max_nodes: int = 160,
+        num_objects: int = 2000,
+        max_nodes: int = 1200,
         remove_wrong_idxs: bool = True,
         incidence_cutval: float = 1e-4,
         is_inference: bool = False,
@@ -98,9 +98,7 @@ class ODDDataset(Dataset):
         self.init_variables_list()
 
         # Input file handling
-        self.filepath = filepath
-        assert is_valid_file(filepath), f"Invalid file: {filepath}"
-
+        self.filedir = filepath
         # Store configuration
         self.inputs = inputs
         self.targets = targets
@@ -114,10 +112,10 @@ class ODDDataset(Dataset):
         print(f"Is inference: {self.is_inference}")
 
         # Load data from parquet
-        self.load_data(num_events)
+        self.load_data(filepath,num_events)
         gc.collect()
 
-    def load_data(self, num_events: int) -> None:
+    def load_data(self, file_dir: str, num_events: int) -> None:
         """
         Load data from parquet file(s) using Polars.
 
@@ -131,53 +129,98 @@ class ODDDataset(Dataset):
         # TODO: Load parquet file(s)
         # df = pl.read_parquet(self.filepath)
         # or if multiple files:
-        # df_particles = pl.read_parquet(f"{self.filepath}/truth_particles.parquet")
-        # df_clusters = pl.read_parquet(f"{self.filepath}/calo_clusters.parquet")
-        # df_tracks = pl.read_parquet(f"{self.filepath}/tracks.parquet")
+        df_particles = pl.read_parquet(f"{file_dir}/target_particles.parquet")
+        df_clusters = pl.read_parquet(f"{file_dir}/calo_clusters.parquet")
+        df_deps = pl.read_parquet(f"{file_dir}/target_particles_deps.parquet")
+        df_tracks = pl.read_parquet(f"{file_dir}/tracks.parquet")
 
-        # TODO: Join dataframes on event_id if needed
-        # df = df_particles.join(df_clusters, on="event_id").join(df_tracks, on="event_id")
+        n_tracks = df_tracks.select(pl.col("track_id").list.len()).to_series().to_numpy()
+        n_clusters = df_clusters.select(pl.col("cluster_id").list.len()).to_series().to_numpy()
+        n_particles = df_particles.select(pl.col("particle_id").list.len()).to_series().to_numpy()
+        n_deps = df_deps.select(pl.col("particle_idx").list.len()).to_series().to_numpy()
 
-        # TODO: Limit number of events
-        # if num_events > 0:
-        #     df = df.head(num_events)
 
-        # TODO: Extract arrays and convert to numpy
-        # Example for truth particles:
-        # self.full_data_array["particle_energy"] = df["energy"].to_numpy()
-        # self.full_data_array["particle_eta"] = df["eta"].to_numpy()
-        # self.full_data_array["particle_phi"] = df["phi"].to_numpy()
-        # self.full_data_array["particle_pdg_id"] = df["pdg_id"].to_numpy()
-        # self.full_data_array["particle_has_track"] = df["has_track"].to_numpy()
+        # 3. Filter Events
+        # ---------------------------------------------------------------------
+        n_nodes = n_tracks + n_clusters
+        mask = (n_nodes < self.max_nodes) & (n_particles < self.num_objects)
+        
+        print(f"Total events: {len(mask)}")
+        print(f"Removing {(~mask).sum()} events with too many nodes or particles")
+        
+        self.num_events = mask.sum()
+        
+        # Apply filter to counts
+        self.n_tracks = n_tracks[mask]
+        self.n_clusters = n_clusters[mask]
+        self.n_particles = n_particles[mask]
+        self.n_deps = n_deps[mask]
+        self.event_number = np.arange(self.num_events) # Or use df_tracks["event_id"].filter(mask)
 
-        # TODO: Compute derived features (sinphi, cosphi, pt from px/py)
-        # particle_phi = self.full_data_array["particle_phi"]
-        # self.full_data_array["particle_sinphi"] = np.sin(particle_phi)
-        # self.full_data_array["particle_cosphi"] = np.cos(particle_phi)
-        # self.full_data_array["particle_pt"] = np.sqrt(px**2 + py**2)
+        # Apply filter to DataFrames
+        df_tracks = df_tracks.filter(mask)
+        df_clusters = df_clusters.filter(mask)
+        df_particles = df_particles.filter(mask)
+        df_deps = df_deps.filter(mask)
 
-        # TODO: Count objects per event
-        # self.n_tracks = np.array([len(x) for x in self.full_data_array["track_d0"]])
-        # self.n_clusters = np.array([len(x) for x in self.full_data_array["cluster_energy"]])
-        # self.n_particles = np.array([len(x) for x in self.full_data_array["particle_energy"]])
+        # 4. Flatten and Store Features (Polars explode -> NumPy)
+        # ---------------------------------------------------------------------
+        
+        # --- Tracks ---
+        track_vars = ["d0", "z0", "phi", "theta",'eta', "qop", "majority_particle_id", "phi_int", "eta_int"]
+        for var in tqdm(track_vars, desc="Loading Tracks"):
+            # explode list column into flat array
+            flat_arr = df_tracks.select(pl.col(var).explode()).to_series().to_numpy()
+            self.full_data_array[f"track_{var}"] = flat_arr
 
-        # TODO: Apply event filtering (too many nodes, invalid indices, etc.)
-        # mask = ((self.n_tracks + self.n_clusters) < self.max_nodes) & \
-        #        (self.n_particles < self.num_objects)
+        self.full_data_array["track_sinphi"] = np.sin(self.full_data_array["track_phi"])
+        self.full_data_array["track_cosphi"] = np.cos(self.full_data_array["track_phi"])
 
-        # TODO: Flatten arrays and compute cumulative sums for indexing
-        # self.track_cumsum = np.cumsum([0, *self.n_tracks.tolist()])
-        # self.cluster_cumsum = np.cumsum([0, *self.n_clusters.tolist()])
-        # self.particle_cumsum = np.cumsum([0, *self.n_particles.tolist()])
+        # --- Clusters (Calo) ---
+        cluster_vars = ["total_cluster_energy", "cluster_cx", "cluster_cy", "cluster_cz"]
+        for var in tqdm(cluster_vars, desc="Loading Clusters"):
+            flat_arr = df_clusters.select(pl.col(var).explode()).to_series().to_numpy()
+            self.full_data_array[var] = flat_arr
 
-        # TODO: Store event numbers
-        # self.event_number = np.arange(self.num_events)
+        # Derived Cluster Features (Cartesian -> Spherical)
+        cx = self.full_data_array["cluster_cx"]
+        cy = self.full_data_array["cluster_cy"]
+        cz = self.full_data_array["cluster_cz"]
+        
+        r_perp = np.sqrt(cx**2 + cy**2)
+        theta_cl = np.arctan2(r_perp, cz)
+        
+        self.full_data_array["cluster_e"] = self.full_data_array["total_cluster_energy"]
+        self.full_data_array["cluster_eta"] = -np.log(np.tan(theta_cl / 2.0))
+        self.full_data_array["cluster_phi"] = np.arctan2(cy, cx)
+        self.full_data_array["cluster_sinphi"] = np.sin(self.full_data_array["cluster_phi"])
+        self.full_data_array["cluster_cosphi"] = np.cos(self.full_data_array["cluster_phi"])
 
-        # TODO: Set final number of events
-        # self.num_events = len(self.event_number)
+        # --- Particles (Truth) ---
+        particle_vars = ["energy", "eta", "phi", "pdg_id", "charge", "particle_id", "has_track", "pt"]
+        for var in tqdm(particle_vars, desc="Loading Particles"):
+            flat_arr = df_particles.select(pl.col(var).explode()).to_series().to_numpy()
+            self.full_data_array[f"particle_{var}"] = flat_arr
 
-        raise NotImplementedError("TODO: Implement load_data() for your parquet schema")
-
+        # Map PDG ID to Class
+        pdg_ids = self.full_data_array["particle_pdg_id"]
+        self.full_data_array["particle_class"] = torch.tensor([self.class_labels[x] for x in pdg_ids])
+        # --- Deps (Incidence) ---
+        deps_vars = ["total_energy_deps_in_cluster", "particle_idx", "cluster_idx"]
+        for var in tqdm(deps_vars, desc="Loading Deps"):
+            flat_arr = df_deps.select(pl.col(var).explode()).to_series().to_numpy()
+            self.full_data_array[f"deps_{var}"] = flat_arr
+        
+                # 6. Build CumSums for Indexing
+        # ---------------------------------------------------------------------
+        self.track_cumsum = np.cumsum([0, *self.n_tracks.tolist()])
+        self.cluster_cumsum = np.cumsum([0, *self.n_clusters.tolist()])
+        self.particle_cumsum = np.cumsum([0, *self.n_particles.tolist()])
+        self.deps_cumsum = np.cumsum([0, *self.n_deps.tolist()])
+        
+        self.n_nodes = self.n_tracks + self.n_clusters
+        print(f"Number of events after filtering: {self.num_events}")
+        raise NotImplementedError("TODO: Implement load_data() for your data schema")
     def __len__(self) -> int:
         return int(self.num_events)
 
@@ -203,54 +246,172 @@ class ODDDataset(Dataset):
             - indicator_truth: (num_objects,) tensor indicating valid particles
             - node_q_mask: (max_nodes,) boolean tensor indicating valid nodes
         """
-        # TODO: Get counts for this event
-        # n_clusters = self.n_clusters[idx]
-        # n_tracks = self.n_tracks[idx]
-        # n_particles = self.n_particles[idx]
-        # n_nodes = n_clusters + n_tracks
+        # 1. Calculate Slices
+        # ---------------------------------------------------------------------
+        n_tracks = self.n_tracks[idx]
+        n_clusters = self.n_clusters[idx]
+        n_particles = self.n_particles[idx]
+        n_nodes = n_tracks + n_clusters
+        
+        t_start, t_end = self.track_cumsum[idx], self.track_cumsum[idx+1]
+        c_start, c_end = self.cluster_cumsum[idx], self.cluster_cumsum[idx+1]
+        p_start, p_end = self.particle_cumsum[idx], self.particle_cumsum[idx+1]
+        d_start, d_end = self.deps_cumsum[idx], self.deps_cumsum[idx+1]
 
-        # TODO: Get index ranges
-        # cluster_start, cluster_end = self.cluster_cumsum[idx], self.cluster_cumsum[idx + 1]
-        # track_start, track_end = self.track_cumsum[idx], self.track_cumsum[idx + 1]
-        # particle_start, particle_end = self.particle_cumsum[idx], self.particle_cumsum[idx + 1]
+        # 2. Extract & Pad Input Features
+        # ---------------------------------------------------------------------
+        # Helper to get tensor slice
+        def get_t(name, start, end):
+            return self.full_data_array[name][start:end]
 
-        # TODO: Extract track features
-        # track_d0 = self.full_data_array["track_d0"][track_start:track_end]
-        # track_z0 = self.full_data_array["track_z0"][track_start:track_end]
-        # track_phi = self.full_data_array["track_phi"][track_start:track_end]
-        # track_theta = self.full_data_array["track_theta"][track_start:track_end]
-        # track_qop = self.full_data_array["track_qop"][track_start:track_end]
+        # --- Tracks ---
+        t_d0 = get_t("track_d0", t_start, t_end)
+        t_z0 = get_t("track_z0", t_start, t_end)
+        t_phi = get_t("track_phi", t_start, t_end)
+        t_theta = get_t("track_theta", t_start, t_end)
+        t_qop = get_t("track_qop", t_start, t_end)
+        t_eta = get_t("track_eta", t_start, t_end)
+        t_sinphi = get_t("track_sinphi", t_start, t_end)
+        t_cosphi = get_t("track_cosphi", t_start, t_end)
+        
+        # --- Clusters ---
+        c_e = get_t("cluster_e", c_start, c_end)
+        c_eta = get_t("cluster_eta", c_start, c_end)
+        c_phi = get_t("cluster_phi", c_start, c_end)
+        c_sinphi = get_t("cluster_sinphi", c_start, c_end)
+        c_cosphi = get_t("cluster_cosphi", c_start, c_end)
 
-        # TODO: Extract cluster features
-        # cluster_energy = self.full_data_array["cluster_energy"][cluster_start:cluster_end]
-        # cluster_cx = self.full_data_array["cluster_cx"][cluster_start:cluster_end]
-        # cluster_cy = self.full_data_array["cluster_cy"][cluster_start:cluster_end]
-        # cluster_cz = self.full_data_array["cluster_cz"][cluster_start:cluster_end]
+        # Scale Features (Assuming self.scaler exists as in CLIC)
+        # We construct the input dictionary matching ODD feature list: 
+        # [d0, z0, phi, theta, qop, energy, eta, is_track]
+        
+        # Note: We concatenate [Tracks, Clusters]
+        # Padding logic:
+        # Tracks have d0, z0, qop. Clusters have 0.
+        # Clusters have Energy. Tracks have 0 (or p? usually 0 in this specific input scheme)
+        
+        node_features = {
+            "d0": torch.cat([self.scaler.transforms["d0"].transform(t_d0), torch.zeros(n_clusters, device=t_d0.device)], -1),
+            "z0": torch.cat([self.scaler.transforms["z0"].transform(t_z0), torch.zeros(n_clusters, device=t_z0.device)], -1),
+            "phi": torch.cat([t_phi, c_phi], -1), # Usually not scaled, pos encoded
+            "theta": torch.cat([t_theta, 2*torch.atan(torch.exp(-c_eta))], -1),
+            "qop": torch.cat([self.scaler.transforms["qop"].transform(t_qop), torch.zeros(n_clusters, device=t_qop.device)], -1),
+            "energy": torch.cat([torch.zeros(n_tracks, device=c_e.device), self.scaler.transforms["energy"].transform(c_e)], -1),
+            "eta": torch.cat([self.scaler.transforms["eta"].transform(t_eta), self.scaler.transforms["eta"].transform(c_eta)], -1),
+            "is_track": torch.cat([torch.ones(n_tracks, device=t_d0.device), torch.zeros(n_clusters, device=t_d0.device)], -1)
+        }
 
-        # TODO: Build node features dictionary (tracks first, then clusters)
-        # node_features = {
-        #     "d0": torch.cat([scaled_track_d0, torch.zeros(n_clusters)], -1),
-        #     "z0": torch.cat([scaled_track_z0, torch.zeros(n_clusters)], -1),
-        #     "energy": torch.cat([torch.zeros(n_tracks), scaled_cluster_energy], -1),
-        #     "is_track": torch.cat([torch.ones(n_tracks), torch.zeros(n_clusters)], -1),
-        #     "is_cluster": torch.cat([torch.zeros(n_tracks), torch.ones(n_clusters)], -1),
-        #     # ... more features
-        # }
+        # Raw features (for regression baseline/analysis)
+        node_raw_features = {
+            "node_energy": torch.cat([torch.zeros(n_tracks), c_e], -1),
+            "node_pt": torch.cat([torch.zeros(n_tracks), c_e / torch.cosh(c_eta)], -1), # Approx pt for clusters
+            "node_eta": torch.cat([t_eta, c_eta], -1),
+            "node_phi": torch.cat([t_phi, c_phi], -1),
+            "node_sinphi": torch.cat([t_sinphi, c_sinphi], -1),
+            "node_cosphi": torch.cat([t_cosphi, c_cosphi], -1),
+            "node_is_track": torch.cat([torch.ones(n_tracks), torch.zeros(n_clusters)], -1)
+        }
 
-        # TODO: Build incidence matrix
-        # incidence_matrix = np.zeros((self.num_objects, n_nodes))
-        # ... populate based on majority_particle_id for tracks
-        # ... populate based on cluster-particle association
+        # Pad everything
+        for key, val in node_features.items():
+            node_features[key] = do_padding(val, self.max_nodes)
+        for key, val in node_raw_features.items():
+            node_raw_features[key] = do_padding(val, self.max_nodes)
 
-        # TODO: Build indicator (valid particle mask)
-        # indicator = torch.zeros(self.num_objects)
-        # indicator[:n_particles] = 1.0
+        # 3. Extract & Pad Target Particles
+        # ---------------------------------------------------------------------
+        p_class = get_t("particle_class", p_start, p_end).clone() # Clone to modify
+        p_has_track = get_t("particle_has_track", p_start, p_end)
+        
+        # Apply CLIC Logic for "Trackless" particles
+        # If a particle is Charged (0,1,2) but has no track, move to Neutral class (3,4)
+        if not self.is_inference:
+            # Shift ChHad(0)/Ele(1) -> Photon(3)/NuHad(4)
+            # 0->3, 1->4 (Using +3 logic)
+            mask_shift = (p_class < 2) & (~p_has_track)
+            p_class[mask_shift] += 3
+            
+            # Muon(2) -> NuHad(4)
+            mask_mu = (p_class == 2) & (~p_has_track)
+            p_class[mask_mu] = 4
+            
+            # Clamp to valid range (0-5, where 5 is null)
+            p_class = torch.clamp(p_class, 0, 4)
 
-        # TODO: Build node validity mask
-        # node_q_mask = torch.zeros(self.max_nodes, dtype=bool)
-        # node_q_mask[:n_nodes] = True
+        is_charged = p_class < 3
 
-        raise NotImplementedError("TODO: Implement load_event() for your data schema")
+        particle_data = {
+            "e": get_t("particle_energy", p_start, p_end),
+            "pt": get_t("particle_pt", p_start, p_end),
+            "eta": get_t("particle_eta", p_start, p_end),
+            "sinphi": torch.sin(get_t("particle_phi", p_start, p_end)),
+            "cosphi": torch.cos(get_t("particle_phi", p_start, p_end)),
+            "class": p_class,
+            "is_charged": is_charged.float()
+        }
+        
+        particle_data_scaled = self.scaler.transform(particle_data)
+        for key, val in particle_data_scaled.items():
+            particle_data_scaled[key] = do_padding(val, self.num_objects)
+
+        # 4. Build Incidence Matrix
+        # ---------------------------------------------------------------------
+        # Shape: [num_particles, max_nodes]
+        incidence_matrix = np.zeros((self.num_objects, self.max_nodes), dtype=np.float32)
+
+        # A. Clusters -> Particles (from deps)
+        dep_c_idx = self.full_data_array["deps_cluster_idx"][d_start:d_end].long()
+        dep_p_idx = self.full_data_array["deps_particle_idx"][d_start:d_end].long()
+        dep_energy = self.full_data_array["deps_total_energy_deps_in_cluster"][d_start:d_end]
+        
+        # Clusters are offset by n_tracks
+        dep_node_idx = dep_c_idx + n_tracks
+        
+        # Safe indexing
+        valid_mask = (dep_p_idx < self.num_objects) & (dep_node_idx < self.max_nodes)
+        
+        if valid_mask.any():
+            incidence_matrix[dep_p_idx[valid_mask].numpy(), dep_node_idx[valid_mask].numpy()] = dep_energy[valid_mask].numpy()
+
+        # B. Tracks -> Particles (from track majority id)
+        # We need to match Global IDs
+        t_maj_id = self.full_data_array["track_majority_particle_id"][t_start:t_end].numpy()
+        p_ids = self.full_data_array["particle_particle_id"][p_start:p_end].numpy()
+        
+        # Create map: GlobalID -> Local Index
+        pid_map = {pid: i for i, pid in enumerate(p_ids)}
+        
+        for trk_local_idx, maj_id in enumerate(t_maj_id):
+            if maj_id in pid_map:
+                p_local_idx = pid_map[maj_id]
+                if p_local_idx < self.num_objects and trk_local_idx < self.max_nodes:
+                    incidence_matrix[p_local_idx, trk_local_idx] = 1.0
+
+        # Normalize columns (Energy fractions)
+        col_sums = incidence_matrix.sum(axis=0, keepdims=True)
+        # Avoid division by zero
+        incidence_matrix = np.divide(incidence_matrix, col_sums, out=np.zeros_like(incidence_matrix), where=col_sums > 1e-6)
+
+        # 5. Final Packaging
+        # ---------------------------------------------------------------------
+        incidence = torch.tensor(incidence_matrix, dtype=torch.float32)
+        
+        indicator = torch.zeros(self.num_objects)
+        indicator[:n_particles] = 1.0 # Simple mask for real particles
+
+        node_q_mask = torch.zeros(self.max_nodes, dtype=torch.bool)
+        node_q_mask[:n_nodes] = True
+        
+        node_inp_features = torch.stack(list(node_features.values()), dim=-1)
+
+        return {
+            "node_inp_features": node_inp_features,
+            "node_raw_features": node_raw_features,
+            "particle_data": particle_data_scaled,
+            "incidence_truth": incidence,
+            "indicator_truth": indicator,
+            "node_q_mask": node_q_mask,
+        }
 
     def __getitem__(self, idx: int) -> tuple[dict, dict]:
         """
