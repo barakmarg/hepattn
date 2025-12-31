@@ -34,9 +34,9 @@ data:
   num_objects: &num_particles 150
 
   # TODO: Update paths to your parquet files
-  train_path: /path/to/your/train_data.parquet
-  valid_path: /path/to/your/val_data.parquet
-  test_path: /path/to/your/test_data.parquet
+  train_path: /storage/agrp/barakma/PileupODD/data
+  valid_path: /storage/agrp/barakma/PileupODD/data
+  test_path: /storage/agrp/barakma/PileupODD/data
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 16
@@ -51,7 +51,7 @@ data:
   scale_dict_path: &scale_dict_path configs/odd_var_transform.yaml
 
   # TODO: Adjust max_nodes based on your data
-  max_nodes: 200
+  max_nodes: 1200
 
 # =============================================================================
 # Trainer Configuration

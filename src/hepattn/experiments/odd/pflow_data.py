@@ -167,17 +167,25 @@ class ODDDataset(Dataset):
         # ---------------------------------------------------------------------
         
         # --- Tracks ---
-        track_vars = ["d0", "z0", "phi", "theta",'eta', "qop", "majority_particle_id", "phi_int", "eta_int"]
+        track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "qop", "majority_particle_id", "phi_int", "eta_int",
+                      "track_tanlambda", "track_omega", "particle_idx"]
         for var in tqdm(track_vars, desc="Loading Tracks"):
             # explode list column into flat array
             flat_arr = df_tracks.select(pl.col(var).explode()).to_series().to_numpy()
-            self.full_data_array[f"track_{var}"] = flat_arr
+            var2 = var.replace("track_","")
+            self.full_data_array[f"track_{var2}"] = flat_arr
 
         self.full_data_array["track_sinphi"] = np.sin(self.full_data_array["track_phi"])
         self.full_data_array["track_cosphi"] = np.cos(self.full_data_array["track_phi"])
+        # --- Derived Track Features ---
+        phi_int = self.full_data_array["track_phi_int"]
+        self.full_data_array["track_sinphi_int"] = np.sin(phi_int)
+        self.full_data_array["track_cosphi_int"] = np.cos(phi_int)
 
         # --- Clusters (Calo) ---
-        cluster_vars = ["total_cluster_energy", "cluster_cx", "cluster_cy", "cluster_cz"]
+        cluster_vars = ["total_cluster_energy", "cluster_cx", "cluster_cy", "cluster_cz",
+                        "cluster_eta", "cluster_phi"
+                        "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
         for var in tqdm(cluster_vars, desc="Loading Clusters"):
             flat_arr = df_clusters.select(pl.col(var).explode()).to_series().to_numpy()
             self.full_data_array[var] = flat_arr
@@ -186,13 +194,10 @@ class ODDDataset(Dataset):
         cx = self.full_data_array["cluster_cx"]
         cy = self.full_data_array["cluster_cy"]
         cz = self.full_data_array["cluster_cz"]
-        
-        r_perp = np.sqrt(cx**2 + cy**2)
-        theta_cl = np.arctan2(r_perp, cz)
+        rho = np.sqrt(cx**2 + cy**2+ cz**2) 
+        self.full_data_array["cluster_rho"] = rho
         
         self.full_data_array["cluster_e"] = self.full_data_array["total_cluster_energy"]
-        self.full_data_array["cluster_eta"] = -np.log(np.tan(theta_cl / 2.0))
-        self.full_data_array["cluster_phi"] = np.arctan2(cy, cx)
         self.full_data_array["cluster_sinphi"] = np.sin(self.full_data_array["cluster_phi"])
         self.full_data_array["cluster_cosphi"] = np.cos(self.full_data_array["cluster_phi"])
 
@@ -268,11 +273,18 @@ class ODDDataset(Dataset):
         t_d0 = get_t("track_d0", t_start, t_end)
         t_z0 = get_t("track_z0", t_start, t_end)
         t_phi = get_t("track_phi", t_start, t_end)
-        t_theta = get_t("track_theta", t_start, t_end)
+        t_pt = get_t("track_pt", t_start, t_end)
         t_qop = get_t("track_qop", t_start, t_end)
         t_eta = get_t("track_eta", t_start, t_end)
         t_sinphi = get_t("track_sinphi", t_start, t_end)
         t_cosphi = get_t("track_cosphi", t_start, t_end)
+        t_eta_int = get_t("track_eta_int", t_start, t_end)
+        t_phi_int = get_t("track_phi_int", t_start, t_end)
+        t_cosphi_int = get_t("track_cosphi_int", t_start, t_end)
+        t_sinphi_int = get_t("track_sinphi_int", t_start, t_end)
+        t_tanlambda = get_t("track_tanlambda", t_start, t_end)
+        t_omega = get_t("track_omega", t_start, t_end)
+        t_particle_idx = get_t("track_particle_idx", t_start, t_end)
         
         # --- Clusters ---
         c_e = get_t("cluster_e", c_start, c_end)
@@ -280,6 +292,16 @@ class ODDDataset(Dataset):
         c_phi = get_t("cluster_phi", c_start, c_end)
         c_sinphi = get_t("cluster_sinphi", c_start, c_end)
         c_cosphi = get_t("cluster_cosphi", c_start, c_end)
+        c_rho = get_t("cluster_rho", c_start, c_end)
+        c_sigma_eta = get_t("sigma_eta", c_start, c_end)
+        c_sigma_phi = get_t("sigma_phi", c_start, c_end)
+        c_sigma_rho = get_t("sigma_rho", c_start, c_end)
+        c_hcal_fraction = get_t("hcal_fraction", c_start, c_end)
+
+        # --- Energy Deposits ---
+        d_particle_idx = get_t("deps_particle_idx", d_start, d_end)
+        d_cluster_idx = get_t("deps_cluster_idx", d_start, d_end)
+        d_energy = get_t("deps_total_energy_deps_in_cluster", d_start, d_end)
 
         # Scale Features (Assuming self.scaler exists as in CLIC)
         # We construct the input dictionary matching ODD feature list: 
@@ -291,25 +313,59 @@ class ODDDataset(Dataset):
         # Clusters have Energy. Tracks have 0 (or p? usually 0 in this specific input scheme)
         
         node_features = {
+            # Common freatures
+            "phi": torch.cat([t_phi, c_phi], -1), # Usually not scaled, pos encoded
+            "cosphi": torch.cat([t_cosphi, c_cosphi], -1),
+            "sinphi": torch.cat([t_sinphi, c_sinphi], -1),
+            "eta": torch.cat([self.scaler.transforms["eta"].transform(t_eta), self.scaler.transforms["eta"].transform(c_eta)], -1),
+            # interaction features
+            "eta_int": torch.cat([self.scaler.transforms["eta"].transform(t_eta_int), torch.zeros(n_clusters, dtype=torch.float32),], -1,),
+            "phi_int": torch.cat([self.scaler.transforms["phi"].transform(t_phi_int), torch.zeros(n_clusters, dtype=torch.float32),], -1,),
+            "cosphi_int": torch.cat([t_cosphi_int, torch.zeros(n_clusters, dtype=torch.float32)], -1),
+            "sinphi_int": torch.cat([t_sinphi_int, torch.zeros(n_clusters, dtype=torch.float32)], -1),
+            # track features set to 0 for clusters
+            "pt": torch.cat([self.scaler.transforms["pt"].transform(t_pt), torch.zeros(n_clusters, device=t_pt.device)], -1),
             "d0": torch.cat([self.scaler.transforms["d0"].transform(t_d0), torch.zeros(n_clusters, device=t_d0.device)], -1),
             "z0": torch.cat([self.scaler.transforms["z0"].transform(t_z0), torch.zeros(n_clusters, device=t_z0.device)], -1),
-            "phi": torch.cat([t_phi, c_phi], -1), # Usually not scaled, pos encoded
-            "theta": torch.cat([t_theta, 2*torch.atan(torch.exp(-c_eta))], -1),
             "qop": torch.cat([self.scaler.transforms["qop"].transform(t_qop), torch.zeros(n_clusters, device=t_qop.device)], -1),
-            "energy": torch.cat([torch.zeros(n_tracks, device=c_e.device), self.scaler.transforms["energy"].transform(c_e)], -1),
-            "eta": torch.cat([self.scaler.transforms["eta"].transform(t_eta), self.scaler.transforms["eta"].transform(c_eta)], -1),
-            "is_track": torch.cat([torch.ones(n_tracks, device=t_d0.device), torch.zeros(n_clusters, device=t_d0.device)], -1)
+            "tanlambda": torch.cat([self.scaler.transforms["tanlambda"].transform(t_tanlambda),torch.zeros(n_clusters, dtype=torch.float32),], -1,),
+            "omega": torch.cat([self.scaler.transforms["omega"].transform(t_omega),torch.zeros(n_clusters, dtype=torch.float32),], -1,),
+            #radiusofinnermosthit, ndf, chi2 missing from ODD tracks
+
+            # cluster features set to 0 for tracks
+            "e": torch.cat([torch.zeros(n_tracks, device=c_e.device), self.scaler.transforms["e"].transform(c_e)], -1),
+            "rho": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["rho"].transform(c_rho)], -1),
+            "sigma_eta": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["sigma_eta"].transform(c_sigma_eta)], -1),
+            "sigma_phi": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["sigma_phi"].transform(c_sigma_phi)], -1),
+            "sigma_rho": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["sigma_rho"].transform(c_sigma_rho)], -1),
+            "hcal_fraction": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), c_hcal_fraction], -1),
+
+            # flags
+            "is_track": torch.cat([torch.ones(n_tracks, dtype=torch.float32), torch.zeros(n_clusters, dtype=torch.float32),],-1,),
+            "is_cluster": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), torch.ones(n_clusters, dtype=torch.float32),],-1,),
         }
 
         # Raw features (for regression baseline/analysis)
         node_raw_features = {
-            "node_energy": torch.cat([torch.zeros(n_tracks), c_e], -1),
-            "node_pt": torch.cat([torch.zeros(n_tracks), c_e / torch.cosh(c_eta)], -1), # Approx pt for clusters
-            "node_eta": torch.cat([t_eta, c_eta], -1),
-            "node_phi": torch.cat([t_phi, c_phi], -1),
-            "node_sinphi": torch.cat([t_sinphi, c_sinphi], -1),
-            "node_cosphi": torch.cat([t_cosphi, c_cosphi], -1),
-            "node_is_track": torch.cat([torch.ones(n_tracks), torch.zeros(n_clusters)], -1)
+            "raw_e": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), c_e], -1),
+            "raw_pt": torch.cat(
+                [
+                    t_pt,
+                    torch.zeros(n_clusters, dtype=torch.float32),
+                ],
+                -1,
+            ),
+            "raw_eta": torch.cat([t_eta, c_eta], -1),
+            "raw_phi": torch.cat([t_phi, c_phi], -1),
+            "sinphi": torch.cat([t_sinphi, c_sinphi], -1),
+            "cosphi": torch.cat([t_cosphi, c_cosphi], -1),
+            "is_track": torch.cat(
+                [
+                    torch.ones(n_tracks, dtype=torch.float32),
+                    torch.zeros(n_clusters, dtype=torch.float32),
+                ],
+                -1,
+            ),
         }
 
         # Pad everything
@@ -320,94 +376,83 @@ class ODDDataset(Dataset):
 
         # 3. Extract & Pad Target Particles
         # ---------------------------------------------------------------------
-        p_class = get_t("particle_class", p_start, p_end).clone() # Clone to modify
-        p_has_track = get_t("particle_has_track", p_start, p_end)
+        particle_class = get_t("particle_class", p_start, p_end)
+        if self.is_inference:
+            trackless_particle_mask = torch.zeros_like(particle_class, dtype=torch.bool)
+        else:
+            trackless_particle_mask = torch.ones_like(particle_class, dtype=torch.bool)
+            trackless_particle_mask[t_particle_idx] = False
+
+            trackless_chhad_and_e_mask = trackless_particle_mask & (particle_class < 2)
+            trackless_muon_mask = trackless_particle_mask & (particle_class == 2)
+
+            # trackless ch hads and es become nu hads and photons (+3)
+            particle_class[trackless_chhad_and_e_mask] += 3
+
+            # trackless muons become neutral hadrons
+            particle_class[trackless_muon_mask] = 3
+
+        is_charged = particle_class < 3
         
-        # Apply CLIC Logic for "Trackless" particles
-        # If a particle is Charged (0,1,2) but has no track, move to Neutral class (3,4)
-        if not self.is_inference:
-            # Shift ChHad(0)/Ele(1) -> Photon(3)/NuHad(4)
-            # 0->3, 1->4 (Using +3 logic)
-            mask_shift = (p_class < 2) & (~p_has_track)
-            p_class[mask_shift] += 3
-            
-            # Muon(2) -> NuHad(4)
-            mask_mu = (p_class == 2) & (~p_has_track)
-            p_class[mask_mu] = 4
-            
-            # Clamp to valid range (0-5, where 5 is null)
-            p_class = torch.clamp(p_class, 0, 4)
-
-        is_charged = p_class < 3
-
         particle_data = {
-            "e": get_t("particle_energy", p_start, p_end),
-            "pt": get_t("particle_pt", p_start, p_end),
-            "eta": get_t("particle_eta", p_start, p_end),
-            "sinphi": torch.sin(get_t("particle_phi", p_start, p_end)),
-            "cosphi": torch.cos(get_t("particle_phi", p_start, p_end)),
-            "class": p_class,
-            "is_charged": is_charged.float()
+            "e": self.full_data_array["particle_energy"][p_start:p_end],
+            "pt": self.full_data_array["particle_pt"][p_start:p_end],
+            "eta": self.full_data_array["particle_eta"][p_start:p_end],
+            "sinphi": torch.sin(self.full_data_array["particle_phi"][p_start:p_end]),
+            "cosphi": torch.cos(self.full_data_array["particle_phi"][p_start:p_end]),
+            "class": particle_class,
+            "is_charged": is_charged,
         }
-        
-        particle_data_scaled = self.scaler.transform(particle_data)
-        for key, val in particle_data_scaled.items():
-            particle_data_scaled[key] = do_padding(val, self.num_objects)
+        particle_data = self.scaler.transform(particle_data)
+        for key, val in particle_data.items():
+            val = do_padding(val, self.num_objects)
+            particle_data[key] = val
 
-        # 4. Build Incidence Matrix
-        # ---------------------------------------------------------------------
-        # Shape: [num_particles, max_nodes]
-        incidence_matrix = np.zeros((self.num_objects, self.max_nodes), dtype=np.float32)
+        has_track = torch.zeros(self.num_objects, dtype=bool)
+        has_track[:n_particles] = ~trackless_particle_mask
 
-        # A. Clusters -> Particles (from deps)
-        dep_c_idx = self.full_data_array["deps_cluster_idx"][d_start:d_end].long()
-        dep_p_idx = self.full_data_array["deps_particle_idx"][d_start:d_end].long()
-        dep_energy = self.full_data_array["deps_total_energy_deps_in_cluster"][d_start:d_end]
-        
-        # Clusters are offset by n_tracks
-        dep_node_idx = dep_c_idx + n_tracks
-        
-        # Safe indexing
-        valid_mask = (dep_p_idx < self.num_objects) & (dep_node_idx < self.max_nodes)
-        
-        if valid_mask.any():
-            incidence_matrix[dep_p_idx[valid_mask].numpy(), dep_node_idx[valid_mask].numpy()] = dep_energy[valid_mask].numpy()
-
-        # B. Tracks -> Particles (from track majority id)
-        # We need to match Global IDs
-        t_maj_id = self.full_data_array["track_majority_particle_id"][t_start:t_end].numpy()
-        p_ids = self.full_data_array["particle_particle_id"][p_start:p_end].numpy()
-        
-        # Create map: GlobalID -> Local Index
-        pid_map = {pid: i for i, pid in enumerate(p_ids)}
-        
-        for trk_local_idx, maj_id in enumerate(t_maj_id):
-            if maj_id in pid_map:
-                p_local_idx = pid_map[maj_id]
-                if p_local_idx < self.num_objects and trk_local_idx < self.max_nodes:
-                    incidence_matrix[p_local_idx, trk_local_idx] = 1.0
-
-        # Normalize columns (Energy fractions)
-        col_sums = incidence_matrix.sum(axis=0, keepdims=True)
-        # Avoid division by zero
-        incidence_matrix = np.divide(incidence_matrix, col_sums, out=np.zeros_like(incidence_matrix), where=col_sums > 1e-6)
-
-        # 5. Final Packaging
-        # ---------------------------------------------------------------------
-        incidence = torch.tensor(incidence_matrix, dtype=torch.float32)
-        
-        indicator = torch.zeros(self.num_objects)
-        indicator[:n_particles] = 1.0 # Simple mask for real particles
-
-        node_q_mask = torch.zeros(self.max_nodes, dtype=torch.bool)
+        node_q_mask = torch.zeros(self.max_nodes, dtype=bool)
         node_q_mask[:n_nodes] = True
-        
+
+        incidence_matrix = np.zeros((self.num_objects, n_nodes))
+        indicator = torch.zeros(self.num_objects)
+
+        track_idx = np.arange(len(t_particle_idx))
+        if self.is_inference:
+            t_particle_idx[t_particle_idx < 0] = 0
+        # print(incidence_matrix.shape, part_idx.shape, track_idx.shape, idx)
+        incidence_matrix[t_particle_idx, track_idx] = 1.0
+
+        # topo_idx = d_cluster_idx
+        # 
+        incidence_matrix[d_particle_idx, d_cluster_idx + n_tracks] = d_energy
+
+        # Zero out entries for non-existing target particles
+        if (incidence_matrix.sum(axis=0) == 0).any():
+            noisy_cols = np.where(incidence_matrix.sum(axis=0) == 0)[0]
+            fake_rows = np.arange(len(noisy_cols)) + n_particles
+            if not (fake_rows < self.num_objects).all():
+                print(f"Warning: fake_rows go beyond maximum ({self.num_objects}) particles. Dropping them!")
+                noisy_cols = noisy_cols[fake_rows < self.num_objects]
+                fake_rows = fake_rows[fake_rows < self.num_objects]
+            incidence_matrix[fake_rows, noisy_cols] = 1.0
+
+        # normalize
+        incidence_matrix /= np.clip(incidence_matrix.sum(axis=0, keepdims=True), a_min=1e-6, a_max=None)
+
+        incidence = torch.tensor(incidence_matrix, dtype=torch.float32)
+
+        incidence = torch.nn.functional.pad(incidence, (0, self.max_nodes - n_nodes, 0, 0))
+        # update the indicator
+        is_not_res_mask = particle_class < 5
+        indicator[:n_particles][is_not_res_mask] = 1.0
+
         node_inp_features = torch.stack(list(node_features.values()), dim=-1)
 
         return {
             "node_inp_features": node_inp_features,
             "node_raw_features": node_raw_features,
-            "particle_data": particle_data_scaled,
+            "particle_data": particle_data,
             "incidence_truth": incidence,
             "indicator_truth": indicator,
             "node_q_mask": node_q_mask,
@@ -423,39 +468,43 @@ class ODDDataset(Dataset):
         inputs = {}
         labels = {}
 
-        # Load event data
+        # load event
         data_dict = self.load_event(idx)
 
-        # TODO: Build inputs dictionary
-        # inputs = {
-        #     "node_features": data_dict["node_inp_features"],
-        #     "node_valid": data_dict["node_q_mask"],
-        #     "node_energy": data_dict["node_raw_features"]["raw_energy"],
-        #     "node_eta": data_dict["node_raw_features"]["raw_eta"],
-        #     "node_phi": data_dict["node_raw_features"]["raw_phi"],
-        #     "node_sinphi": data_dict["node_raw_features"]["sinphi"],
-        #     "node_cosphi": data_dict["node_raw_features"]["cosphi"],
-        #     "node_is_track": data_dict["node_raw_features"]["is_track"],
-        # }
+        inputs = {
+            "node_features": data_dict["node_inp_features"],
+            "node_valid": data_dict["node_q_mask"],
+            "node_e": data_dict["node_raw_features"]["raw_e"],
+            "node_pt": data_dict["node_raw_features"]["raw_pt"],
+            "node_eta": data_dict["node_raw_features"]["raw_eta"],
+            "node_phi": data_dict["node_raw_features"]["raw_phi"],
+            "node_sinphi": data_dict["node_raw_features"]["sinphi"],
+            "node_cosphi": data_dict["node_raw_features"]["cosphi"],
+            "node_is_track": data_dict["node_raw_features"]["is_track"],
+        }
 
-        # TODO: Build class labels
-        # class_labels = data_dict["particle_data"]["class"].long()
-        # class_labels[data_dict["indicator_truth"] == 0] = self.null_class_idx
+        # set class labels (5 is residual & fake, 0-4 are the real classes)
+        class_labels = data_dict["particle_data"]["class"].long()
+        class_labels[data_dict["indicator_truth"] == 0] = 5
 
-        # TODO: Build labels dictionary
-        # labels["particle_class"] = class_labels.long()
-        # labels["particle_valid"] = data_dict["indicator_truth"].bool()
-        # labels["node_valid"] = data_dict["node_q_mask"].bool()
-        # labels["particle_node_valid"] = data_dict["incidence_truth"] > self.incidence_cutval
-        # labels["particle_incidence"] = data_dict["incidence_truth"]
+        labels["particle_class"] = class_labels.long()
+        labels["particle_valid"] = data_dict["indicator_truth"].bool()
+        labels["node_valid"] = data_dict["node_q_mask"].bool()
 
-        # TODO: Add regression targets
-        # for label in self.targets["particle"]:
-        #     labels[f"particle_{label}"] = data_dict["particle_data"][label]
+        # get masks
+        incidence_mask = data_dict["incidence_truth"] > self.incidence_cutval
+        labels["particle_node_valid"] = incidence_mask
 
-        # labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
+        # get incidence matrix label
+        labels["particle_incidence"] = data_dict["incidence_truth"]
 
-        raise NotImplementedError("TODO: Implement __getitem__() for your data schema")
+        # regression targets
+        for label in self.targets["particle"]:
+            tgt = torch.full((self.num_objects,), torch.nan)  # number of reconstructed tracks
+            tgt[: self.n_particles[idx]] = data_dict["particle_data"][label][: self.n_particles[idx]]
+            labels[f"particle_{label}"] = tgt
+
+        labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
 
         return inputs, labels
 
