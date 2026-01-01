@@ -31,7 +31,7 @@ data:
       - cosphi
 
   # Maximum number of output particles
-  num_objects: &num_particles 150
+  num_objects: &num_particles 250
 
   # TODO: Update paths to your parquet files
   train_path: /storage/agrp/barakma/PileupODD/data
@@ -80,7 +80,7 @@ trainer:
       init_args:
         monitor: val/loss
         save_last: true
-    - class_path: hepattn.experiments.odd.ODDPredictionWriter
+    - class_path: hepattn.experiments.odd.PflowPredictionWriter
     - class_path: lightning.pytorch.callbacks.ModelSummary
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
     - class_path: lightning.pytorch.callbacks.TQDMProgressBar

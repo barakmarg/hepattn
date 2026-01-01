@@ -118,11 +118,6 @@ class ODDDataset(Dataset):
     def load_data(self, file_dir: str, num_events: int) -> None:
         """
         Load data from parquet file(s) using Polars.
-
-        TODO: Implement loading logic for your parquet schema:
-        - truth_particles: particle_id, pdg_id, energy, eta, phi, px, py, pz, charge, mass, has_track
-        - calo_clusters: cluster_id, total_cluster_energy, cluster_cx, cluster_cy, cluster_cz
-        - tracks: d0, z0, phi, theta, qop, majority_particle_id, hit_ids, track_id
         """
         self.full_data_array = {}
 
@@ -167,7 +162,7 @@ class ODDDataset(Dataset):
         # ---------------------------------------------------------------------
         
         # --- Tracks ---
-        track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "qop", "majority_particle_id", "phi_int", "eta_int",
+        track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "qop", "phi_int", "eta_int",
                       "track_tanlambda", "track_omega", "particle_idx"]
         for var in tqdm(track_vars, desc="Loading Tracks"):
             # explode list column into flat array
@@ -183,19 +178,14 @@ class ODDDataset(Dataset):
         self.full_data_array["track_cosphi_int"] = np.cos(phi_int)
 
         # --- Clusters (Calo) ---
-        cluster_vars = ["total_cluster_energy", "cluster_cx", "cluster_cy", "cluster_cz",
-                        "cluster_eta", "cluster_phi"
+        cluster_vars = ["total_cluster_energy", "cluster_rho",
+                        "cluster_eta", "cluster_phi",
                         "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
         for var in tqdm(cluster_vars, desc="Loading Clusters"):
             flat_arr = df_clusters.select(pl.col(var).explode()).to_series().to_numpy()
             self.full_data_array[var] = flat_arr
 
         # Derived Cluster Features (Cartesian -> Spherical)
-        cx = self.full_data_array["cluster_cx"]
-        cy = self.full_data_array["cluster_cy"]
-        cz = self.full_data_array["cluster_cz"]
-        rho = np.sqrt(cx**2 + cy**2+ cz**2) 
-        self.full_data_array["cluster_rho"] = rho
         
         self.full_data_array["cluster_e"] = self.full_data_array["total_cluster_energy"]
         self.full_data_array["cluster_sinphi"] = np.sin(self.full_data_array["cluster_phi"])
@@ -216,6 +206,10 @@ class ODDDataset(Dataset):
             flat_arr = df_deps.select(pl.col(var).explode()).to_series().to_numpy()
             self.full_data_array[f"deps_{var}"] = flat_arr
         
+        
+        # transform variables and transform to tensors
+        for key, val in self.full_data_array.items():
+            self.full_data_array[key] = torch.tensor(val)
                 # 6. Build CumSums for Indexing
         # ---------------------------------------------------------------------
         self.track_cumsum = np.cumsum([0, *self.n_tracks.tolist()])
@@ -225,7 +219,6 @@ class ODDDataset(Dataset):
         
         self.n_nodes = self.n_tracks + self.n_clusters
         print(f"Number of events after filtering: {self.num_events}")
-        raise NotImplementedError("TODO: Implement load_data() for your data schema")
     def __len__(self) -> int:
         return int(self.num_events)
 
@@ -673,14 +666,7 @@ class ODDDataset(Dataset):
             # TODO: Add cluster-particle association variable if available
         ]
 
-
 class ODDDataModule(L.LightningDataModule):
-    """
-    Lightning DataModule for ODD Particle Flow.
-
-    Handles train/val/test dataset creation and dataloaders.
-    """
-
     def __init__(
         self,
         train_path: str,
@@ -696,23 +682,6 @@ class ODDDataModule(L.LightningDataModule):
         test_suff: str | None = None,
         **kwargs,
     ):
-        """
-        Initialize DataModule.
-
-        Args:
-            train_path: Path to training parquet file(s)
-            valid_path: Path to validation parquet file(s)
-            batch_size: Batch size for dataloaders
-            num_workers: Number of worker processes for data loading
-            num_train: Number of training events to use
-            num_val: Number of validation events to use
-            num_test: Number of test events to use
-            scale_dict_path: Path to feature scaling YAML file
-            test_path: Path to test parquet file(s)
-            pin_memory: Whether to pin memory for faster GPU transfer
-            test_suff: Suffix for test output files
-            **kwargs: Additional arguments passed to ODDDataset
-        """
         super().__init__()
 
         self.train_path = train_path
@@ -728,11 +697,11 @@ class ODDDataModule(L.LightningDataModule):
         self.scale_dict_path = scale_dict_path
         self.kwargs = kwargs
 
-    def setup(self, stage: str) -> None:
-        """Set up datasets for the given stage."""
+    def setup(self, stage: str):
         if self.trainer.is_global_zero:
             print("-" * 100)
 
+        # create training and validation datasets
         if stage == "fit":
             self.train_dset = ODDDataset(
                 filepath=self.train_path,
@@ -740,6 +709,8 @@ class ODDDataModule(L.LightningDataModule):
                 scale_dict_path=self.scale_dict_path,
                 **self.kwargs,
             )
+
+        if stage == "fit":
             self.val_dset = ODDDataset(
                 filepath=self.valid_path,
                 num_events=self.num_val,
@@ -747,6 +718,7 @@ class ODDDataModule(L.LightningDataModule):
                 **self.kwargs,
             )
 
+        # Only print train/val dataset details when actually training
         if stage == "fit" and self.trainer.is_global_zero:
             print(f"Created training dataset with {len(self.train_dset):,} events")
             print(f"Created validation dataset with {len(self.val_dset):,} events")
@@ -764,8 +736,7 @@ class ODDDataModule(L.LightningDataModule):
         if self.trainer.is_global_zero:
             print("-" * 100, "\n")
 
-    def get_dataloader(self, stage: str, dataset: ODDDataset, shuffle: bool) -> DataLoader:
-        """Create a dataloader for the given dataset."""
+    def get_dataloader(self, stage: str, dataset: ODDDataset, shuffle: bool):
         print(f"Creating {stage} dataloader with {len(dataset):,} events")
         return DataLoader(
             dataset=dataset,
@@ -777,17 +748,14 @@ class ODDDataModule(L.LightningDataModule):
             pin_memory=self.pin_memory,
         )
 
-    def train_dataloader(self) -> DataLoader:
-        """Create training dataloader."""
+    def train_dataloader(self):
         print("Instantiating train dataloader on rank", self.trainer.local_rank)
         return self.get_dataloader(dataset=self.train_dset, stage="fit", shuffle=True)
 
-    def val_dataloader(self) -> DataLoader:
-        """Create validation dataloader."""
+    def val_dataloader(self):
         print("Instantiating validation dataloader on rank", self.trainer.local_rank)
         return self.get_dataloader(dataset=self.val_dset, stage="test", shuffle=False)
 
-    def test_dataloader(self) -> DataLoader:
-        """Create test dataloader."""
+    def test_dataloader(self):
         print("Instantiating test dataloader on rank", self.trainer.local_rank)
         return self.get_dataloader(dataset=self.test_dset, stage="test", shuffle=False)
