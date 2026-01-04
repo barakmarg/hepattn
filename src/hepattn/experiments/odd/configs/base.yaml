@@ -31,7 +31,7 @@ data:
       - cosphi
 
   # Maximum number of output particles
-  num_objects: &num_particles 250
+  num_objects: &num_particles 1000
 
   # TODO: Update paths to your parquet files
   train_path: /storage/agrp/barakma/PileupODD/data
@@ -136,7 +136,7 @@ model:
                   init_args:
                     # TODO: Ensure this matches your ODD input feature count (8 in list above)
                     # Keeping 20 as per your original file, assuming padding or extra features.
-                    input_size: 20 
+                    input_size: 22 
                     output_size: *dim
                 posenc:
                   class_path: hepattn.models.posenc.FourierPositionEncoder

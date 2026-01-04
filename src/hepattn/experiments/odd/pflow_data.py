@@ -166,7 +166,7 @@ class ODDDataset(Dataset):
                       "track_tanlambda", "track_omega", "particle_idx"]
         for var in tqdm(track_vars, desc="Loading Tracks"):
             # explode list column into flat array
-            flat_arr = df_tracks.select(pl.col(var).explode()).to_series().to_numpy()
+            flat_arr = df_tracks.select(pl.col(var).explode()).to_series().to_torch()
             var2 = var.replace("track_","")
             self.full_data_array[f"track_{var2}"] = flat_arr
 
@@ -182,7 +182,7 @@ class ODDDataset(Dataset):
                         "cluster_eta", "cluster_phi",
                         "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
         for var in tqdm(cluster_vars, desc="Loading Clusters"):
-            flat_arr = df_clusters.select(pl.col(var).explode()).to_series().to_numpy()
+            flat_arr = df_clusters.select(pl.col(var).explode()).to_series().to_torch()
             self.full_data_array[var] = flat_arr
 
         # Derived Cluster Features (Cartesian -> Spherical)
@@ -194,19 +194,27 @@ class ODDDataset(Dataset):
         # --- Particles (Truth) ---
         particle_vars = ["energy", "eta", "phi", "pdg_id", "charge", "particle_id", "has_track", "pt"]
         for var in tqdm(particle_vars, desc="Loading Particles"):
-            flat_arr = df_particles.select(pl.col(var).explode()).to_series().to_numpy()
+            flat_arr = df_particles.select(pl.col(var).explode()).to_series().to_torch()
             self.full_data_array[f"particle_{var}"] = flat_arr
 
         # Map PDG ID to Class
         pdg_ids = self.full_data_array["particle_pdg_id"]
-        self.full_data_array["particle_class"] = torch.tensor([self.class_labels[x] for x in pdg_ids])
+        # Convert to numpy for faster iteration and to avoid tensor keys
+        pdg_ids_np = pdg_ids.numpy() if isinstance(pdg_ids, torch.Tensor) else pdg_ids
+        # Use list comprehension which is faster than iterating tensors
+        # Cast to int to match dictionary keys
+        self.full_data_array["particle_class"] = torch.tensor(
+            [self.class_labels[int(x)] for x in pdg_ids_np], 
+            dtype=torch.long
+        )
         # --- Deps (Incidence) ---
         deps_vars = ["total_energy_deps_in_cluster", "particle_idx", "cluster_idx"]
         for var in tqdm(deps_vars, desc="Loading Deps"):
-            flat_arr = df_deps.select(pl.col(var).explode()).to_series().to_numpy()
+            flat_arr = df_deps.select(pl.col(var).explode()).to_series().to_torch()
             self.full_data_array[f"deps_{var}"] = flat_arr
         
-        
+        # convert dtype from float to int
+        self.full_data_array["deps_particle_idx"] = self.full_data_array["deps_particle_idx"].to(torch.int64)
         # transform variables and transform to tensors
         for key, val in self.full_data_array.items():
             self.full_data_array[key] = torch.tensor(val)
@@ -413,12 +421,22 @@ class ODDDataset(Dataset):
         track_idx = np.arange(len(t_particle_idx))
         if self.is_inference:
             t_particle_idx[t_particle_idx < 0] = 0
-        # print(incidence_matrix.shape, part_idx.shape, track_idx.shape, idx)
-        incidence_matrix[t_particle_idx, track_idx] = 1.0
+        
+        # Convert torch tensors to numpy for indexing numpy array
+        t_particle_idx_np = t_particle_idx.numpy() if isinstance(t_particle_idx, torch.Tensor) else t_particle_idx
+        d_particle_idx_np = d_particle_idx.numpy() if isinstance(d_particle_idx, torch.Tensor) else d_particle_idx
+        d_cluster_idx_np = d_cluster_idx.numpy() if isinstance(d_cluster_idx, torch.Tensor) else d_cluster_idx
+        d_energy_np = d_energy.numpy() if isinstance(d_energy, torch.Tensor) else d_energy
+        
+        # print type,dtype, shape of arrays before indexing
+        print(f"t_particle_idx_np: type={type(t_particle_idx_np)}, dtype={t_particle_idx_np.dtype}, shape={t_particle_idx_np.shape}")
+        print(f"d_particle_idx_np: type={type(d_particle_idx_np)}, dtype={d_particle_idx_np.dtype}, shape={d_particle_idx_np.shape}")
+        print(f"d_cluster_idx_np: type={type(d_cluster_idx_np)}, dtype={d_cluster_idx_np.dtype}, shape={d_cluster_idx_np.shape}")
+        print(f"d_energy_np: type={type(d_energy_np)}, dtype={d_energy_np.dtype}, shape={d_energy_np.shape}")   
+        incidence_matrix[t_particle_idx_np, track_idx] = 1.0
 
         # topo_idx = d_cluster_idx
-        # 
-        incidence_matrix[d_particle_idx, d_cluster_idx + n_tracks] = d_energy
+        incidence_matrix[d_particle_idx_np, d_cluster_idx_np + n_tracks] = d_energy_np
 
         # Zero out entries for non-existing target particles
         if (incidence_matrix.sum(axis=0) == 0).any():
@@ -440,7 +458,7 @@ class ODDDataset(Dataset):
         is_not_res_mask = particle_class < 5
         indicator[:n_particles][is_not_res_mask] = 1.0
 
-        node_inp_features = torch.stack(list(node_features.values()), dim=-1)
+        node_inp_features = torch.stack(list(node_features.values()), dim=-1).float()
 
         return {
             "node_inp_features": node_inp_features,
