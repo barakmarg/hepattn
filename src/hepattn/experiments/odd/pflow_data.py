@@ -427,12 +427,7 @@ class ODDDataset(Dataset):
         d_particle_idx_np = d_particle_idx.numpy() if isinstance(d_particle_idx, torch.Tensor) else d_particle_idx
         d_cluster_idx_np = d_cluster_idx.numpy() if isinstance(d_cluster_idx, torch.Tensor) else d_cluster_idx
         d_energy_np = d_energy.numpy() if isinstance(d_energy, torch.Tensor) else d_energy
-        
-        # print type,dtype, shape of arrays before indexing
-        print(f"t_particle_idx_np: type={type(t_particle_idx_np)}, dtype={t_particle_idx_np.dtype}, shape={t_particle_idx_np.shape}")
-        print(f"d_particle_idx_np: type={type(d_particle_idx_np)}, dtype={d_particle_idx_np.dtype}, shape={d_particle_idx_np.shape}")
-        print(f"d_cluster_idx_np: type={type(d_cluster_idx_np)}, dtype={d_cluster_idx_np.dtype}, shape={d_cluster_idx_np.shape}")
-        print(f"d_energy_np: type={type(d_energy_np)}, dtype={d_energy_np.dtype}, shape={d_energy_np.shape}")   
+         
         incidence_matrix[t_particle_idx_np, track_idx] = 1.0
 
         # topo_idx = d_cluster_idx
