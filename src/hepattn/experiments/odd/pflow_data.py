@@ -62,8 +62,8 @@ class ODDDataset(Dataset):
         targets: dict,
         scale_dict_path: str,
         num_events: int = -1,
-        num_objects: int = 2000,
-        max_nodes: int = 1200,
+        num_objects: int = 300,
+        max_nodes: int = 1600,
         remove_wrong_idxs: bool = True,
         incidence_cutval: float = 1e-4,
         is_inference: bool = False,
@@ -217,8 +217,16 @@ class ODDDataset(Dataset):
         self.full_data_array["deps_particle_idx"] = self.full_data_array["deps_particle_idx"].to(torch.int64)
         # transform variables and transform to tensors
         for key, val in self.full_data_array.items():
-            self.full_data_array[key] = torch.tensor(val)
-                # 6. Build CumSums for Indexing
+            # 1. Ensure it is a tensor
+            if not isinstance(val, torch.Tensor):
+                val = torch.tensor(val)
+            
+            # 2. CRITICAL FIX: Cast Float64 (Double) to Float32
+            # Polars loads Parquet as Float64 by default, which crashes AMP/Inductor
+            if val.is_floating_point():
+                val = val.float()
+            self.full_data_array[key] = val
+        # 6. Build CumSums for Indexing
         # ---------------------------------------------------------------------
         self.track_cumsum = np.cumsum([0, *self.n_tracks.tolist()])
         self.cluster_cumsum = np.cumsum([0, *self.n_clusters.tolist()])
@@ -634,7 +642,9 @@ class ODDDataset(Dataset):
             -14: -1,
             14: -1,  # nu_mu
             -16: -1,
-            16: -1,  # nu_tau
+            16: -1,  # nu_tau,
+            3212:3, #"Σ0",
+            -3212:3,# anti Σ0",
         }
 
     def init_variables_list(self) -> None:

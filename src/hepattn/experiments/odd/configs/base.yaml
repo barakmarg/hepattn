@@ -31,7 +31,7 @@ data:
       - cosphi
 
   # Maximum number of output particles
-  num_objects: &num_particles 1000
+  num_objects: &num_particles 300
 
   # TODO: Update paths to your parquet files
   train_path: /storage/agrp/barakma/PileupODD/data
@@ -40,7 +40,7 @@ data:
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 16
-  num_train: -1      # -1 for all events
+  num_train: 500      # -1 for all events
   num_test: -1
   num_val: 5000
 
@@ -51,7 +51,7 @@ data:
   scale_dict_path: &scale_dict_path configs/odd_var_transform.yaml
 
   # TODO: Adjust max_nodes based on your data
-  max_nodes: 1200
+  max_nodes: 1600
 
 # =============================================================================
 # Trainer Configuration
@@ -111,12 +111,12 @@ model:
       # Raw variables passed through for inference/analysis
       # KEPT ODD NAMES (needed for the Regression Task input calculation)
       raw_variables:
-        - "node_energy"
+        - "node_e"
+        - "node_pt"
         - "node_eta"
-        - "node_phi"
         - "node_sinphi"
         - "node_cosphi"
-        - "node_is_track" 
+        - "node_is_track"
         # Total raw vars = 6. 
         # Regression input size = (2 * dim) + 6 = 512 + 6 = 518. 
         # This matches the CLIC network size.
