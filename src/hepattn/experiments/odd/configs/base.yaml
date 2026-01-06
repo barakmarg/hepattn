@@ -31,27 +31,27 @@ data:
       - cosphi
 
   # Maximum number of output particles
-  num_objects: &num_particles 300
+  num_objects: &num_particles 320
 
-  # TODO: Update paths to your parquet files
-  train_path: /storage/agrp/barakma/PileupODD/data
-  valid_path: /storage/agrp/barakma/PileupODD/data
-  test_path: /storage/agrp/barakma/PileupODD/data
+  # TODO: Update paths to your parquet files, seperate for train/val/test
+  train_path: /storage/agrp/barakma/PileupODD/data/train
+  valid_path: /storage/agrp/barakma/PileupODD/data/val
+  test_path: /storage/agrp/barakma/PileupODD/data/test
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
-  num_workers: 16
+  num_workers: 2
   num_train: 500      # -1 for all events
   num_test: -1
-  num_val: 5000
+  num_val: 500
 
-  batch_size: 512    # Increased from 128 to match CLIC
+  batch_size: 32    # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Path to variable transformation config
   scale_dict_path: &scale_dict_path configs/odd_var_transform.yaml
 
   # TODO: Adjust max_nodes based on your data
-  max_nodes: 1600
+  max_nodes: 600
 
 # =============================================================================
 # Trainer Configuration

@@ -1,111 +1,71 @@
-# phi:
-#   type: std
-#   mean: 0.001
-#   std: 1.798
-#   min: -3.142
-#   max: 3.142
-
 eta:
   type: min_max_sym
-  mean: -0.007
-  std: 1.384
-  min: -3.000
-  max: 3.000
-
+  mean: 0.0129
+  std: 1.9129
+  min: -3.4077
+  max: 3.4132
 rho:
   type: min_max_sym
-  mean: 1243.845
-  std: 503.220
-  min: 1.920
-  max: 3000
-
+  mean: 1124.8562
+  std: 506.372
+  min: 312.0095
+  max: 3489.8362
 e:
   type: min_max_sym
   fn: sqrt
-  mean: 1.728
-  std: 1.531
-  min: 0.020
-  max: 15.136
-
+  mean: 1.2464
+  std: 1.2909
+  min: 0.5
+  max: 35.0785
 pt:
   type: min_max_sym
   fn: sqrt
-  mean: 1.334
-  std: 1.101
-  min: 0.000
-  max: 13.570
-
+  mean: 2.0245
+  std: 1.2137
+  min: 0.8439
+  max: 42.8814
 sigma_eta:
   type: std
   fn: sqrt
-  mean: 0.158
-  std: 0.083
-  min: 0.000
-  max: 0.941
-
+  mean: 0.1845
+  std: 0.0878
+  min: 0.0
+  max: 0.6089
 sigma_phi:
   type: std
   fn: sqrt
-  mean: 0.172
-  std: 0.097
-  min: 0.000
-  max: 1.446
-
+  mean: 0.2323
+  std: 0.2366
+  min: 0.0
+  max: 2.1056
 sigma_rho:
   type: std
   fn: sqrt
-  mean: 6.497
-  std: 3.263
-  min: 0.000
-  max: 41.808
-
+  mean: 5.9852
+  std: 2.0357
+  min: 0.0
+  max: 14.501
 d0:
   type: min_max_sym
-  mean: -0.002
-  std: 1.691
-  min: -25
-  max: 25
-
+  mean: 0.0001
+  std: 0.3791
+  min: -7.5895
+  max: 10.0326
 z0:
   type: min_max_sym
-  mean: -0.015
-  std: 2.254
-  min: -400
-  max: 400
-
-#chi2:
-#    type: min_max_sym
-#    fn: sqrt
-#    mean: 4.594
-#    std: 2.435
-#    min: 0.004
-#    max: 100
-
-#ndf:
-#  type: min_max_sym
-#  mean: 17.949
-#  std: 7.345
-#  min: 1.000
-#  max: 51.000
-
-#radiusofinnermosthit:
-#  type: min_max_sym
-#  fn: sqrt
-#  mean: 6.105
-#  std: 1.963
-#  min: 5.583
-#  max: 35.718
-
+  mean: -0.5599
+  std: 54.7377
+  min: -152.9118
+  max: 238.8475
 tanlambda:
   type: min_max_sym
-  mean: -0.002
-  std: 2.235
-  min: -5
-  max: 5
-
+  mean: 0.0258
+  std: 3.0561
+  min: -10.0253
+  max: 10.0293
 omega:
   type: std
-  mean: 0.000
-  std: 0.003
-  min: -0.033
-  max: 0.033
+  mean: 0.0
+  std: 0.0005
+  min: -0.0013
+  max: 0.0012
