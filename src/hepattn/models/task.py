@@ -1123,7 +1123,13 @@ class IncidenceBasedRegressionTask(RegressionTask):
         # get the predictions
         if self.use_incidence:
             inc = x["incidence"].detach()
+            #print('x:',x)
+
             proxy_feats, is_charged = self.get_proxy_feats(inc, x, class_probs=x["class_probs"].detach())
+            #print("Proxy features shape:", proxy_feats.shape)
+            #print(proxy_feats)
+            #print("Is charged shape:", is_charged.shape)
+            #print(is_charged)
             input_data = torch.cat(
                 [
                     x[self.input_object + "_embed"],
@@ -1251,7 +1257,9 @@ class IncidenceBasedRegressionTask(RegressionTask):
         is_charged = class_probs.argmax(-1) < 3
 
         proxy_feats_charged = torch.bmm(charged_inc, proxy_feats)
+        proxy_feats_charged[..., 2] = torch.clamp(proxy_feats_charged[..., 2], -3, 3)
         proxy_feats_charged[..., 0] = proxy_feats_charged[..., 1] * torch.cosh(proxy_feats_charged[..., 2])
+        
         proxy_feats_charged = self.scale_proxy_feats(proxy_feats_charged) * is_charged.unsqueeze(-1)
 
         inc_e_weighted = incidence * proxy_feats[..., 0].unsqueeze(1)

@@ -83,8 +83,19 @@ class ModelWrapper(LightningModule):
 
         # Compute and log losses
         losses = self.model.loss(outputs, targets)
+        # TODO debugging code to catch NaNs in losses
         total_loss = self.log_losses(losses, "train")
-
+        # add code here grok
+        # Check for NaN and Inf in losses
+        for layer_name, layer_losses in losses.items():
+            for task_name, task_losses in layer_losses.items():
+                for loss_name, loss_value in task_losses.items():
+                    if isinstance(loss_value, torch.Tensor):
+                        if torch.isnan(loss_value).any():
+                            print(f"NaN found in loss: {layer_name}_{task_name}_{loss_name} at batch {batch_idx}")
+                        if torch.isinf(loss_value).any():
+                            print(f"Inf found in loss: {layer_name}_{task_name}_{loss_name} at batch {batch_idx}")
+        #------------
         # Get the predictions from the model
         if batch_idx % self.trainer.log_every_n_steps == 0:  # avoid calling predict if possible
             preds = self.predict(outputs)
@@ -143,7 +154,7 @@ class ModelWrapper(LightningModule):
 
         opt = optimizer(self.model.parameters(), lr=self.lrs_config["initial"], weight_decay=self.lrs_config["weight_decay"])
 
-        if not self.lrs_config.get("skip_scheduler"):
+        if not self.lrs_config.get("skip_scheduler") and self.trainer.estimated_stepping_batches > 1:
             # Configure the learning rate scheduler
             sch = torch.optim.lr_scheduler.OneCycleLR(
                 opt,

@@ -3,15 +3,6 @@ ODD (Open Data Detector) Particle Flow Dataset and DataModule.
 
 Data format: Parquet files loaded via Polars, transformed to NumPy/PyTorch tensors.
 
-Schema:
-- truth_particles: event_id (u32), particle_id (list[u64]), pdg_id (list[i64]), energy (list[f32]),
-                   eta (list[f32]), phi (list[f32]), px (list[f32]), py (list[f32]), pz (list[f32]),
-                   charge (list[f32]), mass (list[f32]), has_track (list[bool])
-- calo_clusters:   event_id (u32), cluster_id (list[i32]), total_cluster_energy (list[f64]),
-                   cluster_cx (list[f32]), cluster_cy (list[f32]), cluster_cz (list[f32])
-- tracks:          event_id (u32), d0 (list[f32]), z0 (list[f32]), phi (list[f32]), theta (list[f32]),
-                   qop (list[f32]), majority_particle_id (list[u64]), hit_ids (list[list[u32]]),
-                   track_id (list[u16])
 """
 
 import gc
@@ -62,8 +53,8 @@ class ODDDataset(Dataset):
         targets: dict,
         scale_dict_path: str,
         num_events: int = -1,
-        num_objects: int = 220,
-        max_nodes: int = 600,
+        num_objects: int = 450,
+        max_nodes: int = 900,
         remove_wrong_idxs: bool = True,
         incidence_cutval: float = 1e-4,
         is_inference: bool = False,
@@ -162,7 +153,7 @@ class ODDDataset(Dataset):
         # ---------------------------------------------------------------------
         
         # --- Tracks ---
-        track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "qop", "phi_int", "eta_int",
+        track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "phi_int", "eta_int",
                       "track_tanlambda", "track_omega", "particle_idx"]
         for var in tqdm(track_vars, desc="Loading Tracks"):
             # explode list column into flat array
@@ -283,7 +274,7 @@ class ODDDataset(Dataset):
         t_z0 = get_t("track_z0", t_start, t_end)
         t_phi = get_t("track_phi", t_start, t_end)
         t_pt = get_t("track_pt", t_start, t_end)
-        t_qop = get_t("track_qop", t_start, t_end)
+        #t_qop = get_t("track_qop", t_start, t_end)
         t_eta = get_t("track_eta", t_start, t_end)
         t_sinphi = get_t("track_sinphi", t_start, t_end)
         t_cosphi = get_t("track_cosphi", t_start, t_end)
@@ -312,14 +303,6 @@ class ODDDataset(Dataset):
         d_cluster_idx = get_t("deps_cluster_idx", d_start, d_end)
         d_energy = get_t("deps_total_energy_deps_in_cluster", d_start, d_end)
 
-        # Scale Features (Assuming self.scaler exists as in CLIC)
-        # We construct the input dictionary matching ODD feature list: 
-        # [d0, z0, phi, theta, qop, energy, eta, is_track]
-        
-        # Note: We concatenate [Tracks, Clusters]
-        # Padding logic:
-        # Tracks have d0, z0, qop. Clusters have 0.
-        # Clusters have Energy. Tracks have 0 (or p? usually 0 in this specific input scheme)
         
         node_features = {
             # Common freatures
@@ -336,7 +319,7 @@ class ODDDataset(Dataset):
             "pt": torch.cat([self.scaler.transforms["pt"].transform(t_pt), torch.zeros(n_clusters, device=t_pt.device)], -1),
             "d0": torch.cat([self.scaler.transforms["d0"].transform(t_d0), torch.zeros(n_clusters, device=t_d0.device)], -1),
             "z0": torch.cat([self.scaler.transforms["z0"].transform(t_z0), torch.zeros(n_clusters, device=t_z0.device)], -1),
-            "qop": torch.cat([self.scaler.transforms["qop"].transform(t_qop), torch.zeros(n_clusters, device=t_qop.device)], -1),
+            #"qop": torch.cat([self.scaler.transforms["qop"].transform(t_qop), torch.zeros(n_clusters, device=t_qop.device)], -1),
             "tanlambda": torch.cat([self.scaler.transforms["tanlambda"].transform(t_tanlambda),torch.zeros(n_clusters, dtype=torch.float32),], -1,),
             "omega": torch.cat([self.scaler.transforms["omega"].transform(t_omega),torch.zeros(n_clusters, dtype=torch.float32),], -1,),
             #radiusofinnermosthit, ndf, chi2 missing from ODD tracks
@@ -446,7 +429,7 @@ class ODDDataset(Dataset):
             noisy_cols = np.where(incidence_matrix.sum(axis=0) == 0)[0]
             fake_rows = np.arange(len(noisy_cols)) + n_particles
             if not (fake_rows < self.num_objects).all():
-                print(f"Warning: fake_rows go beyond maximum ({self.num_objects}) particles. Dropping them!")
+                print(f"Warning: fake_rows go beyond maximum ({self.num_objects})(event_id {idx})({np.max(fake_rows)}) particles. Dropping them!")
                 noisy_cols = noisy_cols[fake_rows < self.num_objects]
                 fake_rows = fake_rows[fake_rows < self.num_objects]
             incidence_matrix[fake_rows, noisy_cols] = 1.0
@@ -461,7 +444,7 @@ class ODDDataset(Dataset):
         is_not_res_mask = particle_class < 5
         indicator[:n_particles][is_not_res_mask] = 1.0
 
-        node_inp_features = torch.stack(list(node_features.values()), dim=-1).float()
+        node_inp_features = torch.stack(list(node_features.values()), dim=-1)
 
         return {
             "node_inp_features": node_inp_features,
@@ -514,7 +497,7 @@ class ODDDataset(Dataset):
 
         # regression targets
         for label in self.targets["particle"]:
-            tgt = torch.full((self.num_objects,), torch.nan)  # number of reconstructed tracks
+            tgt = torch.full((self.num_objects,),0)#torch.nan)  # number of reconstructed tracks
             tgt[: self.n_particles[idx]] = data_dict["particle_data"][label][: self.n_particles[idx]]
             labels[f"particle_{label}"] = tgt
 
@@ -658,7 +641,7 @@ class ODDDataset(Dataset):
             "z0",
             "phi",
             "theta",
-            "qop",
+            #"qop",
             # TODO: Add derived variables like eta, pt, sinphi, cosphi
         ]
 
