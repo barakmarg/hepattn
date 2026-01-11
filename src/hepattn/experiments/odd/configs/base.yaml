@@ -73,7 +73,7 @@ trainer:
       project: odd-pflow
 
   callbacks:
-    - class_path: hepattn.callbacks.Compile
+  # - class_path: hepattn.callbacks.Compile
     - class_path: hepattn.callbacks.InferenceTimer
     - class_path: hepattn.callbacks.SaveConfig
     - class_path: hepattn.callbacks.Checkpoint

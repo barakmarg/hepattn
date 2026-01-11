@@ -199,9 +199,9 @@ class MaskFormer(nn.Module):
                 # Only use the cost from the final set of predictions
                 task_costs = task.cost(layer_outputs[task.name], targets)
                 # ADD DEBUGGING CODE HERE:
-                for name, c in task_costs.items():
-                    if torch.isnan(c).any():
-                        print(f"NaN in cost from task {task.name}, component {name}")
+                #for name, c in task_costs.items():
+                #    if torch.isnan(c).any():
+                #        print(f"NaN in cost from task {task.name}, component {name}")
                 # Add the cost on to our running cost total, otherwise initialise a running cost matrix
                 for cost in task_costs.values():
                     if layer_costs is None:
@@ -220,11 +220,12 @@ class MaskFormer(nn.Module):
         for layer_name, cost in costs.items():
             if cost is None:
                 continue
-            if torch.isnan(cost).any():
-                print(f"Warning: NaN value found in cost matrix at layer {layer_name}")
+
+            #if torch.isnan(cost).any():
+            #    print(f"Warning: NaN value found in cost matrix at layer {layer_name}")
             
-            if torch.isinf(cost).any():
-                print(f"Warning: Inf value found in cost matrix at layer {layer_name}")
+            #if torch.isinf(cost).any():
+            #    print(f"Warning: Inf value found in cost matrix at layer {layer_name}")
 
             # Get the indicies that can permute the predictions to yield their optimal matching
             pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])

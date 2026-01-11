@@ -1248,18 +1248,38 @@ class IncidenceBasedRegressionTask(RegressionTask):
         charged_inc_top2 = (topk_attn(charged_inc, 2, dim=-2) & (charged_inc > 0)).float()
         charged_inc_max = charged_inc.max(-2, keepdim=True)[0]
         charged_inc_new = (charged_inc == charged_inc_max) & (charged_inc > 0)
+        # ------------------------
+        particle_max_idx = charged_inc.argmax(dim=-1, keepdim=True)
+        # Create a mask that is True only at that specific index
+        is_first_max_particle = torch.zeros_like(charged_inc, dtype=torch.bool).scatter_(-1, particle_max_idx, True)
+        # Apply the filter
+        charged_inc_new = charged_inc_new & is_first_max_particle
+        # ---------------------
         # TODO: check this
         # charged_inc_new = charged_inc.float()
         zero_track_mask = charged_inc_new.sum(-1, keepdim=True) == 0
         charged_inc = torch.where(zero_track_mask, charged_inc_top2, charged_inc_new)
 
+        # -------------------------
+        # --- ADDED: Final Cleanup (Fixes the Top2/Recovery duplicates) ---
+        # 1. Look at the incidence scores ONLY for the tracks we have currently selected
+        current_scores = incidence * charged_inc
+        # 2. Find the single best track among the selected ones
+        final_best_idx = current_scores.argmax(dim=-1, keepdim=True)
+        # 3. Create a strict mask for that one track
+        final_strict_mask = torch.zeros_like(charged_inc, dtype=torch.bool).scatter_(-1, final_best_idx, True)
+        # 4. Apply the mask. 
+        # Note: If charged_inc was all zeros, intersection with final_strict_mask remains zeros.
+        charged_inc = charged_inc * final_strict_mask.float()
+
+        #-----------------
         # Split charged and neutral
         is_charged = class_probs.argmax(-1) < 3
-
+        #print(torch.max(torch.abs(proxy_feats[..., 2])), 'max eta before proxy scaling')
         proxy_feats_charged = torch.bmm(charged_inc, proxy_feats)
-        proxy_feats_charged[..., 2] = torch.clamp(proxy_feats_charged[..., 2], -3, 3)
-        proxy_feats_charged[..., 0] = proxy_feats_charged[..., 1] * torch.cosh(proxy_feats_charged[..., 2])
+        #print(torch.max(torch.abs(proxy_feats_charged[..., 2])), 'max eta after bmm')
         
+        proxy_feats_charged[..., 0] = proxy_feats_charged[..., 1] * torch.cosh(proxy_feats_charged[..., 2])
         proxy_feats_charged = self.scale_proxy_feats(proxy_feats_charged) * is_charged.unsqueeze(-1)
 
         inc_e_weighted = incidence * proxy_feats[..., 0].unsqueeze(1)
