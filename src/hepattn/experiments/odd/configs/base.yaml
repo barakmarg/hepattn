@@ -35,20 +35,20 @@ data:
 
   # TODO: Update paths to your parquet files, seperate for train/val/test
   train_path: /storage/agrp/barakma/PileupODD/data/train
-  valid_path: /storage/agrp/barakma/PileupODD/data/val
-  test_path: /storage/agrp/barakma/PileupODD/data/test
+  valid_path: /storage/agrp/barakma/PileupODD/data/train
+  test_path: /storage/agrp/barakma/PileupODD/data/train
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 2
-  num_train: 100      # -1 for all events
-  num_test: 40
-  num_val: 40
+  num_train: 1000      # -1 for all events
+  num_test: 1000
+  num_val: 1000
 
   batch_size: 32    # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Path to variable transformation config
-  scale_dict_path: &scale_dict_path configs/odd_var_transform.yaml
+  scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd/configs/odd_var_transform.yaml
 
   # TODO: Adjust max_nodes based on your data
   max_nodes: 600
@@ -73,7 +73,7 @@ trainer:
       project: odd-pflow
 
   callbacks:
-  # - class_path: hepattn.callbacks.Compile
+    - class_path: hepattn.callbacks.Compile
     - class_path: hepattn.callbacks.InferenceTimer
     - class_path: hepattn.callbacks.SaveConfig
     - class_path: hepattn.callbacks.Checkpoint
@@ -91,14 +91,14 @@ trainer:
 # Model Configuration
 # =============================================================================
 model:
-  optimizer: AdamW  # Changed from AdamW to match CLIC
+  optimizer: Lion  # Changed from AdamW to match CLIC
 
   lrs_config:
-    initial: 1e-7   
-    max: 2e-5      
+    initial: 1e-6
+    max: 8e-5
     end: 1e-6
     pct_start: 0.05
-    weight_decay: 1e-2
+    weight_decay: 1e-4
     skip_scheduler: false
 
   mtl: false

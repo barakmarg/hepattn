@@ -30,7 +30,8 @@ class ODDPFlow(ModelWrapper):
 
         # skip detailed metrics for efficiency
         if stage == "train":
-            return
+            pass
+            #return
 
         # get info
         pred_valid = None
