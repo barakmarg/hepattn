@@ -40,9 +40,9 @@ data:
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 2
-  num_train: 1000      # -1 for all events
-  num_test: 1000
-  num_val: 1000
+  num_train: 64      # -1 for all events
+  num_test: 64
+  num_val: 64
 
   batch_size: 32    # Increased from 128 to match CLIC
   incidence_cutval: 0.01

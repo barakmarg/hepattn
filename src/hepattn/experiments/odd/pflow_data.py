@@ -133,6 +133,13 @@ class ODDDataset(Dataset):
         
         print(f"Total events: {len(mask)}")
         print(f"Removing {(~mask).sum()} events with too many nodes or particles")
+
+        if num_events != -1:
+            valid_indices = np.where(mask)[0]
+            if len(valid_indices) > num_events:
+                print(f"Limiting to {num_events} events as requested")
+                # Drop valid events beyond the requested number
+                mask[valid_indices[num_events:]] = False
         
         self.num_events = mask.sum()
         
