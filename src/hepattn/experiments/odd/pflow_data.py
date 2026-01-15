@@ -148,7 +148,8 @@ class ODDDataset(Dataset):
         self.n_clusters = n_clusters[mask]
         self.n_particles = n_particles[mask]
         self.n_deps = n_deps[mask]
-        self.event_number = np.arange(self.num_events) # Or use df_tracks["event_id"].filter(mask)
+        # 
+        self.event_number =  df_tracks["event_id"].filter(mask)
 
         # Apply filter to DataFrames
         df_tracks = df_tracks.filter(mask)

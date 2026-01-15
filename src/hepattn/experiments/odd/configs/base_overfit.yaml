@@ -40,9 +40,9 @@ data:
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 2
-  num_train: 1000      # -1 for all events
-  num_test: 1000
-  num_val: 1000
+  num_train: 32      # -1 for all events
+  num_test: 32
+  num_val: 32
 
   batch_size: 32    # Increased from 128 to match CLIC
   incidence_cutval: 0.01
@@ -57,10 +57,10 @@ data:
 # Trainer Configuration
 # =============================================================================
 trainer:
-  max_epochs: 200
+  max_epochs: 2500
   accelerator: gpu
   devices: 1
-  precision: bf16-mixed
+  precision: 32-true #bf16-mixed
   gradient_clip_val: 0.1
   log_every_n_steps: 50
   default_root_dir: logs
@@ -91,15 +91,16 @@ trainer:
 # Model Configuration
 # =============================================================================
 model:
-  optimizer: Lion  # Changed from AdamW to match CLIC
+  optimizer: AdamW  # Changed from AdamW to match CLIC
 
   lrs_config:
-    initial: 1e-6
-    max: 8e-5
-    end: 1e-6
-    pct_start: 0.05
-    weight_decay: 1e-4
-    skip_scheduler: false
+    initial: 3e-4
+    #max: 8e-5
+    #end: 1e-6
+    #pct_start: 0.05
+    weight_decay: 0
+    #initial: 3e-4   
+    skip_scheduler: true
 
   mtl: false
 
@@ -152,7 +153,7 @@ model:
         init_args:
           num_layers: 6
           dim: *dim
-          attn_type: flash-varlen
+          attn_type: torch #flash-varlen
           hybrid_norm: true
           value_residual: true
           num_register_tokens: 8
