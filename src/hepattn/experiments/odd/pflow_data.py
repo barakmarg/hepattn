@@ -109,92 +109,192 @@ class ODDDataset(Dataset):
     def load_data(self, file_dir: str, num_events: int) -> None:
         """
         Load data from parquet file(s) using Polars.
+        Memory efficient version: loads sequentially and accumulates tensors.
         """
         self.full_data_array = {}
-
-        # TODO: Load parquet file(s)
-        # df = pl.read_parquet(self.filepath)
-        # or if multiple files:
-        df_particles = pl.read_parquet(f"{file_dir}/target_particles.parquet")
-        df_clusters = pl.read_parquet(f"{file_dir}/calo_clusters.parquet")
-        df_deps = pl.read_parquet(f"{file_dir}/target_particles_deps.parquet")
-        df_tracks = pl.read_parquet(f"{file_dir}/tracks.parquet")
-
-        n_tracks = df_tracks.select(pl.col("track_id").list.len()).to_series().to_numpy()
-        n_clusters = df_clusters.select(pl.col("cluster_id").list.len()).to_series().to_numpy()
-        n_particles = df_particles.select(pl.col("particle_id").list.len()).to_series().to_numpy()
-        n_deps = df_deps.select(pl.col("particle_idx").list.len()).to_series().to_numpy()
-
-
-        # 3. Filter Events
+        
+        # 1. Identify Files
         # ---------------------------------------------------------------------
-        n_nodes = n_tracks + n_clusters
-        mask = (n_nodes < self.max_nodes) & (n_particles < self.num_objects)
+        file_dir_path = Path(file_dir)
         
-        print(f"Total events: {len(mask)}")
-        print(f"Removing {(~mask).sum()} events with too many nodes or particles")
 
-        if num_events != -1:
-            valid_indices = np.where(mask)[0]
-            if len(valid_indices) > num_events:
-                print(f"Limiting to {num_events} events as requested")
-                # Drop valid events beyond the requested number
-                mask[valid_indices[num_events:]] = False
+        # Check for sharded mode - look for target_particles-*.parquet
+        # Using glob to find all matching files
+        files = sorted(list(file_dir_path.glob("target_particles-*.parquet")))
         
-        self.num_events = mask.sum()
-        
-        # Apply filter to counts
-        self.n_tracks = n_tracks[mask]
-        self.n_clusters = n_clusters[mask]
-        self.n_particles = n_particles[mask]
-        self.n_deps = n_deps[mask]
-        # 
-        self.event_number =  df_tracks["event_id"].filter(mask)
-
-        # Apply filter to DataFrames
-        df_tracks = df_tracks.filter(mask)
-        df_clusters = df_clusters.filter(mask)
-        df_particles = df_particles.filter(mask)
-        df_deps = df_deps.filter(mask)
-
-        # 4. Flatten and Store Features (Polars explode -> NumPy)
+        if not files:
+            # If no sharded files and no single file, try the original heuristic logic
+            # or raise error. Original code assumed {file_dir}/target_particles-{i:05d}.parquet
+            # We will assume that if the user didn't provide files, maybe they are generated on the fly?
+            # But for now let's assume valid files exist or we fail gracefully / use heuristic.
+            print(f"Warning: No parquet files found in {file_dir} via glob. Using heuristic indices.")
+            num_of_files = num_events // 1000 + 1 if num_events != -1 else 50
+            files_indices = list(range(num_of_files))
+        else:
+                # Extract indices from filenames: target_particles-{i:05d}.parquet
+            try:
+                files_indices = [int(f.name.split('-')[-1].split('.')[0]) for f in files]
+            except (ValueError, IndexError):
+                print("Warning: Could not parse indices from filenames. Using sequential index.")
+                files_indices = list(range(len(files)))
+            
+        # 2. Sequential Loading and Accumulation
         # ---------------------------------------------------------------------
         
-        # --- Tracks ---
+        accumulated_data = {} # Key -> List of Tensors
+        accumulated_counts = {
+            "n_tracks": [],
+            "n_clusters": [],
+            "n_particles": [],
+            "n_deps": [],
+            "event_id": []
+        }
+        
+        total_events_loaded = 0
+        
+        # List of variables to extract (keeping consistent with original code)
         track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "phi_int", "eta_int",
                       "track_tanlambda", "track_omega", "particle_idx"]
-        for var in tqdm(track_vars, desc="Loading Tracks"):
-            # explode list column into flat array
-            flat_arr = df_tracks.select(pl.col(var).explode()).to_series().to_torch()
-            var2 = var.replace("track_","")
-            self.full_data_array[f"track_{var2}"] = flat_arr
+        cluster_vars = ["total_cluster_energy", "cluster_rho",
+                        "cluster_eta", "cluster_phi",
+                        "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
+        particle_vars = ["energy", "eta", "phi", "pdg_id", "charge", "particle_id", "has_track", "pt"]
+        deps_vars = ["total_energy_deps_in_cluster", "particle_idx", "cluster_idx"]
 
+        if num_events != -1:
+            pbar = tqdm(total=num_events, desc="Loading Events", unit="evt")
+        else:
+            pbar = tqdm(total=len(files_indices), desc="Loading Files", unit="file")
+        
+        for i, idx in enumerate(files_indices):
+            if num_events != -1 and total_events_loaded >= num_events:
+                break
+                
+            print(f"Processing file index {idx} (File {i+1}/{len(files_indices)})")
+    
+            df_particles = pl.read_parquet(file_dir_path / f"target_particles-{idx:05d}.parquet")
+            df_clusters = pl.read_parquet(file_dir_path / f"calo_clusters-{idx:05d}.parquet")
+            df_deps = pl.read_parquet(file_dir_path / f"target_particles_deps-{idx:05d}.parquet")
+            df_tracks = pl.read_parquet(file_dir_path / f"tracks-{idx:05d}.parquet")
+
+            # B. Filter (Locally)
+            n_tracks = df_tracks.select(pl.col("track_id").list.len()).to_series().to_numpy()
+            n_clusters = df_clusters.select(pl.col("cluster_id").list.len()).to_series().to_numpy()
+            n_particles = df_particles.select(pl.col("particle_id").list.len()).to_series().to_numpy()
+            n_deps = df_deps.select(pl.col("particle_idx").list.len()).to_series().to_numpy()
+
+            n_nodes = n_tracks + n_clusters
+            mask = (n_nodes < self.max_nodes) & (n_particles < self.num_objects)
+            
+            # Check if we need to trim the batch to meet exact num_events
+            valid_count = mask.sum()
+            if num_events != -1 and total_events_loaded + valid_count > num_events:
+                needed = num_events - total_events_loaded
+                # Find indices of the first 'needed' True values
+                valid_indices = np.where(mask)[0]
+                if len(valid_indices) > needed:
+                    # Set mask to False for excess events
+                    mask[valid_indices[needed:]] = False
+                valid_count = mask.sum()
+
+            if valid_count == 0:
+                del df_particles, df_clusters, df_deps, df_tracks, n_tracks, n_clusters, n_nodes, mask, n_particles, n_deps
+                gc.collect()
+                if num_events == -1:
+                    pbar.update(1)
+                continue
+
+            total_events_loaded += valid_count
+            if num_events != -1:
+                pbar.update(valid_count)
+            else:
+                pbar.update(1)
+            
+            # Apply Filter
+            df_tracks = df_tracks.filter(mask)
+            df_clusters = df_clusters.filter(mask)
+            df_particles = df_particles.filter(mask)
+            df_deps = df_deps.filter(mask)
+            
+            # Counts
+            accumulated_counts["n_tracks"].append(n_tracks[mask])
+            accumulated_counts["n_clusters"].append(n_clusters[mask])
+            accumulated_counts["n_particles"].append(n_particles[mask])
+            accumulated_counts["n_deps"].append(n_deps[mask])
+            accumulated_counts["event_id"].append(df_tracks["event_id"].to_numpy())
+
+            # C. Extract Features to Tensors
+            def safe_append(name, value):
+                if name not in accumulated_data: accumulated_data[name] = []
+                
+                # Check for floating point and cast immediately to save RAM
+                if isinstance(value, torch.Tensor) and value.is_floating_point():
+                    if value.dtype == torch.float64:
+                        value = value.float() # Downcast to float32
+                accumulated_data[name].append(value)
+
+            # Tracks
+            for var in track_vars:
+                # explode list column into flat array
+                flat_arr = df_tracks.select(pl.col(var).explode()).to_series().to_torch()
+                var2 = var.replace("track_","")
+                safe_append(f"track_{var2}", flat_arr)
+            
+            # Clusters
+            for var in cluster_vars:
+                flat_arr = df_clusters.select(pl.col(var).explode()).to_series().to_torch()
+                safe_append(var, flat_arr)
+
+            # Particles
+            for var in particle_vars:
+                flat_arr = df_particles.select(pl.col(var).explode()).to_series().to_torch()
+                safe_append(f"particle_{var}", flat_arr)
+                
+            # Deps
+            for var in deps_vars:
+                flat_arr = df_deps.select(pl.col(var).explode()).to_series().to_torch()
+                safe_append(f"deps_{var}", flat_arr)
+
+            # Cleanup
+            del df_particles, df_clusters, df_deps, df_tracks, n_tracks, n_clusters, n_nodes, mask, n_particles, n_deps
+            # Explicit garbage collection to free Polars memory
+            gc.collect()
+            
+        pbar.close()
+
+        # 3. Concatenate and Finalize
+        # ---------------------------------------------------------------------
+        print(f"Loaded {total_events_loaded} events. Concatenating arrays...")
+        if total_events_loaded == 0:
+             print("Warning: No events loaded!")
+             return
+
+        self.num_events = total_events_loaded
+        
+        # Concatenate counts
+        self.n_tracks = np.concatenate(accumulated_counts["n_tracks"])
+        self.n_clusters = np.concatenate(accumulated_counts["n_clusters"])
+        self.n_particles = np.concatenate(accumulated_counts["n_particles"])
+        self.n_deps = np.concatenate(accumulated_counts["n_deps"])
+        self.event_number = np.concatenate(accumulated_counts["event_id"]) # Original used pl.Series/DataFrame column behaviour
+
+        # Concatenate features
+        for key, tensor_list in accumulated_data.items():
+            self.full_data_array[key] = torch.cat(tensor_list)
+
+        # 4. Computed / Derived Features
+        # ---------------------------------------------------------------------
         self.full_data_array["track_sinphi"] = np.sin(self.full_data_array["track_phi"])
         self.full_data_array["track_cosphi"] = np.cos(self.full_data_array["track_phi"])
+        
         # --- Derived Track Features ---
         phi_int = self.full_data_array["track_phi_int"]
         self.full_data_array["track_sinphi_int"] = np.sin(phi_int)
         self.full_data_array["track_cosphi_int"] = np.cos(phi_int)
-
-        # --- Clusters (Calo) ---
-        cluster_vars = ["total_cluster_energy", "cluster_rho",
-                        "cluster_eta", "cluster_phi",
-                        "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
-        for var in tqdm(cluster_vars, desc="Loading Clusters"):
-            flat_arr = df_clusters.select(pl.col(var).explode()).to_series().to_torch()
-            self.full_data_array[var] = flat_arr
-
-        # Derived Cluster Features (Cartesian -> Spherical)
         
         self.full_data_array["cluster_e"] = self.full_data_array["total_cluster_energy"]
         self.full_data_array["cluster_sinphi"] = np.sin(self.full_data_array["cluster_phi"])
         self.full_data_array["cluster_cosphi"] = np.cos(self.full_data_array["cluster_phi"])
-
-        # --- Particles (Truth) ---
-        particle_vars = ["energy", "eta", "phi", "pdg_id", "charge", "particle_id", "has_track", "pt"]
-        for var in tqdm(particle_vars, desc="Loading Particles"):
-            flat_arr = df_particles.select(pl.col(var).explode()).to_series().to_torch()
-            self.full_data_array[f"particle_{var}"] = flat_arr
 
         # Map PDG ID to Class
         pdg_ids = self.full_data_array["particle_pdg_id"]
@@ -206,11 +306,6 @@ class ODDDataset(Dataset):
             [self.class_labels[int(x)] for x in pdg_ids_np], 
             dtype=torch.long
         )
-        # --- Deps (Incidence) ---
-        deps_vars = ["total_energy_deps_in_cluster", "particle_idx", "cluster_idx"]
-        for var in tqdm(deps_vars, desc="Loading Deps"):
-            flat_arr = df_deps.select(pl.col(var).explode()).to_series().to_torch()
-            self.full_data_array[f"deps_{var}"] = flat_arr
         
         # convert dtype from float to int
         self.full_data_array["deps_particle_idx"] = self.full_data_array["deps_particle_idx"].to(torch.int64)

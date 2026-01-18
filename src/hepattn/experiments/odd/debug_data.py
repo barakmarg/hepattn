@@ -34,7 +34,7 @@ def debug_load():
         inputs=inputs,
         targets=targets,
         scale_dict_path=scale_path,
-        num_events=-1, # Load all available
+        num_events=2100, # Load all available
         num_objects=450,
         max_nodes=900,
         remove_wrong_idxs=True,
