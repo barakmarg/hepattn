@@ -151,6 +151,9 @@ class ODDDataset(Dataset):
         }
         
         total_events_loaded = 0
+        stats_total_events = 0 # New
+        stats_dropped_nodes = 0 # New
+        stats_dropped_particles = 0 # New
         
         # List of variables to extract (keeping consistent with original code)
         track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "phi_int", "eta_int",
@@ -184,7 +187,15 @@ class ODDDataset(Dataset):
             n_deps = df_deps.select(pl.col("particle_idx").list.len()).to_series().to_numpy()
 
             n_nodes = n_tracks + n_clusters
-            mask = (n_nodes < self.max_nodes) & (n_particles < self.num_objects)
+            
+            # Update Stats
+            stats_total_events += len(n_nodes)
+            mask_nodes_ok = n_nodes < self.max_nodes
+            mask_particles_ok = n_particles < self.num_objects
+            stats_dropped_nodes += (~mask_nodes_ok).sum()
+            stats_dropped_particles += (~mask_particles_ok).sum()
+
+            mask = mask_nodes_ok & mask_particles_ok
             
             # Check if we need to trim the batch to meet exact num_events
             valid_count = mask.sum()
@@ -264,6 +275,13 @@ class ODDDataset(Dataset):
 
         # 3. Concatenate and Finalize
         # ---------------------------------------------------------------------
+        print(f"--- Filtering Statistics ---")
+        print(f"Total events processed: {stats_total_events}")
+        print(f"Events dropped (Too many nodes > {self.max_nodes}): {stats_dropped_nodes}")
+        print(f"Events dropped (Too many particles > {self.num_objects}): {stats_dropped_particles}")
+        print(f"Total events kept: {total_events_loaded}")
+        print(f"----------------------------")
+
         print(f"Loaded {total_events_loaded} events. Concatenating arrays...")
         if total_events_loaded == 0:
              print("Warning: No events loaded!")

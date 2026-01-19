@@ -31,20 +31,20 @@ data:
       - cosphi
 
   # Maximum number of output particles
-  num_objects: &num_particles 450
+  num_objects: &num_particles 350
 
   # TODO: Update paths to your parquet files, seperate for train/val/test
-  train_path: /storage/agrp/barakma/PileupODD/data/train
-  valid_path: /storage/agrp/barakma/PileupODD/data/train
-  test_path: /storage/agrp/barakma/PileupODD/data/train
+  train_path: /storage/agrp/barakma/PileupODD/data/unify
+  valid_path: /storage/agrp/barakma/PileupODD/data/unify
+  test_path: /storage/agrp/barakma/PileupODD/data/unify
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
-  num_workers: 2
-  num_train: 1000      # -1 for all events
-  num_test: 1000
-  num_val: 1000
+  num_workers: 6
+  num_train: -1      # -1 for all events
+  num_test: 2000
+  num_val: 2000
 
-  batch_size: 32    # Increased from 128 to match CLIC
+  batch_size: 64    # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Path to variable transformation config
@@ -57,7 +57,7 @@ data:
 # Trainer Configuration
 # =============================================================================
 trainer:
-  max_epochs: 200
+  max_epochs: 30
   accelerator: gpu
   devices: 1
   precision: bf16-mixed
@@ -94,9 +94,9 @@ model:
   optimizer: Lion  # Changed from AdamW to match CLIC
 
   lrs_config:
-    initial: 1e-6
-    max: 8e-5
-    end: 1e-6
+    initial: 4e-6
+    max: 1e-3
+    end: 4e-5
     pct_start: 0.05
     weight_decay: 1e-4
     skip_scheduler: false

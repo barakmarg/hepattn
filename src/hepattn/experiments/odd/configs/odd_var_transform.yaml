@@ -24,6 +24,13 @@ pt:
   std: 1.2137
   min: 0.8439
   max: 42.8814
+cluster_pt:
+  type: min_max_sym
+  fn: sqrt
+  mean: 0.7611
+  std: 0.824
+  min: 0.1301
+  max: 21.882
 sigma_eta:
   type: std
   fn: sqrt
