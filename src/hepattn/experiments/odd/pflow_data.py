@@ -58,6 +58,7 @@ class ODDDataset(Dataset):
         remove_wrong_idxs: bool = True,
         incidence_cutval: float = 1e-4,
         is_inference: bool = False,
+        files_list: list[Path] | None = None,
     ):
         """
         Initialize ODD Dataset.
@@ -73,12 +74,9 @@ class ODDDataset(Dataset):
             remove_wrong_idxs: Whether to remove events with invalid indices
             incidence_cutval: Threshold for incidence matrix values
             is_inference: Whether running in inference mode
+            files_list: Optional list of files to load (supercedes globbing in filepath)
         """
         super().__init__()
-
-        self.sampling_seed = 42
-        np.random.default_rng(self.sampling_seed)
-        seed_everything(self.sampling_seed, workers=True)
 
         self.scaler = FeatureScaler(scale_dict_path)
 
@@ -90,6 +88,7 @@ class ODDDataset(Dataset):
 
         # Input file handling
         self.filedir = filepath
+        self.files_list = files_list
         # Store configuration
         self.inputs = inputs
         self.targets = targets
@@ -120,7 +119,10 @@ class ODDDataset(Dataset):
 
         # Check for sharded mode - look for target_particles-*.parquet
         # Using glob to find all matching files
-        files = sorted(list(file_dir_path.glob("target_particles-*.parquet")))
+        if self.files_list is not None:
+             files = self.files_list
+        else:
+             files = sorted(list(file_dir_path.glob("target_particles-*.parquet")))
         
         if not files:
             # If no sharded files and no single file, try the original heuristic logic
@@ -804,9 +806,23 @@ class ODDDataModule(L.LightningDataModule):
         num_val: int,
         num_test: int,
         scale_dict_path: str,
+        inputs: dict | None = None,
+        targets: dict | None = None,
+        num_objects: int = 450,
+        max_nodes: int = 900,
+        remove_wrong_idxs: bool = True,
+        incidence_cutval: float = 1e-4,
+        is_inference: bool = False,
         test_path: str | None = None,
         pin_memory: bool = True,
         test_suff: str | None = None,
+        unify_path: str | None = None,
+        enable_split: bool = False,
+        train_split: float = 0.8,
+        val_split: float = 0.1,
+        test_split: float = 0.1,
+        val_and_test_split_same: bool = False,
+        seed: int = 42,
         **kwargs,
     ):
         super().__init__()
@@ -822,27 +838,93 @@ class ODDDataModule(L.LightningDataModule):
         self.pin_memory = pin_memory
         self.test_suff = test_suff
         self.scale_dict_path = scale_dict_path
-        self.kwargs = kwargs
+        
+        self.unify_path = unify_path
+        self.enable_split = enable_split
+        self.train_split = train_split
+        self.val_split = val_split
+        self.test_split = test_split
+        self.val_and_test_split_same = val_and_test_split_same
+        self.seed = seed
+        
+        # Dataset kwargs
+        self.dataset_kwargs = {
+            "inputs": inputs,
+            "targets": targets,
+            "num_objects": num_objects,
+            "max_nodes": max_nodes,
+            "remove_wrong_idxs": remove_wrong_idxs,
+            "incidence_cutval": incidence_cutval,
+            "is_inference": is_inference,
+        }
+        self.dataset_kwargs.update(kwargs)
 
     def setup(self, stage: str):
         if self.trainer.is_global_zero:
             print("-" * 100)
 
+        train_files = None
+        val_files = None
+        test_files = None
+
+        if self.enable_split and self.unify_path:
+             import random
+             path = Path(self.unify_path)
+             # Must use sorted to ensure determinism before shuffle
+             all_files = sorted(list(path.glob("target_particles-*.parquet")))
+             
+             # Deterministic shuffle
+             rng = random.Random(self.seed)
+             rng.shuffle(all_files)
+             
+             n_total = len(all_files)
+             n_train = int(n_total * self.train_split)
+             
+             train_files = all_files[:n_train]
+             
+             if self.val_and_test_split_same:
+                  val_files = all_files[n_train:]
+                  test_files = all_files[n_train:]
+                  if self.trainer.is_global_zero:
+                       print("Using SAME files for Validation and Test (Rest of dataset)")
+             else:
+                  n_val = int(n_total * self.val_split)
+                  val_files = all_files[n_train:n_train+n_val]
+                  test_files = all_files[n_train+n_val:]
+             
+             if self.trainer.is_global_zero:
+                  print(f"Splitting {n_total} files from {self.unify_path}")
+                  print(f"Train: {len(train_files)} files")
+                  print(f"Val: {len(val_files)} files")
+                  print(f"Test: {len(test_files)} files")
+
         # create training and validation datasets
         if stage == "fit":
+            kw = self.dataset_kwargs.copy()
+            path = self.train_path
+            if self.enable_split and self.unify_path:
+                 kw['files_list'] = train_files
+                 path = self.unify_path
+
             self.train_dset = ODDDataset(
-                filepath=self.train_path,
+                filepath=path,
                 num_events=self.num_train,
                 scale_dict_path=self.scale_dict_path,
-                **self.kwargs,
+                **kw,
             )
 
         if stage == "fit":
+            kw = self.dataset_kwargs.copy()
+            path = self.valid_path
+            if self.enable_split and self.unify_path:
+                 kw['files_list'] = val_files
+                 path = self.unify_path
+            
             self.val_dset = ODDDataset(
-                filepath=self.valid_path,
+                filepath=path,
                 num_events=self.num_val,
                 scale_dict_path=self.scale_dict_path,
-                **self.kwargs,
+                **kw,
             )
 
         # Only print train/val dataset details when actually training
@@ -851,12 +933,20 @@ class ODDDataModule(L.LightningDataModule):
             print(f"Created validation dataset with {len(self.val_dset):,} events")
 
         if stage == "test":
-            assert self.test_path is not None, "No test file specified, see --data.test_path"
+            kw = self.dataset_kwargs.copy()
+            path = self.test_path
+            
+            if self.enable_split and self.unify_path:
+                kw['files_list'] = test_files
+                path = self.unify_path
+            elif self.test_path is None:
+                 assert self.test_path is not None, "No test file specified, see --data.test_path"
+            
             self.test_dset = ODDDataset(
-                filepath=self.test_path,
+                filepath=path,
                 num_events=self.num_test,
                 scale_dict_path=self.scale_dict_path,
-                **self.kwargs,
+                **kw,
             )
             print(f"Created test dataset with {len(self.test_dset):,} events")
 
