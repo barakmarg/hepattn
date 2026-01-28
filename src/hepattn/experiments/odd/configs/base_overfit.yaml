@@ -35,8 +35,15 @@ data:
 
   # TODO: Update paths to your parquet files, seperate for train/val/test
   train_path: /storage/agrp/barakma/PileupODD/data/train
-  valid_path: /storage/agrp/barakma/PileupODD/data/train
-  test_path: /storage/agrp/barakma/PileupODD/data/train
+  valid_path: /storage/agrp/barakma/PileupODD/data/val
+  test_path: /storage/agrp/barakma/PileupODD/data/test
+  
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu0
+  enable_split: true
+  train_split: 0.9
+  val_split: 0.1
+  test_split: 0.1
+  val_and_test_split_same: true
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 2

@@ -860,7 +860,11 @@ class ODDDataModule(L.LightningDataModule):
         self.dataset_kwargs.update(kwargs)
 
     def setup(self, stage: str):
-        if self.trainer.is_global_zero:
+        is_global_zero = True
+        if self.trainer is not None:
+             is_global_zero = self.trainer.is_global_zero
+        
+        if is_global_zero:
             print("-" * 100)
 
         train_files = None
@@ -885,18 +889,18 @@ class ODDDataModule(L.LightningDataModule):
              if self.val_and_test_split_same:
                   val_files = all_files[n_train:]
                   test_files = all_files[n_train:]
-                  if self.trainer.is_global_zero:
+                  if is_global_zero:
                        print("Using SAME files for Validation and Test (Rest of dataset)")
              else:
                   n_val = int(n_total * self.val_split)
                   val_files = all_files[n_train:n_train+n_val]
                   test_files = all_files[n_train+n_val:]
              
-             if self.trainer.is_global_zero:
+             if is_global_zero:
                   print(f"Splitting {n_total} files from {self.unify_path}")
-                  print(f"Train: {len(train_files)} files")
-                  print(f"Val: {len(val_files)} files")
-                  print(f"Test: {len(test_files)} files")
+                  print(f"Train: {(train_files)} files")
+                  print(f"Val: {(val_files)} files")
+                  print(f"Test: {(test_files)} files")
 
         # create training and validation datasets
         if stage == "fit":
@@ -928,7 +932,7 @@ class ODDDataModule(L.LightningDataModule):
             )
 
         # Only print train/val dataset details when actually training
-        if stage == "fit" and self.trainer.is_global_zero:
+        if stage == "fit" and is_global_zero:
             print(f"Created training dataset with {len(self.train_dset):,} events")
             print(f"Created validation dataset with {len(self.val_dset):,} events")
 
@@ -950,7 +954,7 @@ class ODDDataModule(L.LightningDataModule):
             )
             print(f"Created test dataset with {len(self.test_dset):,} events")
 
-        if self.trainer.is_global_zero:
+        if is_global_zero:
             print("-" * 100, "\n")
 
     def get_dataloader(self, stage: str, dataset: ODDDataset, shuffle: bool):
@@ -966,13 +970,16 @@ class ODDDataModule(L.LightningDataModule):
         )
 
     def train_dataloader(self):
-        print("Instantiating train dataloader on rank", self.trainer.local_rank)
+        rank = 0 if self.trainer is None else self.trainer.local_rank
+        print("Instantiating train dataloader on rank", rank)
         return self.get_dataloader(dataset=self.train_dset, stage="fit", shuffle=True)
 
     def val_dataloader(self):
-        print("Instantiating validation dataloader on rank", self.trainer.local_rank)
+        rank = 0 if self.trainer is None else self.trainer.local_rank
+        print("Instantiating validation dataloader on rank", rank)
         return self.get_dataloader(dataset=self.val_dset, stage="test", shuffle=False)
 
     def test_dataloader(self):
-        print("Instantiating test dataloader on rank", self.trainer.local_rank)
+        rank = 0 if self.trainer is None else self.trainer.local_rank
+        print("Instantiating test dataloader on rank", rank)
         return self.get_dataloader(dataset=self.test_dset, stage="test", shuffle=False)

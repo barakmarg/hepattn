@@ -21,8 +21,8 @@ def debug_load():
         "particle": ["e", "pt", "eta", "sinphi", "cosphi"]
     }
     
-    # Path to your data - using train path from config
-    data_path = "/storage/agrp/barakma/PileupODD/data/train"
+    # Path to your data - using unify path from config
+    data_path = "/storage/agrp/barakma/PileupODD/data/ttbar_pu0"
     # Using absolute path for config
     scale_path = "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd/configs/odd_var_transform.yaml"
     
@@ -34,9 +34,9 @@ def debug_load():
         inputs=inputs,
         targets=targets,
         scale_dict_path=scale_path,
-        num_events=-1, # Load all available
+        num_events=5000, # Load all available
         num_objects=350,
-        max_nodes=900,
+        max_nodes=650,
         remove_wrong_idxs=True,
         incidence_cutval=0.01,
         is_inference=False
@@ -50,30 +50,6 @@ def debug_load():
             d = dataset[i]
             inputs, labels = d
             
-            # Check for NaN values in inputs
-            for key, val in inputs.items():
-                if isinstance(val, torch.Tensor) and val.is_floating_point():
-
-                    max_val = torch.abs(val).max().item()
-                    if max_val > 1e-1:
-                        pass#print(f"Event {i}: Large value in {key}: {max_val}")
-                    
-                    if torch.isnan(val).any():
-                        print(f"Event {i}: NaN values found in {key}")
-                    if torch.isinf(val).any():
-                        print(f"Event {i}: Inf values found in {key}")
-            
-            # Check for NaN, Inf, and large values in labels
-            for key, val in labels.items():
-                if isinstance(val, torch.Tensor) and val.is_floating_point():
-                    max_val = torch.abs(val).max().item()
-                    if max_val > 1e2:
-                        pass#print(f"Event {i}: Large value in labels {key}: {max_val}")
-                    
-                    if torch.isnan(val).any():
-                        print(f"Event {i}: NaN values found in labels {key}")
-                    if torch.isinf(val).any():
-                        print(f"Event {i}: Inf values found in labels {key}")
             
         except Exception as e:
             print(f"Failed at index {i}: {e}")
