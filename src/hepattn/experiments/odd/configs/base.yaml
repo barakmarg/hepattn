@@ -31,7 +31,7 @@ data:
       - cosphi
 
   # Maximum number of output particles
-  num_objects: &num_particles 350
+  num_objects: &num_particles 400
 
   # TODO: Update paths to your parquet files, seperate for train/val/test
   train_path: /storage/agrp/barakma/PileupODD/data/train
@@ -48,8 +48,8 @@ data:
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 6
   num_train: -1      # -1 for all events
-  num_test: 2000
-  num_val: 2000
+  num_test: -1
+  num_val: -1
 
   batch_size: 64    # Increased from 128 to match CLIC
   incidence_cutval: 0.01
