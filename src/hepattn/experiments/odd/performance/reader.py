@@ -171,24 +171,28 @@ def load_truth_odd(truth_path, event_indices, num_of_events_per_file=1000):
         ("particle_pt", "pt"),
         ("particle_eta", "eta"),
         ("particle_phi", "phi"),
-        ("particle_energy", "energy"),
+        ("particle_e", "energy"),
         ("particle_pdg", "pdg_id"),
     ]
-    file_indices = np.unique(event_indices // num_of_events_per_file    )
+    file_indices = np.unique(event_indices // num_of_events_per_file)
     for idx in file_indices:
         df_particles = pl.read_parquet(truth_path / f"truth_particles-{idx:05d}.parquet")
         df_particles = df_particles.filter(pl.col("event_id").is_in(event_indices))
-        for var, col_name in vars_to_load:
-            if var not in truth_dict:
-                truth_dict[var] = []
-            
-
-            arr = df_particles.select(pl.col(col_name).explode()).to_series().to_numpy()         
-            truth_dict[var].append(arr)
+        grouped = df_particles.group_by("event_id", maintain_order=True)
+        for group_key, group_df in grouped:
+            event_id = group_key[0]
+            for var, col_name in vars_to_load:
+                if var not in truth_dict:
+                    truth_dict[var] = []
+                if var == "event_number":
+                    arr = np.array([event_id])
+                else:
+                    arr = group_df.select(pl.col(col_name)).explode(pl.col(col_name)).to_series().to_numpy()
+                truth_dict[var].append(arr)
     
-    # concatenate lists to arrays
+    # convert lists to arrays of arrays
     for var, _ in vars_to_load:
-        truth_dict[var] = np.concatenate(truth_dict[var])
+        truth_dict[var] = np.array(truth_dict[var], dtype=object)
 
     gc.collect()
         

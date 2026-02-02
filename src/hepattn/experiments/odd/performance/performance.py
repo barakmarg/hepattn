@@ -128,6 +128,9 @@ class Performance:
         self.truth_dict, pandora_dict = load_truth_odd(config.truth_path, event_indices)
         # HACK: add pandora dict to data and network configs  # noqa: FIX004
         self.data["pandora"] = pandora_dict
+        # pop pandora
+        self.data.pop("pandora", None)
+        """
         self.config.networks.append(
             NetworkConfig(
                 name="pandora",
@@ -135,6 +138,7 @@ class Performance:
                 network_type=NetworkType.PANDORA,
             )
         )
+        """
 
         self.network_names = [net.name for net in self.config.networks]
         # Initialize flags
