@@ -163,7 +163,7 @@ class ODDDataset(Dataset):
         cluster_vars = ["total_cluster_energy", "cluster_rho",
                         "cluster_eta", "cluster_phi",
                         "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
-        particle_vars = ["energy", "eta", "phi", "pdg_id", "charge", "particle_id", "has_track", "pt"]
+        particle_vars = ["energy", "eta", "phi", "pdg_id", "particle_id", "has_track", "pt"]
         deps_vars = ["total_energy_deps_in_cluster", "particle_idx", "cluster_idx"]
 
         if num_events != -1:
@@ -783,8 +783,6 @@ class ODDDataset(Dataset):
             "px",
             "py",
             "pz",
-            "charge",
-            "mass",
             "pdg_id",
             "has_track",
         ]
