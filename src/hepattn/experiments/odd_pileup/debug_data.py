@@ -7,11 +7,11 @@ import torch
 sys.path.append("/storage/agrp/barakma/hepattn/src")
 
 try:
-    from hepattn.experiments.odd_pileup.pflow_data import ODDDataset
+    from hepattn.experiments.odd_pileup.pflow_data import ODDDatasetPileup
 except ImportError:
     # If running from different location, adjust path
     sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
-    from hepattn.experiments.odd_pileup.pflow_data import ODDDataset
+    from hepattn.experiments.odd_pileup.pflow_data import ODDDatasetPileup
 
 def debug_load():
     inputs = {
@@ -22,21 +22,20 @@ def debug_load():
     }
     
     # Path to your data - using unify path from config
-    data_path = "/storage/agrp/barakma/PileupODD/data/ttbar_pu0"
+    data_path = "/storage/agrp/barakma/PileupODD/data/ttbar_pu200"
     # Using absolute path for config
     scale_path = "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup/configs/odd_var_transform.yaml"
     
     print("Initializing Dataset...")
     # NOTE: Set num_events filters how many events are LOADED into memory from parquet
     # The filter inside load_data will further reduce this based on max_nodes/num_objects
-    dataset = ODDDataset(
+    dataset = ODDDatasetPileup(
         filepath=data_path,
         inputs=inputs,
         targets=targets,
         scale_dict_path=scale_path,
-        num_events=5000, # Load all available
-        num_objects=350,
-        max_nodes=650,
+        num_events=10, # Load all available
+        max_nodes=6500,
         remove_wrong_idxs=True,
         incidence_cutval=0.01,
         is_inference=False

@@ -38,7 +38,7 @@ def is_valid_file(path: str | Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
-class ODDDataset(Dataset):
+class ODDDatasetPileup(Dataset):
     """
     ODD Particle Flow Dataset.
 
@@ -52,10 +52,8 @@ class ODDDataset(Dataset):
         inputs: dict,
         targets: dict,
         scale_dict_path: str,
-        stage: str | None = None,
         num_events: int = -1,
-        num_objects: int = 450,
-        max_nodes: int = 900,
+        max_nodes: int = 7000,
         remove_wrong_idxs: bool = True,
         incidence_cutval: float = 1e-4,
         is_inference: bool = False,
@@ -81,8 +79,6 @@ class ODDDataset(Dataset):
 
         self.scaler = FeatureScaler(scale_dict_path)
         # Stage (e.g., 'train', 'val', 'test') - used to toggle stage-specific logic
-        self.stage = stage
-
         # Initialize class labels mapping (PDG ID -> class index)
         self.init_label_dicts()
 
@@ -95,7 +91,6 @@ class ODDDataset(Dataset):
         # Store configuration
         self.inputs = inputs
         self.targets = targets
-        self.num_objects = num_objects
         self.max_nodes = max_nodes
         self.remove_wrong_idxs = remove_wrong_idxs
         self.incidence_cutval = incidence_cutval
@@ -162,12 +157,11 @@ class ODDDataset(Dataset):
         
         # List of variables to extract (keeping consistent with original code)
         track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "phi_int", "eta_int",
-                      "track_tanlambda", "track_omega", "particle_idx"]
+                      "track_tanlambda", "track_omega", "particle_idx", "vertex_primary"]
         cluster_vars = ["total_cluster_energy", "cluster_rho",
                         "cluster_eta", "cluster_phi",
                         "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
-        particle_vars = ["energy", "eta", "phi", "pdg_id", "particle_id", "has_track", "pt"]
-        deps_vars = ["total_energy_deps_in_cluster", "particle_idx", "cluster_idx"]
+        deps_vars = ["hard_scatter_energy_deps_in_cluster", "cluster_idx"]
 
         if num_events != -1:
             pbar = tqdm(total=num_events, desc="Loading Events", unit="evt")
@@ -187,18 +181,16 @@ class ODDDataset(Dataset):
             n_tracks = df_tracks.select(pl.col("track_id").list.len()).to_series().to_numpy()
             n_clusters = df_clusters.select(pl.col("cluster_id").list.len()).to_series().to_numpy()
             n_particles = df_particles.select(pl.col("particle_id").list.len()).to_series().to_numpy()
-            n_deps = df_deps.select(pl.col("particle_idx").list.len()).to_series().to_numpy()
+            n_deps = df_deps.select(pl.col("cluster_idx").list.len()).to_series().to_numpy()
 
             n_nodes = n_tracks + n_clusters
             
             # Update Stats
             stats_total_events += len(n_nodes)
             mask_nodes_ok = n_nodes < self.max_nodes
-            mask_particles_ok = n_particles < self.num_objects
             stats_dropped_nodes += (~mask_nodes_ok).sum()
-            stats_dropped_particles += (~mask_particles_ok).sum()
 
-            mask = mask_nodes_ok & mask_particles_ok
+            mask = mask_nodes_ok 
             
             # Check if we need to trim the batch to meet exact num_events
             valid_count = mask.sum()
@@ -259,12 +251,6 @@ class ODDDataset(Dataset):
                 flat_arr = df_clusters.select(pl.col(var).explode()).to_series().to_torch()
                 safe_append(var, flat_arr)
 
-            # Particles
-            for var in particle_vars:
-                flat_arr = df_particles.select(pl.col(var).explode()).to_series().to_torch()
-                safe_append(f"particle_{var}", flat_arr)
-                
-            # Deps
             for var in deps_vars:
                 flat_arr = df_deps.select(pl.col(var).explode()).to_series().to_torch()
                 safe_append(f"deps_{var}", flat_arr)
@@ -281,7 +267,6 @@ class ODDDataset(Dataset):
         print(f"--- Filtering Statistics ---")
         print(f"Total events processed: {stats_total_events}")
         print(f"Events dropped (Too many nodes > {self.max_nodes}): {stats_dropped_nodes}")
-        print(f"Events dropped (Too many particles > {self.num_objects}): {stats_dropped_particles}")
         print(f"Total events kept: {total_events_loaded}")
         print(f"----------------------------")
 
@@ -317,19 +302,6 @@ class ODDDataset(Dataset):
         self.full_data_array["cluster_sinphi"] = np.sin(self.full_data_array["cluster_phi"])
         self.full_data_array["cluster_cosphi"] = np.cos(self.full_data_array["cluster_phi"])
 
-        # Map PDG ID to Class
-        pdg_ids = self.full_data_array["particle_pdg_id"]
-        # Convert to numpy for faster iteration and to avoid tensor keys
-        pdg_ids_np = pdg_ids.numpy() if isinstance(pdg_ids, torch.Tensor) else pdg_ids
-        # Use list comprehension which is faster than iterating tensors
-        # Cast to int to match dictionary keys
-        self.full_data_array["particle_class"] = torch.tensor(
-            [self.class_labels[int(x)] for x in pdg_ids_np], 
-            dtype=torch.long
-        )
-        
-        # convert dtype from float to int
-        self.full_data_array["deps_particle_idx"] = self.full_data_array["deps_particle_idx"].to(torch.int64)
         # transform variables and transform to tensors
         for key, val in self.full_data_array.items():
             # 1. Ensure it is a tensor
@@ -379,12 +351,10 @@ class ODDDataset(Dataset):
         # ---------------------------------------------------------------------
         n_tracks = self.n_tracks[idx]
         n_clusters = self.n_clusters[idx]
-        n_particles = self.n_particles[idx]
         n_nodes = n_tracks + n_clusters
         
         t_start, t_end = self.track_cumsum[idx], self.track_cumsum[idx+1]
         c_start, c_end = self.cluster_cumsum[idx], self.cluster_cumsum[idx+1]
-        p_start, p_end = self.particle_cumsum[idx], self.particle_cumsum[idx+1]
         d_start, d_end = self.deps_cumsum[idx], self.deps_cumsum[idx+1]
 
         # 2. Extract & Pad Input Features
@@ -408,7 +378,8 @@ class ODDDataset(Dataset):
         t_sinphi_int = get_t("track_sinphi_int", t_start, t_end)
         t_tanlambda = get_t("track_tanlambda", t_start, t_end)
         t_omega = get_t("track_omega", t_start, t_end)
-        t_particle_idx = get_t("track_particle_idx", t_start, t_end)
+        t_vertex_primary = get_t("track_vertex_primary", t_start, t_end)
+        t_vertex_primary_mask = (t_vertex_primary == 1).float() # New mask for primary vertex tracks
         
         # --- Clusters ---
         c_e = get_t("cluster_e", c_start, c_end)
@@ -423,10 +394,13 @@ class ODDDataset(Dataset):
         c_hcal_fraction = get_t("hcal_fraction", c_start, c_end)
 
         # --- Energy Deposits ---
-        d_particle_idx = get_t("deps_particle_idx", d_start, d_end)
         d_cluster_idx = get_t("deps_cluster_idx", d_start, d_end)
-        d_energy = get_t("deps_total_energy_deps_in_cluster", d_start, d_end)
-
+        d_energy_hard_scatter = get_t("deps_hard_scatter_energy_deps_in_cluster", d_start, d_end)
+        
+        d_energy_hard_scatter_frac = torch.zeros_like(c_e)
+        d_energy_hard_scatter_frac[d_cluster_idx] = d_energy_hard_scatter /(c_e[d_cluster_idx] + 1e-6)
+        d_energy_hard_scatter_energy = torch.zeros_like(c_e)
+        d_energy_hard_scatter_energy[d_cluster_idx] = d_energy_hard_scatter
         
         node_features = {
             # Common freatures
@@ -463,25 +437,9 @@ class ODDDataset(Dataset):
 
         # Raw features (for regression baseline/analysis)
         node_raw_features = {
-            "raw_e": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), c_e], -1),
-            "raw_pt": torch.cat(
-                [
-                    t_pt,
-                    torch.zeros(n_clusters, dtype=torch.float32),
-                ],
-                -1,
-            ),
-            "raw_eta": torch.cat([t_eta, c_eta], -1),
-            "raw_phi": torch.cat([t_phi, c_phi], -1),
-            "sinphi": torch.cat([t_sinphi, c_sinphi], -1),
-            "cosphi": torch.cat([t_cosphi, c_cosphi], -1),
-            "is_track": torch.cat(
-                [
-                    torch.ones(n_tracks, dtype=torch.float32),
-                    torch.zeros(n_clusters, dtype=torch.float32),
-                ],
-                -1,
-            ),
+            "calo_raw_hard_scatter_energy": d_energy_hard_scatter_energy,
+            "calo_raw_hard_scatter_energy_frac": d_energy_hard_scatter_frac,
+            "track_vertex_primary_mask": t_vertex_primary_mask
         }
 
         # Pad everything
@@ -490,92 +448,13 @@ class ODDDataset(Dataset):
         for key, val in node_raw_features.items():
             node_raw_features[key] = do_padding(val, self.max_nodes)
 
-        # 3. Extract & Pad Target Particles
-        # ---------------------------------------------------------------------
-        particle_class = get_t("particle_class", p_start, p_end)
-        if self.is_inference:
-            trackless_particle_mask = torch.zeros_like(particle_class, dtype=torch.bool)
-        else:
-            trackless_particle_mask = torch.ones_like(particle_class, dtype=torch.bool)
-            trackless_particle_mask[t_particle_idx] = False
-
-            trackless_chhad_and_e_mask = trackless_particle_mask & (particle_class < 2)
-            trackless_muon_mask = trackless_particle_mask & (particle_class == 2)
-
-            # trackless ch hads and es become nu hads and photons (+3)
-            particle_class[trackless_chhad_and_e_mask] += 3
-
-            # trackless muons become neutral hadrons
-            particle_class[trackless_muon_mask] = 3
-
-        is_charged = particle_class < 3
-        
-        particle_data = {
-            "e": self.full_data_array["particle_energy"][p_start:p_end],
-            "pt": self.full_data_array["particle_pt"][p_start:p_end],
-            "eta": self.full_data_array["particle_eta"][p_start:p_end],
-            "sinphi": torch.sin(self.full_data_array["particle_phi"][p_start:p_end]),
-            "cosphi": torch.cos(self.full_data_array["particle_phi"][p_start:p_end]),
-            "class": particle_class,
-            "is_charged": is_charged,
-        }
-        particle_data = self.scaler.transform(particle_data)
-        for key, val in particle_data.items():
-            val = do_padding(val, self.num_objects)
-            particle_data[key] = val
-
-        has_track = torch.zeros(self.num_objects, dtype=bool)
-        has_track[:n_particles] = ~trackless_particle_mask
-
         node_q_mask = torch.zeros(self.max_nodes, dtype=bool)
         node_q_mask[:n_nodes] = True
-
-        incidence_matrix = np.zeros((self.num_objects, n_nodes))
-        indicator = torch.zeros(self.num_objects)
-
-        track_idx = np.arange(len(t_particle_idx))
-        if self.is_inference:
-            t_particle_idx[t_particle_idx < 0] = 0
-        
-        # Convert torch tensors to numpy for indexing numpy array
-        t_particle_idx_np = t_particle_idx.numpy() if isinstance(t_particle_idx, torch.Tensor) else t_particle_idx
-        d_particle_idx_np = d_particle_idx.numpy() if isinstance(d_particle_idx, torch.Tensor) else d_particle_idx
-        d_cluster_idx_np = d_cluster_idx.numpy() if isinstance(d_cluster_idx, torch.Tensor) else d_cluster_idx
-        d_energy_np = d_energy.numpy() if isinstance(d_energy, torch.Tensor) else d_energy
-         
-        incidence_matrix[t_particle_idx_np, track_idx] = 1.0
-
-        # topo_idx = d_cluster_idx
-        incidence_matrix[d_particle_idx_np, d_cluster_idx_np + n_tracks] = d_energy_np
-
-        # Zero out entries for non-existing target particles
-        if (incidence_matrix.sum(axis=0) == 0).any():
-            noisy_cols = np.where(incidence_matrix.sum(axis=0) == 0)[0]
-            fake_rows = np.arange(len(noisy_cols)) + n_particles
-            if not (fake_rows < self.num_objects).all():
-                print(f"Warning: fake_rows go beyond maximum ({self.num_objects})(event_id {idx})({np.max(fake_rows)}) particles. Dropping them!")
-                noisy_cols = noisy_cols[fake_rows < self.num_objects]
-                fake_rows = fake_rows[fake_rows < self.num_objects]
-            incidence_matrix[fake_rows, noisy_cols] = 1.0
-
-        # normalize
-        incidence_matrix /= np.clip(incidence_matrix.sum(axis=0, keepdims=True), a_min=1e-6, a_max=None)
-
-        incidence = torch.tensor(incidence_matrix, dtype=torch.float32)
-
-        incidence = torch.nn.functional.pad(incidence, (0, self.max_nodes - n_nodes, 0, 0))
-        # update the indicator
-        is_not_res_mask = particle_class < 5
-        indicator[:n_particles][is_not_res_mask] = 1.0
-
         node_inp_features = torch.stack(list(node_features.values()), dim=-1)
 
         return {
             "node_inp_features": node_inp_features,
             "node_raw_features": node_raw_features,
-            "particle_data": particle_data,
-            "incidence_truth": incidence,
-            "indicator_truth": indicator,
             "node_q_mask": node_q_mask,
         }
 
@@ -595,35 +474,15 @@ class ODDDataset(Dataset):
         inputs = {
             "node_features": data_dict["node_inp_features"],
             "node_valid": data_dict["node_q_mask"],
-            "node_e": data_dict["node_raw_features"]["raw_e"],
-            "node_pt": data_dict["node_raw_features"]["raw_pt"],
-            "node_eta": data_dict["node_raw_features"]["raw_eta"],
-            "node_phi": data_dict["node_raw_features"]["raw_phi"],
-            "node_sinphi": data_dict["node_raw_features"]["sinphi"],
-            "node_cosphi": data_dict["node_raw_features"]["cosphi"],
-            "node_is_track": data_dict["node_raw_features"]["is_track"],
+            "node_e_frac": data_dict["node_raw_features"]["calo_raw_hard_scatter_energy_frac"],
         }
 
-        # set class labels (5 is residual & fake, 0-4 are the real classes)
-        class_labels = data_dict["particle_data"]["class"].long()
-        class_labels[data_dict["indicator_truth"] == 0] = 5
 
-        labels["particle_class"] = class_labels.long()
-        labels["particle_valid"] = data_dict["indicator_truth"].bool()
+        labels["tracks_mask"] = data_dict["node_raw_features"]["track_vertex_primary_mask"]
         labels["node_valid"] = data_dict["node_q_mask"].bool()
 
-        # get masks
-        incidence_mask = data_dict["incidence_truth"] > self.incidence_cutval
-        labels["particle_node_valid"] = incidence_mask
-
-        # get incidence matrix label
-        labels["particle_incidence"] = data_dict["incidence_truth"]
-
-        # regression targets
-        for label in self.targets["particle"]:
-            tgt = torch.full((self.num_objects,),torch.nan)  # number of reconstructed tracks
-            tgt[: self.n_particles[idx]] = data_dict["particle_data"][label][: self.n_particles[idx]]
-            labels[f"particle_{label}"] = tgt
+        labels["calo_hard_scatter_energy"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy"]
+        labels["calo_hard_scatter_energy_frac"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy_frac"]
 
         labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
 
@@ -632,7 +491,7 @@ class ODDDataset(Dataset):
     def preprocess_hook(self, file_dir: Path, index: int) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
         """Placeholder hook called for non-test stages.
 
-            Called at the start of processing each file when `self.stage != 'test'`.
+            Called at the start of processing each file when `self.is_inference == False`.
             Implement custom logic here (e.g., custom filtering, logging, augmentation,
             or calling external preprocessing). This default implementation is a no-op.
         """
@@ -640,7 +499,7 @@ class ODDDataset(Dataset):
         df_clusters = pl.read_parquet(file_dir / f"calo_clusters-{index:05d}.parquet")
         df_deps = pl.read_parquet(file_dir / f"target_particles_deps-{index:05d}.parquet")
         df_tracks = pl.read_parquet(file_dir / f"tracks-{index:05d}.parquet")
-        if self.stage == "test":
+        if self.is_inference:
             return df_particles, df_clusters, df_deps, df_tracks
         cols_to_explode = [col for col in df_tracks.columns if col != 'event_id']
         # We remove double matched tracks to the same particle, only in the non-test stages. 
@@ -676,6 +535,16 @@ class ODDDataset(Dataset):
                     .collect()
                 )
 
+        df_deps = (
+            df_deps.lazy()
+            .select(pl.col("event_id"), pl.col("total_energy_deps_in_cluster"), pl.col("cluster_idx"))
+            .explode(["total_energy_deps_in_cluster", "cluster_idx"])
+            .group_by("event_id", "cluster_idx", maintain_order=True)
+            .agg(pl.col("total_energy_deps_in_cluster").sum().alias("hard_scatter_energy_deps_in_cluster"))
+            .group_by("event_id", maintain_order=True)
+            .agg('cluster_idx', 'hard_scatter_energy_deps_in_cluster')
+            .collect()
+        )
         return df_particles, df_clusters, df_deps, df_tracks
 
 
@@ -959,7 +828,7 @@ class ODDDataModule(L.LightningDataModule):
                  kw['files_list'] = train_files
                  path = self.unify_path
 
-            self.train_dset = ODDDataset(
+            self.train_dset = ODDDatasetPileup(
                 filepath=path,
                 num_events=self.num_train,
                 scale_dict_path=self.scale_dict_path,
@@ -973,7 +842,7 @@ class ODDDataModule(L.LightningDataModule):
                  kw['files_list'] = val_files
                  path = self.unify_path
             
-            self.val_dset = ODDDataset(
+            self.val_dset = ODDDatasetPileup(
                 filepath=path,
                 num_events=self.num_val,
                 scale_dict_path=self.scale_dict_path,
@@ -995,7 +864,7 @@ class ODDDataModule(L.LightningDataModule):
             elif self.test_path is None:
                  assert self.test_path is not None, "No test file specified, see --data.test_path"
             
-            self.test_dset = ODDDataset(
+            self.test_dset = ODDDatasetPileup(
                 filepath=path,
                 num_events=self.num_test,
                 scale_dict_path=self.scale_dict_path,
@@ -1006,7 +875,7 @@ class ODDDataModule(L.LightningDataModule):
         if is_global_zero:
             print("-" * 100, "\n")
 
-    def get_dataloader(self, stage: str, dataset: ODDDataset, shuffle: bool):
+    def get_dataloader(self, stage: str, dataset: ODDDatasetPileup, shuffle: bool):
         print(f"Creating {stage} dataloader with {len(dataset):,} events")
         return DataLoader(
             dataset=dataset,
