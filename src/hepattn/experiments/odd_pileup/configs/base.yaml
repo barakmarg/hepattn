@@ -31,7 +31,8 @@ data:
       - cosphi
 
   # Maximum number of output particles
-  num_objects: &num_particles 400
+  num_tracks: &num_tracks 1400
+  num_clusters: &num_clusters 4000
 
   # TODO: Update paths to your parquet files, seperate for train/val/test
   train_path: /storage/agrp/barakma/PileupODD/data/train
@@ -77,7 +78,7 @@ trainer:
   logger:
     class_path: hepattn.experiments.odd_pileup.logger_utils.FixedCometLogger
     init_args:
-      project: odd-pflow
+      project: odd-pflow-pileup-removal
 
   callbacks:
     - class_path: hepattn.callbacks.Compile
@@ -110,8 +111,8 @@ model:
 
   mtl: false
 
-  model:
-    class_path: hepattn.models.MaskFormer
+  model:   
+    class_path: hepattn.experiments.odd_pileup.pileup_model.PileupRemovalModel
     init_args:
       dim: &dim 256
 
@@ -166,127 +167,27 @@ model:
           attn_kwargs:
             num_heads: 16
 
-      # Decoder configuration
-      decoder:
-        num_decoder_layers: 4
-        num_queries: *num_particles
-        mask_attention: true
-        use_query_masks: false
-        decoder_layer_config:
-          dim: *dim
-          hybrid_norm: true
-          attn_kwargs:
-            num_heads: 16
-
-      # Hungarian matcher for set prediction
-      matcher:
-        class_path: hepattn.models.matcher.Matcher
-        init_args:
-          default_solver: scipy
-          adaptive_solver: false
-          parallel_solver: true
-          n_jobs: 16
-
-      # Task heads - UPDATED TO MATCH CLIC
-      tasks:
-        class_path: torch.nn.ModuleList
-        init_args:
-          modules:
-            # 1. Classification task
-            - class_path: hepattn.models.task.ObjectClassificationTask
+      tracks_mlp:
+          class_path: hepattn.experiments.odd_pileup.pileup_model.TracksMlp
+          init_args:
+            net:
+              class_path: hepattn.models.Dense
               init_args:
-                name: classification
-                input_object: query
-                output_object: pflow
-                target_object: particle
-                num_classes: 5
-                losses:
-                  object_ce: 2
-                costs:
-                  object_ce: 2
-                net:
-                  class_path: hepattn.models.Dense
-                  init_args:
-                    input_size: *dim
-                    activation: torch.nn.SiLU
-                    output_size: 6
-                    hidden_layers: [256, 128, 32]
-                null_weight: 0.5
-                loss_class_weights: [1.0, 3.0, 8.0, 1.5, 1.0]
-                mask_queries: false
-                has_intermediate_loss: true
-
-            # 2. Mask task
-            - class_path: hepattn.models.task.ObjectHitMaskTask
+                # Input size = ??(Dim * 2) + Num_Raw_Variables
+                input_size: *dim
+                activation: torch.nn.SiLU
+                output_size: *num_tracks
+                hidden_layers: [512, 256, 256, 256]
+            has_intermediate_loss: false
+      calo_mlp:
+          class_path: hepattn.experiments.odd_pileup.pileup_model.CaloMlp
+          init_args:
+            net:
+              class_path: hepattn.models.Dense
               init_args:
-                name: mask
-                input_hit: node
-                input_object: query
-                output_object: pflow
-                target_object: particle
-                pred_threshold: 0.1
-                logit_scale: 4
-                losses:
-                  mask_bce: 5.0
-                  mask_dice: 1.0
-                costs:
-                  # mask_bce: 5.0  (Commented out in CLIC, usually expensive for matching)
-                  mask_dice: 1.0
-                dim: *dim
-                null_weight: 1.0
-                has_intermediate_loss: true
-
-            # 3. Incidence Regression (Added from CLIC)
-            - class_path: hepattn.models.task.IncidenceRegressionTask
-              init_args:
-                name: incidence
-                input_hit: node
-                input_object: query
-                output_object: pflow
-                target_object: particle
-                losses:
-                  kl_div: 1.0
-                costs:
-                  kl_div: 1.0
-                net:
-                  class_path: hepattn.models.Dense
-                  init_args:
-                    input_size: *dim
-                    activation: torch.nn.SiLU
-                    output_size: *dim
-                    hidden_layers: [*dim, *dim]
-                node_net:
-                  class_path: hepattn.models.Dense
-                  init_args:
-                    input_size: *dim
-                    output_size: *dim
-                    hidden_layers: [*dim]
-                has_intermediate_loss: false
-
-            # 4. Incidence Based Regression (Added from CLIC)
-            - class_path: hepattn.models.task.IncidenceBasedRegressionTask
-              init_args:
-                name: regression
-                fields: ["e", "pt", "eta", "sinphi", "cosphi"]
-                input_hit: node
-                input_object: query
-                output_object: pflow
-                target_object: particle
-                loss: l1
-                loss_weight: 10.0
-                cost_weight: 10.0
-                use_incidence: true
-                use_nodes: true
-                cost: new
-                mode: scale
-                scale_dict_path: *scale_dict_path
-                net:
-                  class_path: hepattn.models.Dense
-                  init_args:
-                    # Input size = (Dim * 2) + Num_Raw_Variables
-                    # 256 * 2 + 6 = 518 (Matches CLIC size)
-                    input_size: 518
-                    activation: torch.nn.SiLU
-                    output_size: 5
-                    hidden_layers: [512, 256, 128, 64, 32]
-                has_intermediate_loss: false
+                # Input size = ??(Dim * 2) + Num_Raw_Variables
+                input_size: *dim
+                activation: torch.nn.SiLU
+                output_size: *num_calo
+                hidden_layers: [512, 256, 256, 256]
+            has_intermediate_loss: false
