@@ -1,19 +1,17 @@
 """
-ODD (Open Data Detector) Particle Flow Experiment.
+ODD (Open Data Detector) Pileup Removal Experiment.
 
-This module provides dataset, model wrapper, and utilities for particle flow
-reconstruction using the Open Data Detector geometry.
+This module provides dataset, model wrapper, and utilities for pileup removal
+using the Open Data Detector geometry.
 """
 
 from hepattn.experiments.odd_pileup.pflow_data import ODDDatasetPileup, ODDDataModule
 from hepattn.experiments.odd_pileup.predictionwriter import PflowPredictionWriter
 from hepattn.experiments.odd_pileup.lightning_module import ODDPFlow
-from hepattn.experiments.odd_pileup.metrics import MaskInference
 
 __all__ = [
     "ODDDatasetPileup",
     "ODDDataModule",
     "ODDPFlow",
     "PflowPredictionWriter",
-    "MaskInference",
 ]

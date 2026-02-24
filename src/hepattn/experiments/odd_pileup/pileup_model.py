@@ -93,19 +93,20 @@ class PileupRemovalModel(nn.Module):
             "track_logits": track_logits,
             "calo_frac": calo_frac,
             "key_valid": x["key_valid"],
-            # Ensure these are passed for loss calculation
-            "node_e": x.get("node_e"), 
+            # Raw variables passed through for loss calculation
+            "node_e": x.get("node_e"),
             "is_track": x.get("node_is_track"),
-            "final": {} # Wrapper expects 'final' key for metrics sometimes
         }
 
     def predict(self, outputs: dict[str, Tensor]) -> dict[str, Tensor]:
         """Inference output generation"""
         track_probs = torch.sigmoid(outputs["track_logits"])
         return {
-            "track_is_hard_scatter": track_probs > 0.5,
-            "track_prob": track_probs,
-            "calo_hs_fraction": outputs["calo_frac"]
+            "final": {
+                "track_is_hard_scatter": track_probs > 0.5,
+                "track_prob": track_probs,
+                "calo_hs_fraction": outputs["calo_frac"],
+            }
         }
 
     def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -119,34 +120,28 @@ class PileupRemovalModel(nn.Module):
         track_mask = valid & is_track
         cluster_mask = valid & (~is_track)
 
-        losses = {}
-
         # --- Track Loss (BCE) ---
         if track_mask.any():
-            # Preds: (B, N, 1) -> (B*N_masked)
             track_pred = outputs["track_logits"].squeeze(-1)[track_mask]
-            # Targets: (B, N) -> (B*N_masked)
             track_target = targets["tracks_mask"].float()[track_mask]
-            
-            losses["loss_tracks"] = F.binary_cross_entropy_with_logits(track_pred, track_target)
+            loss_tracks = F.binary_cross_entropy_with_logits(track_pred, track_target)
         else:
-            losses["loss_tracks"] = torch.tensor(0.0, device=valid.device, requires_grad=True)
+            loss_tracks = torch.tensor(0.0, device=valid.device, requires_grad=True)
 
         # --- Cluster Loss (L1 on Energy) ---
         if cluster_mask.any():
             pred_alpha = outputs["calo_frac"].squeeze(-1)[cluster_mask]
-            
-            # Use raw total energy (passed from inputs)
             E_total = outputs["node_e"].squeeze(-1)[cluster_mask]
-            
-            # Target is the True Hard Scatter Energy
             E_HS_true = targets["calo_hard_scatter_energy"][cluster_mask]
-            
-            # Physics Calculation: E_pred = fraction * E_total
             E_HS_pred = pred_alpha * E_total
-            
-            losses["loss_calo"] = F.l1_loss(E_HS_pred, E_HS_true)
+            loss_calo = F.l1_loss(E_HS_pred, E_HS_true)
         else:
-            losses["loss_calo"] = torch.tensor(0.0, device=valid.device, requires_grad=True)
+            loss_calo = torch.tensor(0.0, device=valid.device, requires_grad=True)
 
-        return losses
+        # ModelWrapper.log_losses expects nested dict: {layer: {task: {loss_name: value}}}
+        return {
+            "final": {
+                "tracks": {"bce": loss_tracks},
+                "calo": {"l1": loss_calo},
+            }
+        }

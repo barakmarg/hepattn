@@ -394,7 +394,7 @@ class ODDDatasetPileup(Dataset):
         c_hcal_fraction = get_t("hcal_fraction", c_start, c_end)
 
         # --- Energy Deposits ---
-        d_cluster_idx = get_t("deps_cluster_idx", d_start, d_end)
+        d_cluster_idx = get_t("deps_cluster_idx", d_start, d_end).long()
         d_energy_hard_scatter = get_t("deps_hard_scatter_energy_deps_in_cluster", d_start, d_end)
         
         d_energy_hard_scatter_frac = torch.zeros_like(c_e)
@@ -435,13 +435,14 @@ class ODDDatasetPileup(Dataset):
             "is_cluster": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), torch.ones(n_clusters, dtype=torch.float32),],-1,),
         }
 
-        # Raw features (for regression baseline/analysis)
+        # Raw features (for loss computation and analysis)
+        # All raw features must be aligned with node ordering: [tracks, clusters]
         node_raw_features = {
             "total_e": torch.cat([torch.zeros(n_tracks), c_e], -1),
-            "is_track": torch.cat([torch.ones(n_tracks, dtype=torch.float32), torch.zeros(n_clusters, dtype=torch.float32),],-1,),
-            "calo_raw_hard_scatter_energy": d_energy_hard_scatter_energy,
-            "calo_raw_hard_scatter_energy_frac": d_energy_hard_scatter_frac,
-            "track_vertex_primary_mask": t_vertex_primary_mask
+            "is_track": torch.cat([torch.ones(n_tracks, dtype=torch.float32), torch.zeros(n_clusters, dtype=torch.float32)], -1),
+            "calo_raw_hard_scatter_energy": torch.cat([torch.zeros(n_tracks), d_energy_hard_scatter_energy], -1),
+            "calo_raw_hard_scatter_energy_frac": torch.cat([torch.zeros(n_tracks), d_energy_hard_scatter_frac], -1),
+            "track_vertex_primary_mask": torch.cat([t_vertex_primary_mask, torch.zeros(n_clusters, dtype=torch.float32)], -1),
         }
 
         # Pad everything
@@ -458,6 +459,8 @@ class ODDDatasetPileup(Dataset):
             "node_inp_features": node_inp_features,
             "node_raw_features": node_raw_features,
             "node_q_mask": node_q_mask,
+            "node_eta": node_features["eta"],
+            "node_phi": node_features["phi"],
         }
 
     def __getitem__(self, idx: int) -> tuple[dict, dict]:
@@ -476,12 +479,15 @@ class ODDDatasetPileup(Dataset):
         inputs = {
             "node_features": data_dict["node_inp_features"],
             "node_valid": data_dict["node_q_mask"],
-            "node_e_frac": data_dict["node_raw_features"]["calo_raw_hard_scatter_energy_frac"],
+            "node_eta": data_dict["node_eta"],
+            "node_phi": data_dict["node_phi"],
+            "node_e": data_dict["node_raw_features"]["total_e"],
+            "node_is_track": data_dict["node_raw_features"]["is_track"],
         }
-
 
         labels["tracks_mask"] = data_dict["node_raw_features"]["track_vertex_primary_mask"]
         labels["node_valid"] = data_dict["node_q_mask"].bool()
+        labels["is_track"] = data_dict["node_raw_features"]["is_track"]
 
         labels["calo_hard_scatter_energy"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy"]
         labels["calo_hard_scatter_energy_frac"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy_frac"]
@@ -728,7 +734,6 @@ class ODDDataModule(L.LightningDataModule):
         scale_dict_path: str,
         inputs: dict | None = None,
         targets: dict | None = None,
-        num_objects: int = 450,
         max_nodes: int = 900,
         remove_wrong_idxs: bool = True,
         incidence_cutval: float = 1e-4,
@@ -771,7 +776,6 @@ class ODDDataModule(L.LightningDataModule):
         self.dataset_kwargs = {
             "inputs": inputs,
             "targets": targets,
-            "num_objects": num_objects,
             "max_nodes": max_nodes,
             "remove_wrong_idxs": remove_wrong_idxs,
             "incidence_cutval": incidence_cutval,
