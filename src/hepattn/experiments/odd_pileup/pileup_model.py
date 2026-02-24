@@ -1,25 +1,24 @@
-from models.transformer import Encoder
 import torch
 from torch import Tensor, nn
-
+import torch.nn.functional as F
+from hepattn.models.transformer import Encoder
 
 class TracksMlp(nn.Module):
     def __init__(self, net: nn.Module):
         super().__init__()
         self.mlp = net
     
-    def forward(self, inputs: dict[str, Tensor]) -> Tensor:
-        x = inputs["key_embed"]
+    def forward(self, x: Tensor) -> Tensor:
         return self.mlp(x)
 
 class CaloMlp(nn.Module):
-    def __init__(self, net: nn.Module):
+    def __init__(self, net: nn.Module, final_activation: nn.Module = None):
         super().__init__()
         self.mlp = net
+        self.act = final_activation if final_activation else nn.Identity()
     
-    def forward(self, inputs: dict[str, Tensor]) -> Tensor:
-        x = inputs["key_embed"]
-        return self.mlp(x)
+    def forward(self, x: Tensor) -> Tensor:
+        return self.act(self.mlp(x))
 
 class PileupRemovalModel(nn.Module):
     def __init__(
@@ -28,68 +27,126 @@ class PileupRemovalModel(nn.Module):
         encoder: Encoder,
         tracks_mlp: nn.Module,
         calo_mlp: nn.Module,
+        dim: int,
+        raw_variables: list[str] | None = None,
+        input_sort_field: str | None = None,
     ):
         super().__init__()
         self.input_nets = input_nets
         self.encoder = encoder
         self.tracks_mlp = tracks_mlp
         self.calo_mlp = calo_mlp
-    
-    def forward(self, inputs: dict[str, Tensor]):
-        # Atomic input names
+        self.dim = dim
+        self.raw_variables = raw_variables or []
+        self.input_sort_field = input_sort_field
+        
+        # Define tasks list for the ModelWrapper to iterate over if needed
+        # (Even though we calculate loss internally, the wrapper might check this)
+        self.tasks = nn.ModuleList([]) 
+
+    def forward(self, inputs: dict[str, Tensor]) -> dict[str, Tensor]:
+        # 1. Prepare Input names
         input_names = [input_net.input_name for input_net in self.input_nets]
-
-        assert "key" not in input_names, "'key' input name is reserved."
-        assert "query" not in input_names, "'query' input name is reserved."
-
         x = {}
 
+        # 2. Pass Raw Variables (Important for Loss!)
         for raw_var in self.raw_variables:
-            # If the raw variable is present in the inputs, add it directly to the output
             if raw_var in inputs:
                 x[raw_var] = inputs[raw_var]
 
-        # Store input positional encodings if we need to preserve them for the decoder
-        if self.decoder.preserve_posenc:
-            assert all(input_net.posenc is not None for input_net in self.input_nets)
-            x["key_posenc"] = torch.concatenate([input_net.posenc(inputs) for input_net in self.input_nets], dim=-2)
-
-        # Embed the input objects
+        # 3. Embed Inputs (InputNets)
         for input_net in self.input_nets:
             input_name = input_net.input_name
             x[input_name + "_embed"] = input_net(inputs)
             x[input_name + "_valid"] = inputs[input_name + "_valid"]
-
-            # These slices can be used to pick out specific
-            # objects after we have merged them all together
-            # TODO: Clean this up
+            
+            # Helper mask to know which node came from where
             device = inputs[input_name + "_valid"].device
             x[f"key_is_{input_name}"] = torch.cat(
                 [torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device, dtype=torch.bool) for i in input_names], dim=-1
             )
 
-        # Merge the input objects and he padding mask into a single set
+        # 4. Merge inputs (Tracks + Clusters)
         x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in input_names], dim=-2)
         x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in input_names], dim=-1)
 
-        # calculate the batch size and combined number of input constituents
-        batch_size = x["key_valid"].shape[0]
-
-        # if all key_valid are true, then we can just set it to None
-        if batch_size == 1 and x["key_valid"].all():
-            x["key_valid"] = None
-
-        # Also merge the field being used for sorting in window attention if requested
-        if self.input_sort_field is not None:
-            x[f"key_{self.input_sort_field}"] = torch.concatenate(
-                [inputs[input_name + "_" + self.input_sort_field] for input_name in input_names], dim=-1
-            )        
-        
-        # Pass merged input hits through the encoder
+        # 5. Encoder
         if self.encoder is not None:
-            # Note that a padded feature is a feature that is not valid!
-            x["key_embed"] = self.encoder(x["key_embed"], x_sort_value=x.get(f"key_{self.input_sort_field}"), kv_mask=x.get("key_valid"))
+            # Note: The Encoder expects 'kv_mask' for masking
+            x["key_embed"] = self.encoder(
+                x["key_embed"], 
+                x_sort_value=x.get(f"key_{self.input_sort_field}"), 
+                kv_mask=x.get("key_valid")
+            )
 
-        t = self.tracks_mlp(x)
-        c = self.calo_mlp(x)
-        return t, c
+        # 6. Apply Heads
+        latent = x["key_embed"]
+        
+        # Track Head (Logits)
+        track_logits = self.tracks_mlp(latent) 
+        
+        # Calo Head (Fraction 0-1)
+        calo_frac = self.calo_mlp(latent)
+        
+        # Return dictionary used by Loss and Predict
+        return {
+            "track_logits": track_logits,
+            "calo_frac": calo_frac,
+            "key_valid": x["key_valid"],
+            # Ensure these are passed for loss calculation
+            "node_e": x.get("node_e"), 
+            "is_track": x.get("node_is_track"),
+            "final": {} # Wrapper expects 'final' key for metrics sometimes
+        }
+
+    def predict(self, outputs: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Inference output generation"""
+        track_probs = torch.sigmoid(outputs["track_logits"])
+        return {
+            "track_is_hard_scatter": track_probs > 0.5,
+            "track_prob": track_probs,
+            "calo_hs_fraction": outputs["calo_frac"]
+        }
+
+    def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Physics-Weighted Loss"""
+        
+        # 1. Create Masks
+        valid = outputs["key_valid"].bool()
+        # "node_is_track" comes from inputs, ensure it's bool
+        is_track = outputs["is_track"].bool().squeeze(-1) 
+        
+        track_mask = valid & is_track
+        cluster_mask = valid & (~is_track)
+
+        losses = {}
+
+        # --- Track Loss (BCE) ---
+        if track_mask.any():
+            # Preds: (B, N, 1) -> (B*N_masked)
+            track_pred = outputs["track_logits"].squeeze(-1)[track_mask]
+            # Targets: (B, N) -> (B*N_masked)
+            track_target = targets["tracks_mask"].float()[track_mask]
+            
+            losses["loss_tracks"] = F.binary_cross_entropy_with_logits(track_pred, track_target)
+        else:
+            losses["loss_tracks"] = torch.tensor(0.0, device=valid.device, requires_grad=True)
+
+        # --- Cluster Loss (L1 on Energy) ---
+        if cluster_mask.any():
+            pred_alpha = outputs["calo_frac"].squeeze(-1)[cluster_mask]
+            
+            # Use raw total energy (passed from inputs)
+            E_total = outputs["node_e"].squeeze(-1)[cluster_mask]
+            
+            # Target is the True Hard Scatter Energy
+            E_HS_true = targets["calo_hard_scatter_energy"][cluster_mask]
+            
+            # Physics Calculation: E_pred = fraction * E_total
+            E_HS_pred = pred_alpha * E_total
+            
+            losses["loss_calo"] = F.l1_loss(E_HS_pred, E_HS_true)
+        else:
+            losses["loss_calo"] = torch.tensor(0.0, device=valid.device, requires_grad=True)
+
+        return losses

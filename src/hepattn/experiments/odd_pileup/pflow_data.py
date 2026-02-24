@@ -437,6 +437,8 @@ class ODDDatasetPileup(Dataset):
 
         # Raw features (for regression baseline/analysis)
         node_raw_features = {
+            "total_e": torch.cat([torch.zeros(n_tracks), c_e], -1),
+            "is_track": torch.cat([torch.ones(n_tracks, dtype=torch.float32), torch.zeros(n_clusters, dtype=torch.float32),],-1,),
             "calo_raw_hard_scatter_energy": d_energy_hard_scatter_energy,
             "calo_raw_hard_scatter_energy_frac": d_energy_hard_scatter_frac,
             "track_vertex_primary_mask": t_vertex_primary_mask
