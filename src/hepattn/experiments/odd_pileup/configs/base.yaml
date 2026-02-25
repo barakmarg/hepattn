@@ -30,16 +30,12 @@ data:
       - sinphi
       - cosphi
 
-  # Maximum number of output particles
-  num_tracks: &num_tracks 1400
-  num_clusters: &num_clusters 4000
-
   # TODO: Update paths to your parquet files, seperate for train/val/test
-  train_path: /storage/agrp/barakma/PileupODD/data/train
-  valid_path: /storage/agrp/barakma/PileupODD/data/val
-  test_path: /storage/agrp/barakma/PileupODD/data/test
+  train_path: /storage/agrp/barakma/PileupODD/data/fervefvef
+  valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
+  test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
   
-  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu0
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu200
   enable_split: true
   train_split: 0.9
   val_split: 0.1
@@ -47,19 +43,19 @@ data:
   val_and_test_split_same: true
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
-  num_workers: 6
-  num_train: -1      # -1 for all events
-  num_test: 4000
-  num_val: 4000
+  num_workers: 0
+  num_train: -1     # -1 for all events
+  num_test: 30
+  num_val: 30
 
-  batch_size: 64    # Increased from 128 to match CLIC
+  batch_size: 16   # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Path to variable transformation config
   scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup/configs/odd_var_transform.yaml
 
   # TODO: Adjust max_nodes based on your data
-  max_nodes: 650
+  max_nodes: 5500
 
 # =============================================================================
 # Trainer Configuration

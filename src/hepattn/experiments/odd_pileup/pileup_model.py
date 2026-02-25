@@ -78,7 +78,6 @@ class PileupRemovalModel(nn.Module):
                 x_sort_value=x.get(f"key_{self.input_sort_field}"), 
                 kv_mask=x.get("key_valid")
             )
-
         # 6. Apply Heads
         latent = x["key_embed"]
         
@@ -87,7 +86,6 @@ class PileupRemovalModel(nn.Module):
         
         # Calo Head (Fraction 0-1)
         calo_frac = self.calo_mlp(latent)
-        
         # Return dictionary used by Loss and Predict
         return {
             "track_logits": track_logits,
@@ -128,13 +126,13 @@ class PileupRemovalModel(nn.Module):
         else:
             loss_tracks = torch.tensor(0.0, device=valid.device, requires_grad=True)
 
-        # --- Cluster Loss (L1 on Energy) ---
+        # --- Cluster Loss (mse on Energy) ---
         if cluster_mask.any():
             pred_alpha = outputs["calo_frac"].squeeze(-1)[cluster_mask]
             E_total = outputs["node_e"].squeeze(-1)[cluster_mask]
             E_HS_true = targets["calo_hard_scatter_energy"][cluster_mask]
             E_HS_pred = pred_alpha * E_total
-            loss_calo = F.l1_loss(E_HS_pred, E_HS_true)
+            loss_calo = F.mse_loss(E_HS_pred, E_HS_true)
         else:
             loss_calo = torch.tensor(0.0, device=valid.device, requires_grad=True)
 
@@ -142,6 +140,6 @@ class PileupRemovalModel(nn.Module):
         return {
             "final": {
                 "tracks": {"bce": loss_tracks},
-                "calo": {"l1": loss_calo},
+                "calo": {"mse": loss_calo},
             }
         }

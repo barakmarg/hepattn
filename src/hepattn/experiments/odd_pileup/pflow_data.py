@@ -489,6 +489,7 @@ class ODDDatasetPileup(Dataset):
         labels["node_valid"] = data_dict["node_q_mask"].bool()
         labels["is_track"] = data_dict["node_raw_features"]["is_track"]
 
+        labels["node_e"] = data_dict["node_raw_features"]["total_e"]
         labels["calo_hard_scatter_energy"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy"]
         labels["calo_hard_scatter_energy_frac"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy_frac"]
 
