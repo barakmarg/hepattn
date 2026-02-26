@@ -32,6 +32,8 @@ class PileupRemovalModel(nn.Module):
         input_sort_field: str | None = None,
         track_loss_weight: float = 1.0,
         calo_loss_weight: float = 1.0,
+        track_threshold: float = 0.5,
+        track_pos_weight: float = 17.0,
     ):
         super().__init__()
         self.input_nets = input_nets
@@ -43,7 +45,9 @@ class PileupRemovalModel(nn.Module):
         self.input_sort_field = input_sort_field
         self.track_loss_weight = track_loss_weight
         self.calo_loss_weight = calo_loss_weight
-        
+        self.track_threshold = track_threshold
+        self.track_pos_weight = track_pos_weight
+
         # Define tasks list for the ModelWrapper to iterate over if needed
         # (Even though we calculate loss internally, the wrapper might check this)
         self.tasks = nn.ModuleList([]) 
@@ -105,7 +109,7 @@ class PileupRemovalModel(nn.Module):
         track_probs = torch.sigmoid(outputs["track_logits"])
         return {
             "final": {
-                "track_is_hard_scatter": track_probs > 0.5,
+                "track_is_hard_scatter": track_probs > self.track_threshold,
                 "track_prob": track_probs,
                 "calo_hs_fraction": outputs["calo_frac"],
             }
@@ -122,11 +126,11 @@ class PileupRemovalModel(nn.Module):
         track_mask = valid & is_track
         cluster_mask = valid & (~is_track)
 
-        # --- Track Loss (weighted BCE, HS:pileup = 200:1) ---
+        # --- Track Loss (weighted BCE) ---
         if track_mask.any():
             track_pred = outputs["track_logits"].squeeze(-1)[track_mask]
             track_target = targets["tracks_mask"].float()[track_mask]
-            pos_weight = torch.tensor(200.0, device=valid.device)
+            pos_weight = torch.tensor(self.track_pos_weight, device=valid.device)
             loss_tracks = F.binary_cross_entropy_with_logits(track_pred, track_target, pos_weight=pos_weight)
         else:
             loss_tracks = torch.tensor(0.0, device=valid.device, requires_grad=True)
@@ -136,8 +140,11 @@ class PileupRemovalModel(nn.Module):
             pred_alpha = outputs["calo_frac"].squeeze(-1)[cluster_mask]
             E_total = outputs["node_e"].squeeze(-1)[cluster_mask]
             E_HS_true = targets["calo_hard_scatter_energy"][cluster_mask]
+            is_signal = (E_HS_true / (E_total + 1e-8) > 0.05).float()  # Only consider nodes with significant HS energy for loss
+            weights = 1 + 120 * is_signal  # Upweight signal nodes by factor of 30
             E_HS_pred = pred_alpha * E_total
-            loss_calo = F.l1_loss(E_HS_pred, E_HS_true)
+            loss_calo = torch.mean(torch.abs(E_HS_pred - E_HS_true) * weights)
+
         else:
             loss_calo = torch.tensor(0.0, device=valid.device, requires_grad=True)
 

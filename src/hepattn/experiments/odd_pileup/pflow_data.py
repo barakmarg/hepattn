@@ -322,6 +322,22 @@ class ODDDatasetPileup(Dataset):
         
         self.n_nodes = self.n_tracks + self.n_clusters
         print(f"Number of events after filtering: {self.num_events}")
+
+        # Print pileup vs hard scatter track statistics
+        vertex_primary = self.full_data_array["track_vertex_primary"]
+        n_hard_scatter = (vertex_primary == 1).sum().item()
+        n_pileup = (vertex_primary != 1).sum().item()
+        n_total_tracks = len(vertex_primary)
+        pct_hard_scatter = 100 * n_hard_scatter / n_total_tracks if n_total_tracks > 0 else 0
+        pct_pileup = 100 * n_pileup / n_total_tracks if n_total_tracks > 0 else 0
+        print(f"Track composition: Hard scatter {n_hard_scatter} ({pct_hard_scatter:.1f}%) | Pileup {n_pileup} ({pct_pileup:.1f}%)")
+
+        # Print deposited energy vs total cluster energy statistics
+        if "deps_hard_scatter_energy_deps_in_cluster" in self.full_data_array and "total_cluster_energy" in self.full_data_array:
+            total_deps_energy = self.full_data_array["deps_hard_scatter_energy_deps_in_cluster"].sum().item()
+            total_cluster_energy = self.full_data_array["total_cluster_energy"].sum().item()
+            deps_to_cluster_ratio = total_deps_energy / total_cluster_energy if total_cluster_energy > 0 else 0
+            print(f"Energy composition: Total deposited HS energy {total_deps_energy:.2e} | Total cluster energy {total_cluster_energy:.2e} | Ratio {deps_to_cluster_ratio:.4f}")
     def __len__(self) -> int:
         return int(self.num_events)
 

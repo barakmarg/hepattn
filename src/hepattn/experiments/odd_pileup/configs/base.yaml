@@ -109,14 +109,18 @@ model:
 
   mtl: false
 
-  model:   
+  model:
     class_path: hepattn.experiments.odd_pileup.pileup_model.PileupRemovalModel
     init_args:
       dim: &dim 256
 
       # Loss weights
-      track_loss_weight: 1.0
-      calo_loss_weight: 0.0001
+      track_loss_weight: 0.0001
+      calo_loss_weight: 1.0
+
+      # Inference and loss hyperparameters
+      track_threshold: 0.5
+      track_pos_weight: 17.0
 
       # Raw variables passed through from inputs for loss calculation
       raw_variables:
