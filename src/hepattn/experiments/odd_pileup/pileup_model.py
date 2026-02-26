@@ -30,6 +30,8 @@ class PileupRemovalModel(nn.Module):
         dim: int,
         raw_variables: list[str] | None = None,
         input_sort_field: str | None = None,
+        track_loss_weight: float = 1.0,
+        calo_loss_weight: float = 1.0,
     ):
         super().__init__()
         self.input_nets = input_nets
@@ -39,6 +41,8 @@ class PileupRemovalModel(nn.Module):
         self.dim = dim
         self.raw_variables = raw_variables or []
         self.input_sort_field = input_sort_field
+        self.track_loss_weight = track_loss_weight
+        self.calo_loss_weight = calo_loss_weight
         
         # Define tasks list for the ModelWrapper to iterate over if needed
         # (Even though we calculate loss internally, the wrapper might check this)
@@ -118,28 +122,29 @@ class PileupRemovalModel(nn.Module):
         track_mask = valid & is_track
         cluster_mask = valid & (~is_track)
 
-        # --- Track Loss (BCE) ---
+        # --- Track Loss (weighted BCE, HS:pileup = 200:1) ---
         if track_mask.any():
             track_pred = outputs["track_logits"].squeeze(-1)[track_mask]
             track_target = targets["tracks_mask"].float()[track_mask]
-            loss_tracks = F.binary_cross_entropy_with_logits(track_pred, track_target)
+            pos_weight = torch.tensor(200.0, device=valid.device)
+            loss_tracks = F.binary_cross_entropy_with_logits(track_pred, track_target, pos_weight=pos_weight)
         else:
             loss_tracks = torch.tensor(0.0, device=valid.device, requires_grad=True)
 
-        # --- Cluster Loss (mse on Energy) ---
+        # --- Cluster Loss (l1 on Energy) ---
         if cluster_mask.any():
             pred_alpha = outputs["calo_frac"].squeeze(-1)[cluster_mask]
             E_total = outputs["node_e"].squeeze(-1)[cluster_mask]
             E_HS_true = targets["calo_hard_scatter_energy"][cluster_mask]
             E_HS_pred = pred_alpha * E_total
-            loss_calo = F.mse_loss(E_HS_pred, E_HS_true)
+            loss_calo = F.l1_loss(E_HS_pred, E_HS_true)
         else:
             loss_calo = torch.tensor(0.0, device=valid.device, requires_grad=True)
 
         # ModelWrapper.log_losses expects nested dict: {layer: {task: {loss_name: value}}}
         return {
             "final": {
-                "tracks": {"bce": loss_tracks},
-                "calo": {"mse": loss_calo},
+                "tracks": {"bce": self.track_loss_weight * loss_tracks},
+                "calo": {"l1": self.calo_loss_weight * loss_calo},
             }
         }

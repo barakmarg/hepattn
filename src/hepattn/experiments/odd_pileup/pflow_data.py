@@ -283,7 +283,7 @@ class ODDDatasetPileup(Dataset):
         self.n_particles = np.concatenate(accumulated_counts["n_particles"])
         self.n_deps = np.concatenate(accumulated_counts["n_deps"])
         self.event_number = np.concatenate(accumulated_counts["event_id"]) # Original used pl.Series/DataFrame column behaviour
-
+        print("event numbers 10:", self.event_number[:10]) # Show first 10 event numbers for debugging
         # Concatenate features
         for key, tensor_list in accumulated_data.items():
             self.full_data_array[key] = torch.cat(tensor_list)
@@ -748,6 +748,7 @@ class ODDDataModule(L.LightningDataModule):
         val_split: float = 0.1,
         test_split: float = 0.1,
         val_and_test_split_same: bool = False,
+        overtrain: bool = False,
         seed: int = 42,
         **kwargs,
     ):
@@ -771,6 +772,7 @@ class ODDDataModule(L.LightningDataModule):
         self.val_split = val_split
         self.test_split = test_split
         self.val_and_test_split_same = val_and_test_split_same
+        self.overtrain = overtrain
         self.seed = seed
         
         # Dataset kwargs
@@ -797,35 +799,39 @@ class ODDDataModule(L.LightningDataModule):
         test_files = None
 
         if self.enable_split and self.unify_path:
-             import random
-             path = Path(self.unify_path)
-             # Must use sorted to ensure determinism before shuffle
-             all_files = sorted(list(path.glob("target_particles-*.parquet")))
-             
-             # Deterministic shuffle
-             rng = random.Random(self.seed)
-             rng.shuffle(all_files)
-             
-             n_total = len(all_files)
-             n_train = int(n_total * self.train_split)
-             
-             train_files = all_files[:n_train]
-             
-             if self.val_and_test_split_same:
-                  val_files = all_files[n_train:]
-                  test_files = all_files[n_train:]
-                  if is_global_zero:
-                       print("Using SAME files for Validation and Test (Rest of dataset)")
-             else:
-                  n_val = int(n_total * self.val_split)
-                  val_files = all_files[n_train:n_train+n_val]
-                  test_files = all_files[n_train+n_val:]
-             
-             if is_global_zero:
-                  print(f"Splitting {n_total} files from {self.unify_path}")
-                  print(f"Train: {(train_files)} files")
-                  print(f"Val: {(val_files)} files")
-                  print(f"Test: {(test_files)} files")
+            import random
+            path = Path(self.unify_path)
+            # Must use sorted to ensure determinism before shuffle
+            all_files = sorted(list(path.glob("target_particles-*.parquet")))
+            
+            # Deterministic shuffle
+            rng = random.Random(self.seed)
+            rng.shuffle(all_files)
+            
+            n_total = len(all_files)
+            n_train = int(n_total * self.train_split)
+            
+            train_files = all_files[:n_train]
+            if self.overtrain:
+                val_files = all_files[:n_train]
+                test_files = all_files[:n_train]
+                print("Overtraining enabled: Using SAME files for Train, Validation, and Test")
+                if is_global_zero:
+                    print("Overtraining enabled: Using SAME files for Train, Validation, and Test")
+            elif self.val_and_test_split_same:
+                val_files = all_files[n_train:]
+                test_files = all_files[n_train:]
+                if is_global_zero:
+                    print("Using SAME files for Validation and Test (Rest of dataset)")
+            else:
+                n_val = int(n_total * self.val_split)
+                val_files = all_files[n_train:n_train+n_val]
+                test_files = all_files[n_train+n_val:]
+            
+            print(f"Splitting {n_total} files from {self.unify_path}")
+            print(f"Train: {(train_files)} files")
+            print(f"Val: {(val_files)} files")
+            print(f"Test: {(test_files)} files")
 
         # create training and validation datasets
         if stage == "fit":

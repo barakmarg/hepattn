@@ -45,11 +45,11 @@ data:
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 0
-  num_train: 8    # -1 for all events
-  num_test: 8
-  num_val: 8
+  num_train: 32    # -1 for all events
+  num_test: 32
+  num_val: 32
 
-  batch_size: 8   # Increased from 128 to match CLIC
+  batch_size: 32   # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Path to variable transformation config
@@ -62,11 +62,11 @@ data:
 # Trainer Configuration
 # =============================================================================
 trainer:
-  max_epochs: 600
+  max_epochs: 200
   accelerator: gpu
   devices: 1
   precision: bf16-mixed
-  gradient_clip_val: 1.0
+  gradient_clip_val: 0.1
   log_every_n_steps: 50
   default_root_dir: logs
   enable_progress_bar: True
@@ -150,7 +150,7 @@ model:
       encoder:
         class_path: hepattn.models.Encoder
         init_args:
-          num_layers: 8
+          num_layers: 12
           dim: *dim
           attn_type: flash-varlen
           hybrid_norm: true
@@ -169,7 +169,7 @@ model:
                 input_size: *dim
                 activation: torch.nn.SiLU
                 output_size: 1
-                hidden_layers: [1024, 256,128, 64, 32]
+                hidden_layers: [256, 256,128, 64, 32]
       calo_mlp:
           class_path: hepattn.experiments.odd_pileup.pileup_model.CaloMlp
           init_args:
@@ -180,6 +180,6 @@ model:
                 input_size: *dim
                 activation: torch.nn.SiLU
                 output_size: 1
-                hidden_layers: [1024, 256,128, 64,32]
+                hidden_layers: [256, 256,128, 64,32]
             final_activation:
               class_path: torch.nn.Sigmoid
