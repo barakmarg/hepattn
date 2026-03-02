@@ -41,15 +41,15 @@ data:
   val_split: 0.1
   test_split: 0.1
   val_and_test_split_same: true
-  overtrain: false # Enable overtraining for debugging (use same files for train/val/test), have priority over val_and_test_split_same
+  overtrain: true # Enable overtraining for debugging (use same files for train/val/test), have priority over val_and_test_split_same
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
-  num_workers: 4
-  num_train: -1    # -1 for all events
-  num_test: -1
-  num_val: -1
+  num_workers: 0
+  num_train: 8    # -1 for all events
+  num_test: 8
+  num_val: 8
 
-  batch_size: 32   # Increased from 128 to match CLIC
+  batch_size: 8   # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Energy threshold for cluster filtering
@@ -65,7 +65,7 @@ data:
 # Trainer Configuration
 # =============================================================================
 trainer:
-  max_epochs: 100
+  max_epochs: 3000
   accelerator: gpu
   devices: 1
   precision: bf16-mixed
@@ -102,13 +102,13 @@ model:
   optimizer: AdamW  # Changed from AdamW to match CLIC
 
   lrs_config:
-    initial: 1.25e-6     # (Was 1e-5) / 8
-    max: 1e-4            # (Was 8e-4) / 8
-    end: 1.25e-6         # (Was 1e-5) / 8
-    pct_start: 0.05
-    weight_decay: 0.01   # Keep constant
-    skip_scheduler: false
-
+    initial: 3e-4
+    #max: 8e-5
+    #end: 1e-6
+    #pct_start: 0.05
+    weight_decay: 0
+    #initial: 3e-4   
+    skip_scheduler: true
 
   mtl: false
 
@@ -118,14 +118,12 @@ model:
       dim: &dim 256
 
       # Loss weights
-      track_loss_weight: 1.0
+      track_loss_weight: 0.0
       calo_loss_weight: 1.0
 
       # Inference and loss hyperparameters
       track_threshold: 0.5
-      track_pos_weight: 16.24
-      calo_signal_threshold: 0.05
-      calo_signal_weight: 25.3
+      track_pos_weight: 17.0
 
       # Raw variables passed through from inputs for loss calculation
       raw_variables:

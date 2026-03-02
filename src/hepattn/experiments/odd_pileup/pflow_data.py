@@ -58,6 +58,7 @@ class ODDDatasetPileup(Dataset):
         incidence_cutval: float = 1e-4,
         is_inference: bool = False,
         files_list: list[Path] | None = None,
+        hard_scatter_energy_threshold: float = 0.03,
     ):
         """
         Initialize ODD Dataset.
@@ -95,6 +96,7 @@ class ODDDatasetPileup(Dataset):
         self.remove_wrong_idxs = remove_wrong_idxs
         self.incidence_cutval = incidence_cutval
         self.is_inference = is_inference
+        self.hard_scatter_energy_threshold = hard_scatter_energy_threshold
 
         print(f"Loading ODD dataset from {filepath} with {num_events} samples")
         print(f"Is inference: {self.is_inference}")
@@ -566,6 +568,7 @@ class ODDDatasetPileup(Dataset):
             .explode(["total_energy_deps_in_cluster", "cluster_idx"])
             .group_by("event_id", "cluster_idx", maintain_order=True)
             .agg(pl.col("total_energy_deps_in_cluster").sum().alias("hard_scatter_energy_deps_in_cluster"))
+            .filter(pl.col("hard_scatter_energy_deps_in_cluster") > self.hard_scatter_energy_threshold) # Optional: keep only clusters with non-zero deposited energy
             .group_by("event_id", maintain_order=True)
             .agg('cluster_idx', 'hard_scatter_energy_deps_in_cluster')
             .collect()
@@ -766,6 +769,7 @@ class ODDDataModule(L.LightningDataModule):
         val_and_test_split_same: bool = False,
         overtrain: bool = False,
         seed: int = 42,
+        hard_scatter_energy_threshold: float = 0.03,
         **kwargs,
     ):
         super().__init__()
@@ -799,6 +803,7 @@ class ODDDataModule(L.LightningDataModule):
             "remove_wrong_idxs": remove_wrong_idxs,
             "incidence_cutval": incidence_cutval,
             "is_inference": is_inference,
+            "hard_scatter_energy_threshold": hard_scatter_energy_threshold,
         }
         self.dataset_kwargs.update(kwargs)
 

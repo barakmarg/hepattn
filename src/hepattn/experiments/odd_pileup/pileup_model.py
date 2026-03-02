@@ -34,6 +34,8 @@ class PileupRemovalModel(nn.Module):
         calo_loss_weight: float = 1.0,
         track_threshold: float = 0.5,
         track_pos_weight: float = 17.0,
+        calo_signal_threshold: float = 0.05,
+        calo_signal_weight: float = 15.5,
     ):
         super().__init__()
         self.input_nets = input_nets
@@ -47,6 +49,8 @@ class PileupRemovalModel(nn.Module):
         self.calo_loss_weight = calo_loss_weight
         self.track_threshold = track_threshold
         self.track_pos_weight = track_pos_weight
+        self.calo_signal_threshold = calo_signal_threshold
+        self.calo_signal_weight = calo_signal_weight
 
         # Define tasks list for the ModelWrapper to iterate over if needed
         # (Even though we calculate loss internally, the wrapper might check this)
@@ -140,8 +144,8 @@ class PileupRemovalModel(nn.Module):
             pred_alpha = outputs["calo_frac"].squeeze(-1)[cluster_mask]
             E_total = outputs["node_e"].squeeze(-1)[cluster_mask]
             E_HS_true = targets["calo_hard_scatter_energy"][cluster_mask]
-            is_signal = (E_HS_true / (E_total + 1e-8) > 0.05).float()  # Only consider nodes with significant HS energy for loss
-            weights = 1 + 120 * is_signal  # Upweight signal nodes by factor of 30
+            is_signal = (E_HS_true / (E_total + 1e-8) > self.calo_signal_threshold).float()
+            weights = 1 + self.calo_signal_weight * is_signal
             E_HS_pred = pred_alpha * E_total
             loss_calo = torch.mean(torch.abs(E_HS_pred - E_HS_true) * weights)
 
