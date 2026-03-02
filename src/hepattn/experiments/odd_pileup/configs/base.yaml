@@ -45,11 +45,11 @@ data:
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 4
-  num_train: -1    # -1 for all events
-  num_test: -1
-  num_val: -1
+  num_train: 1000   # -1 for all events
+  num_test: 100
+  num_val: 100
 
-  batch_size: 32   # Increased from 128 to match CLIC
+  batch_size: 64   # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Energy threshold for cluster filtering
@@ -155,6 +155,9 @@ model:
                     fields: [eta, phi]
                     scale: 0.1
 
+      # Sort field for windowed attention: nodes are sorted by this key before the encoder
+      input_sort_field: deltaR_idx  # Z-order Morton index in eta-phi for delta-R locality
+
       # Encoder (transformer) configuration
       encoder:
         class_path: hepattn.models.Encoder
@@ -162,9 +165,10 @@ model:
           num_layers: 8
           dim: *dim
           attn_type: flash-varlen
+          window_size: 512   # Each token attends to ±128 nearest neighbors in Z-order
+          window_wrap: false # Z-order space is not periodic
           hybrid_norm: true
           value_residual: true
-          num_register_tokens: 8
           attn_kwargs:
             num_heads: 16
 

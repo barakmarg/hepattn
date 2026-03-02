@@ -82,6 +82,10 @@ class PileupRemovalModel(nn.Module):
         x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in input_names], dim=-2)
         x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in input_names], dim=-1)
 
+        # Expose sort coordinate for windowed attention (e.g. deltaR_idx for Z-order sort)
+        if self.input_sort_field is not None:
+            x[f"key_{self.input_sort_field}"] = inputs.get(f"node_{self.input_sort_field}")
+
         # 5. Encoder
         if self.encoder is not None:
             # Note: The Encoder expects 'kv_mask' for masking
