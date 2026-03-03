@@ -359,6 +359,70 @@ class ODDDatasetPileup(Dataset):
             total_cluster_energy = self.full_data_array["total_cluster_energy"].sum().item()
             deps_to_cluster_ratio = total_deps_energy / total_cluster_energy if total_cluster_energy > 0 else 0
             print(f"Energy composition: Total deposited HS energy {total_deps_energy:.2e} | Total cluster energy {total_cluster_energy:.2e} | Ratio {deps_to_cluster_ratio:.4f}")
+
+        self.print_deltaR_stats()
+
+    def print_deltaR_stats(self, n_sample: int = 100, window_size: int = 512) -> None:
+        """Sample events and print delta R statistics within a Z-order sorted window.
+
+        Nodes are sorted by their Morton (Z-order) index — the same ordering used by
+        the windowed transformer attention — then, for each node, delta R is computed
+        to every other node inside the sliding window of `window_size` positions.
+        This lets you directly assess how well the window_size config covers local
+        structure in eta-phi space.
+        """
+        n_sample = min(n_sample, self.num_events)
+        sample_indices = np.random.choice(self.num_events, size=n_sample, replace=False)
+        half_w = window_size // 2
+        all_mean_window_dR = []
+        all_max_window_dR = []
+        all_n_nodes = []
+
+        for evt_idx in sample_indices:
+            t_start, t_end = self.track_cumsum[evt_idx], self.track_cumsum[evt_idx + 1]
+            c_start, c_end = self.cluster_cumsum[evt_idx], self.cluster_cumsum[evt_idx + 1]
+            eta = torch.cat([self.full_data_array["track_eta"][t_start:t_end],
+                             self.full_data_array["cluster_eta"][c_start:c_end]])
+            phi = torch.cat([self.full_data_array["track_phi"][t_start:t_end],
+                             self.full_data_array["cluster_phi"][c_start:c_end]])
+            n = len(eta)
+            if n < 2:
+                continue
+            all_n_nodes.append(n)
+
+            # Sort by Morton index — same as the transformer encoder
+            sort_idx = torch.argsort(morton_encode(eta, phi))
+            eta = eta[sort_idx]
+            phi = phi[sort_idx]
+
+            # For each node compute delta R to all nodes within the window
+            window_dR = []
+            for i in range(n):
+                j_start = max(0, i - half_w)
+                j_end = min(n, i + half_w + 1)
+                nbrs = torch.arange(j_start, j_end)
+                nbrs = nbrs[nbrs != i]
+                deta = eta[i] - eta[nbrs]
+                dphi = phi[i] - phi[nbrs]
+                dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))
+                dR = torch.sqrt(deta ** 2 + dphi ** 2)
+                window_dR.append(dR)
+
+            window_dR = torch.cat(window_dR)
+            all_mean_window_dR.append(window_dR.mean().item())
+            all_max_window_dR.append(window_dR.max().item())
+
+        if all_mean_window_dR:
+            print(f"--- Delta R window analysis ({n_sample} sampled events, window_size={window_size}) ---")
+            print(f"Avg nodes per event: {np.mean(all_n_nodes):.0f}")
+            print(f"Mean delta R within window: {np.mean(all_mean_window_dR):.4f}  "
+                  f"[Q1={np.percentile(all_mean_window_dR, 25):.4f}, "
+                  f"Q3={np.percentile(all_mean_window_dR, 75):.4f}]")
+            print(f"Mean max delta R within window: {np.mean(all_max_window_dR):.4f}  "
+                  f"[Q1={np.percentile(all_max_window_dR, 25):.4f}, "
+                  f"Q3={np.percentile(all_max_window_dR, 75):.4f}]")
+            print(f"-------------------------------------------------------------------------")
+
     def __len__(self) -> int:
         return int(self.num_events)
 
