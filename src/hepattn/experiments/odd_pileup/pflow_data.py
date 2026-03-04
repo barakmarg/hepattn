@@ -544,6 +544,9 @@ class ODDDatasetPileup(Dataset):
             "calo_raw_hard_scatter_energy": torch.cat([torch.zeros(n_tracks), d_energy_hard_scatter_energy], -1),
             "calo_raw_hard_scatter_energy_frac": torch.cat([torch.zeros(n_tracks), d_energy_hard_scatter_frac], -1),
             "track_vertex_primary_mask": torch.cat([t_vertex_primary_mask, torch.zeros(n_clusters, dtype=torch.float32)], -1),
+            # Raw (unscaled) kinematic quantities for plotting
+            "node_pt":  torch.cat([t_pt,  torch.zeros(n_clusters, device=t_pt.device)], -1),
+            "node_eta": torch.cat([t_eta, c_eta], -1),
         }
 
         # Compute Z-order (Morton) index from raw eta/phi for locality-preserving sort
@@ -602,6 +605,8 @@ class ODDDatasetPileup(Dataset):
         labels["node_e"] = data_dict["node_raw_features"]["total_e"]
         labels["calo_hard_scatter_energy"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy"]
         labels["calo_hard_scatter_energy_frac"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy_frac"]
+        labels["node_pt"]  = data_dict["node_raw_features"]["node_pt"]
+        labels["node_eta"] = data_dict["node_raw_features"]["node_eta"]
 
         labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
 
@@ -840,10 +845,12 @@ class ODDDataModule(L.LightningDataModule):
         valid_path: str,
         batch_size: int,
         num_workers: int,
-        num_train: int,
-        num_val: int,
-        num_test: int,
-        scale_dict_path: str,
+        num_train: int = -1,
+        num_val: int = -1,
+        num_test: int = -1,
+        scale_dict_path: str = "",
+        num_val_workers: int | None = None,
+        num_test_workers: int | None = None,
         inputs: dict | None = None,
         targets: dict | None = None,
         max_nodes: int = 900,
@@ -871,6 +878,8 @@ class ODDDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.test_path = test_path
         self.num_workers = num_workers
+        self.num_val_workers = num_val_workers if num_val_workers is not None else num_workers
+        self.num_test_workers = num_test_workers if num_test_workers is not None else num_workers
         self.num_train = num_train
         self.num_val = num_val
         self.num_test = num_test
@@ -1001,16 +1010,18 @@ class ODDDataModule(L.LightningDataModule):
         if is_global_zero:
             print("-" * 100, "\n")
 
-    def get_dataloader(self, stage: str, dataset: ODDDatasetPileup, shuffle: bool):
+    def get_dataloader(self, stage: str, dataset: ODDDatasetPileup, shuffle: bool, num_workers: int | None = None):
+        nw = num_workers if num_workers is not None else self.num_workers
         print(f"Creating {stage} dataloader with {len(dataset):,} events")
         return DataLoader(
             dataset=dataset,
             batch_size=self.batch_size,
             collate_fn=None,
             sampler=None,
-            num_workers=self.num_workers,
+            num_workers=nw,
             shuffle=shuffle,
             pin_memory=self.pin_memory,
+            persistent_workers=nw > 0,
         )
 
     def train_dataloader(self):
@@ -1021,9 +1032,9 @@ class ODDDataModule(L.LightningDataModule):
     def val_dataloader(self):
         rank = 0 if self.trainer is None else self.trainer.local_rank
         print("Instantiating validation dataloader on rank", rank)
-        return self.get_dataloader(dataset=self.val_dset, stage="test", shuffle=False)
+        return self.get_dataloader(dataset=self.val_dset, stage="test", shuffle=False, num_workers=self.num_val_workers)
 
     def test_dataloader(self):
         rank = 0 if self.trainer is None else self.trainer.local_rank
         print("Instantiating test dataloader on rank", rank)
-        return self.get_dataloader(dataset=self.test_dset, stage="test", shuffle=False)
+        return self.get_dataloader(dataset=self.test_dset, stage="test", shuffle=False, num_workers=self.num_test_workers)

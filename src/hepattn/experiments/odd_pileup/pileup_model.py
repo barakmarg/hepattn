@@ -1,32 +1,17 @@
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from hepattn.models.dense import Dense
 from hepattn.models.transformer import Encoder
 
-class TracksMlp(nn.Module):
-    def __init__(self, net: nn.Module):
-        super().__init__()
-        self.mlp = net
-    
-    def forward(self, x: Tensor) -> Tensor:
-        return self.mlp(x)
-
-class CaloMlp(nn.Module):
-    def __init__(self, net: nn.Module, final_activation: nn.Module = None):
-        super().__init__()
-        self.mlp = net
-        self.act = final_activation if final_activation else nn.Identity()
-    
-    def forward(self, x: Tensor) -> Tensor:
-        return self.act(self.mlp(x))
 
 class PileupRemovalModel(nn.Module):
     def __init__(
         self,
         input_nets: nn.ModuleList,
         encoder: Encoder,
-        tracks_mlp: nn.Module,
-        calo_mlp: nn.Module,
+        tracks_mlp: Dense,
+        calo_mlp: Dense,
         dim: int,
         raw_variables: list[str] | None = None,
         input_sort_field: str | None = None,
@@ -54,7 +39,7 @@ class PileupRemovalModel(nn.Module):
 
         # Define tasks list for the ModelWrapper to iterate over if needed
         # (Even though we calculate loss internally, the wrapper might check this)
-        self.tasks = nn.ModuleList([]) 
+        self.tasks = nn.ModuleList([])
 
     def forward(self, inputs: dict[str, Tensor]) -> dict[str, Tensor]:
         # 1. Prepare Input names
@@ -71,7 +56,7 @@ class PileupRemovalModel(nn.Module):
             input_name = input_net.input_name
             x[input_name + "_embed"] = input_net(inputs)
             x[input_name + "_valid"] = inputs[input_name + "_valid"]
-            
+
             # Helper mask to know which node came from where
             device = inputs[input_name + "_valid"].device
             x[f"key_is_{input_name}"] = torch.cat(
@@ -88,21 +73,22 @@ class PileupRemovalModel(nn.Module):
 
         # 5. Encoder
         if self.encoder is not None:
-            # Note: The Encoder expects 'kv_mask' for masking
             x["key_embed"] = self.encoder(
-                x["key_embed"], 
-                x_sort_value=x.get(f"key_{self.input_sort_field}"), 
+                x["key_embed"],
+                x_sort_value=x.get(f"key_{self.input_sort_field}"),
                 kv_mask=x.get("key_valid")
             )
-        # 6. Apply Heads
-        latent = x["key_embed"]
-        
-        # Track Head (Logits)
-        track_logits = self.tracks_mlp(latent) 
-        
-        # Calo Head (Fraction 0-1)
-        calo_frac = self.calo_mlp(latent)
-        # Return dictionary used by Loss and Predict
+
+        latent = x["key_embed"]   # [B, N, D]
+        mask = x["key_valid"].bool().unsqueeze(-1)   # [B, N, 1]
+
+        # 6. Compute global context: mean of valid node embeddings
+        global_context = (latent * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-9)  # [B, D]
+
+        # 7. Apply Heads (with optional global context)
+        track_logits = self.tracks_mlp(latent, context=global_context)
+        calo_frac = self.calo_mlp(latent, context=global_context)
+
         return {
             "track_logits": track_logits,
             "calo_frac": calo_frac,
@@ -125,12 +111,12 @@ class PileupRemovalModel(nn.Module):
 
     def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
         """Physics-Weighted Loss"""
-        
+
         # 1. Create Masks
         valid = outputs["key_valid"].bool()
         # "node_is_track" comes from inputs, ensure it's bool
-        is_track = outputs["is_track"].bool().squeeze(-1) 
-        
+        is_track = outputs["is_track"].bool().squeeze(-1)
+
         track_mask = valid & is_track
         cluster_mask = valid & (~is_track)
 
@@ -152,7 +138,6 @@ class PileupRemovalModel(nn.Module):
             weights = 1 + self.calo_signal_weight * is_signal
             E_HS_pred = pred_alpha * E_total
             loss_calo = torch.mean(torch.abs(E_HS_pred - E_HS_true) * weights)
-
         else:
             loss_calo = torch.tensor(0.0, device=valid.device, requires_grad=True)
 

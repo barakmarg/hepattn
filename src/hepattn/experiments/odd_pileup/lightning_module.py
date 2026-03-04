@@ -1,8 +1,13 @@
+from collections import defaultdict
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchmetrics as tm
 from torch import nn
 
+from hepattn.experiments.odd_pileup.plots import PhysicsPlotter
 from hepattn.models.wrapper import ModelWrapper
 
 
@@ -21,6 +26,73 @@ class ODDPFlow(ModelWrapper):
         self.track_f1 = tm.classification.BinaryF1Score()
         self.track_precision = tm.classification.BinaryPrecision()
         self.track_recall = tm.classification.BinaryRecall()
+
+        # Accumulation buffers for end-of-epoch physics plots
+        self._val_track_data: dict[str, list] = defaultdict(list)
+        self._val_cluster_data: dict[str, list] = defaultdict(list)
+
+    # ------------------------------------------------------------------
+    # Validation accumulation hooks
+    # ------------------------------------------------------------------
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_track_data = defaultdict(list)
+        self._val_cluster_data = defaultdict(list)
+
+    def on_validation_epoch_end(self) -> None:
+        if not self._val_track_data and not self._val_cluster_data:
+            return
+
+        track = {k: np.concatenate(v) for k, v in self._val_track_data.items()}
+        cluster = {k: np.concatenate(v) for k, v in self._val_cluster_data.items()}
+
+        figs = {}
+        if cluster.get("pred_frac") is not None and len(cluster["pred_frac"]) > 0:
+            figs["calo/energy_corr"] = PhysicsPlotter.plot_energy_correlation(
+                cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
+            )
+            figs["calo/frac_corr"] = PhysicsPlotter.plot_calo_frac_correlation(
+                cluster["pred_frac"], cluster["true_frac"]
+            )
+            figs["calo/energy_resid"] = PhysicsPlotter.plot_energy_residual(
+                cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
+            )
+
+        if track.get("probs") is not None and len(track["probs"]) > 0:
+            figs["track/score_dist"] = PhysicsPlotter.plot_track_score_distribution(
+                track["probs"], track["truth"]
+            )
+            figs["track/eff_vs_pt"] = PhysicsPlotter.plot_track_efficiency_vs_pt(
+                track["probs"], track["truth"], track["pt"]
+            )
+            figs["track/rej_vs_pt"] = PhysicsPlotter.plot_pileup_rejection_vs_pt(
+                track["probs"], track["truth"], track["pt"]
+            )
+            figs["track/mistag_eta"] = PhysicsPlotter.plot_mistag_rate_vs_eta(
+                track["probs"], track["truth"], track["eta"]
+            )
+            figs["track/score_by_pt"] = PhysicsPlotter.plot_track_score_by_pt(
+                track["probs"], track["truth"], track["pt"]
+            )
+            figs["track/roc"] = PhysicsPlotter.plot_roc_curve(
+                track["probs"], track["truth"]
+            )
+
+        # Log to CometML
+        if self.logger is not None and hasattr(self.logger, "experiment"):
+            exp = self.logger.experiment
+            if hasattr(exp, "log_figure"):
+                for name, fig in figs.items():
+                    exp.log_figure(figure_name=name, figure=fig, step=self.current_epoch)
+                    plt.close(fig)
+                return
+        # Fallback: just close figures without logging
+        for fig in figs.values():
+            plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Per-batch metrics + accumulation
+    # ------------------------------------------------------------------
 
     def log_custom_metrics(self, preds, labels, stage):
         kwargs = {"sync_dist": True, "batch_size": 1}
@@ -47,6 +119,13 @@ class ODDPFlow(ModelWrapper):
 
             self.track_recall(track_prob, track_truth)
             self.log(f"{stage}/track_recall", self.track_recall, **kwargs)
+
+            # Accumulate for epoch-end plots
+            if stage == "val":
+                self._val_track_data["probs"].append(track_prob.detach().float().cpu().numpy())
+                self._val_track_data["truth"].append(track_truth.detach().cpu().numpy())
+                self._val_track_data["pt"].append(labels["node_pt"][track_node_mask].detach().float().cpu().numpy())
+                self._val_track_data["eta"].append(labels["node_eta"][track_node_mask].detach().float().cpu().numpy())
 
         # --- Cluster Metrics (only on cluster nodes) ---
         cluster_node_mask = node_valid & (~is_track)
@@ -84,3 +163,10 @@ class ODDPFlow(ModelWrapper):
                 pred_hs_energy = calo_frac_pred * node_e
                 hs_energy_ratio = pred_hs_energy.sum() / sum_true
                 self.log(f"{stage}/calo_hs_energy_ratio", hs_energy_ratio, **kwargs)
+
+            # Accumulate for epoch-end plots
+            if stage == "val":
+                self._val_cluster_data["pred_frac"].append(calo_frac_pred.detach().float().cpu().numpy())
+                self._val_cluster_data["true_frac"].append(calo_frac_true.detach().float().cpu().numpy())
+                self._val_cluster_data["total_e"].append(node_e.detach().float().cpu().numpy())
+                self._val_cluster_data["true_hs_e"].append(true_hs_energy.detach().float().cpu().numpy())

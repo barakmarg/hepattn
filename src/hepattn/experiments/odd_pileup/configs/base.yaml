@@ -45,6 +45,9 @@ data:
 
   # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
   num_workers: 4
+  num_val_workers: 1
+  num_test_workers: 1
+  #prefetch_factor: 1
   num_train: -1   # -1 for all events
   num_test: -1
   num_val: -1
@@ -173,26 +176,21 @@ model:
             num_heads: 16
 
       tracks_mlp:
-          class_path: hepattn.experiments.odd_pileup.pileup_model.TracksMlp
+          class_path: hepattn.models.Dense
           init_args:
-            net:
-              class_path: hepattn.models.Dense
-              init_args:
-                # Input size = ??(Dim * 2) + Num_Raw_Variables
-                input_size: *dim
-                activation: torch.nn.SiLU
-                output_size: 1
-                hidden_layers: [256,128, 64, 32]
+            input_size: *dim
+            output_size: 1
+            context_size: *dim
+            activation: torch.nn.SiLU
+            hidden_layers: [256, 128, 64, 32]
+
       calo_mlp:
-          class_path: hepattn.experiments.odd_pileup.pileup_model.CaloMlp
+          class_path: hepattn.models.Dense
           init_args:
-            net:
-              class_path: hepattn.models.Dense
-              init_args:
-                # Input size = ??(Dim * 2) + Num_Raw_Variables
-                input_size: *dim
-                activation: torch.nn.SiLU
-                output_size: 1
-                hidden_layers: [ 256,128, 64,32]
+            input_size: *dim
+            output_size: 1
+            context_size: *dim
+            activation: torch.nn.SiLU
+            hidden_layers: [256, 128, 64, 32]
             final_activation:
               class_path: torch.nn.Sigmoid

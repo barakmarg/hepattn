@@ -1,3 +1,4 @@
+import torch
 from torch import Tensor, nn
 
 from hepattn.models.activation import SwiGLU
@@ -15,6 +16,7 @@ class Dense(nn.Module):
         dropout: float = 0.0,
         bias: bool = True,
         norm_input: bool = False,
+        context_size: int = 0,
     ) -> None:
         """A fully connected feed forward neural network, which can take
         in additional contextual information.
@@ -39,7 +41,11 @@ class Dense(nn.Module):
         bias : bool, optional
             Whether to use bias in the linear layers.
         norm_input : bool, optional
-            Whether to apply layer normalization to the input.
+            Whether to apply layer normalization to the input (before context concat).
+        context_size : int, optional
+            Size of the optional global context vector. When > 0, a context tensor
+            can be passed to forward() and will be broadcast over the node dimension
+            and concatenated to x before the first linear layer.
         """
         super().__init__()
 
@@ -52,13 +58,17 @@ class Dense(nn.Module):
 
         self.input_size = input_size
         self.output_size = output_size
+        self.context_size = context_size
         gate = isinstance(activation, SwiGLU)
 
-        layers = []
-        if norm_input:
-            layers.append(nn.LayerNorm(input_size))
+        # LayerNorm is stored separately so it can be applied before context concat
+        self.input_norm = nn.LayerNorm(input_size) if norm_input else None
 
-        node_list = [input_size, *hidden_layers]
+        # First layer takes input_size + context_size
+        effective_input = input_size + context_size
+        node_list = [effective_input, *hidden_layers]
+
+        layers = []
         for i in range(len(node_list) - 1):
             in_dim = node_list[i]
             proj_dim = node_list[i + 1]
@@ -79,5 +89,11 @@ class Dense(nn.Module):
         # build the net
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, context: Tensor | None = None) -> Tensor:
+        if self.input_norm is not None:
+            x = self.input_norm(x)
+        if self.context_size > 0 and context is not None:
+            # context: [B, D] → broadcast to [B, N, D] and concat along feature dim
+            context_expanded = context.unsqueeze(1).expand(-1, x.shape[1], -1)
+            x = torch.cat([x, context_expanded], dim=-1)
         return self.net(x)
