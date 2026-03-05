@@ -44,6 +44,22 @@ class PhysicsPlotter:
         return fig
 
     @staticmethod
+    def plot_calo_frac_distribution(pred_frac: np.ndarray, true_frac: np.ndarray) -> Figure:
+        """Overlaid 1D histograms of predicted and truth HS fraction in [0, 1]."""
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(true_frac, bins=100, range=(0, 1), density=True,
+                alpha=0.7, color="steelblue", label="Truth")
+        ax.hist(pred_frac, bins=100, range=(0, 1), density=True,
+                alpha=0.7, color="tomato", label="Predicted")
+        ax.set_xlabel("HS Fraction")
+        ax.set_ylabel("Normalised Density")
+        ax.set_title("Calo: HS Fraction Distribution")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
     def plot_energy_residual(pred_frac: np.ndarray, total_e: np.ndarray, true_hs_e: np.ndarray) -> Figure:
         """(E_pred − E_true) / E_true distribution. Tests calibration."""
         pred_hs_e = pred_frac * total_e

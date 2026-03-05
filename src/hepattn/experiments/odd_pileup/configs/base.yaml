@@ -56,7 +56,7 @@ data:
   incidence_cutval: 0.01
 
   # Energy threshold for cluster filtering
-  hard_scatter_energy_threshold: 0.01
+  hard_scatter_energy_threshold: 0.1
 
   # Path to variable transformation config
   scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup/configs/odd_var_transform.yaml

@@ -54,6 +54,9 @@ class ODDPFlow(ModelWrapper):
             figs["calo/frac_corr"] = PhysicsPlotter.plot_calo_frac_correlation(
                 cluster["pred_frac"], cluster["true_frac"]
             )
+            figs["calo/frac_dist"] = PhysicsPlotter.plot_calo_frac_distribution(
+                cluster["pred_frac"], cluster["true_frac"]
+            )
             figs["calo/energy_resid"] = PhysicsPlotter.plot_energy_residual(
                 cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
             )

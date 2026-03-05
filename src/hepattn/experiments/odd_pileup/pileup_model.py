@@ -134,7 +134,7 @@ class PileupRemovalModel(nn.Module):
             pred_alpha = outputs["calo_frac"].squeeze(-1)[cluster_mask]
             E_total = outputs["node_e"].squeeze(-1)[cluster_mask]
             E_HS_true = targets["calo_hard_scatter_energy"][cluster_mask]
-            is_signal = (E_HS_true / (E_total + 1e-8) > self.calo_signal_threshold).float()
+            is_signal = (E_HS_true  > self.calo_signal_threshold).float()
             weights = 1 + self.calo_signal_weight * is_signal
             E_HS_pred = pred_alpha * E_total
             loss_calo = torch.mean(torch.abs(E_HS_pred - E_HS_true) * weights)
