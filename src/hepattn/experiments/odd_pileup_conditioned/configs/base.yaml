@@ -1,0 +1,196 @@
+# ODD Particle Flow Base Configuration - Adapted to CLIC v6 Architecture
+# TODO: Adjust paths, hyperparameters, and model architecture for your use case
+
+name: odd_pflow_v1_clic_arch
+seed_everything: 42
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  # Input features for nodes (tracks + clusters) - KEPT ODD SETTINGS
+  inputs:
+    node:
+      - "d0"
+      - "z0"
+      - "phi"
+      - "theta"
+      - "qop"
+      - "energy"
+      - "eta"
+      - "is_track"
+      # TODO: Add more features as needed
+
+  # Target variables for regression
+  targets:
+    particle:
+      - e
+      - pt
+      - eta
+      - sinphi
+      - cosphi
+
+  # TODO: Update paths to your parquet files, seperate for train/val/test
+  train_path: /storage/agrp/barakma/PileupODD/data/fervefvef
+  valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
+  test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
+  
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu200
+  enable_split: true
+  train_split: 0.9
+  val_split: 0.1
+  test_split: 0.1
+  val_and_test_split_same: true
+  overtrain: false # Enable overtraining for debugging (use same files for train/val/test), have priority over val_and_test_split_same
+
+  # DataLoader settings - MATCHED CLIC SETTINGS (Higher batch/workers)
+  num_workers: 4
+  num_val_workers: 1
+  num_test_workers: 1
+  #prefetch_factor: 1
+  num_train: 45000   # -1 for all events
+  num_test: 4000
+  num_val: 4000
+
+  batch_size: 64   # Increased from 128 to match CLIC
+  incidence_cutval: 0.01
+
+  # Energy threshold for cluster filtering
+  hard_scatter_energy_threshold: 0.1
+
+  # Path to variable transformation config
+  scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup/configs/odd_var_transform.yaml
+
+  # TODO: Adjust max_nodes based on your data
+  max_nodes: 5500
+
+# =============================================================================
+# Trainer Configuration
+# =============================================================================
+trainer:
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  default_root_dir: logs
+  enable_progress_bar: True
+
+  # TODO: Configure your logger
+  logger:
+    class_path: hepattn.experiments.odd_pileup_conditioned.logger_utils.FixedCometLogger
+    init_args:
+      project: odd-pflow-pileup-removal
+
+  callbacks:
+    - class_path: hepattn.callbacks.Compile
+    - class_path: hepattn.callbacks.InferenceTimer
+    - class_path: hepattn.callbacks.SaveConfig
+    - class_path: hepattn.callbacks.Checkpoint
+      init_args:
+        monitor: val/loss
+        save_last: true
+    - class_path: hepattn.experiments.odd_pileup_conditioned.PflowPredictionWriter
+    - class_path: lightning.pytorch.callbacks.ModelSummary
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+    - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 50
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model:
+  optimizer: AdamW  # Changed from AdamW to match CLIC
+
+  lrs_config:
+    initial: 1.25e-6     # (Was 1e-5) / 8
+    max: 1e-4            # (Was 8e-4) / 8
+    end: 1.25e-6         # (Was 1e-5) / 8
+    pct_start: 0.05
+    weight_decay: 0.01   # Keep constant
+    skip_scheduler: false
+
+
+  mtl: false
+
+  model:
+    class_path: hepattn.experiments.odd_pileup_conditioned.pileup_model.PileupRemovalModel
+    init_args:
+      dim: &dim 256
+
+      # Loss weights
+      track_loss_weight: 1.0
+      calo_loss_weight: 1.0
+
+      # Inference and loss hyperparameters
+      track_threshold: 0.5
+      track_pos_weight: 16.24
+      calo_signal_threshold: 0.05
+      calo_signal_weight: 25.3
+
+      # Raw variables passed through from inputs for loss calculation
+      raw_variables:
+        - "node_e"
+        - "node_is_track"
+
+      # Input network configuration
+      input_nets:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            - class_path: hepattn.models.InputNet
+              init_args:
+                input_name: node
+                fields:
+                  - features
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: 21 
+                    output_size: *dim
+                posenc:
+                  class_path: hepattn.models.posenc.FourierPositionEncoder
+                  init_args:
+                    input_name: node
+                    dim: *dim
+                    fields: [eta, phi]
+                    scale: 0.1
+
+      # Sort field for windowed attention: nodes are sorted by this key before the encoder
+      input_sort_field: deltaR_idx  # Z-order Morton index in eta-phi for delta-R locality
+
+      # Encoder (transformer) configuration
+      encoder:
+        class_path: hepattn.models.Encoder
+        init_args:
+          num_layers: 8
+          dim: *dim
+          attn_type: flash-varlen
+          window_size: 512   # Each token attends to ±128 nearest neighbors in Z-order
+          window_wrap: false # Z-order space is not periodic
+          hybrid_norm: true
+          value_residual: true
+          attn_kwargs:
+            num_heads: 16
+
+      tracks_mlp:
+          class_path: hepattn.models.Dense
+          init_args:
+            input_size: *dim
+            output_size: 1
+            context_size: *dim
+            activation: torch.nn.SiLU
+            hidden_layers: [256, 128, 64, 32]
+
+      calo_mlp:
+          class_path: hepattn.models.Dense
+          init_args:
+            input_size: *dim
+            output_size: 1
+            context_size: *dim
+            activation: torch.nn.SiLU
+            hidden_layers: [256, 128, 64, 32]
+            final_activation:
+              class_path: torch.nn.Sigmoid

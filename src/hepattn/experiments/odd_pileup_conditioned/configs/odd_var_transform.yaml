@@ -1,0 +1,78 @@
+eta:
+  type: min_max_sym
+  mean: 0.0003
+  std: 1.7599
+  min: -3.4189
+  max: 3.513
+rho:
+  type: min_max_sym
+  mean: 1193.3315
+  std: 388.2537
+  min: 298.2659
+  max: 3495.3765
+e:
+  type: min_max_sym
+  fn: sqrt
+  mean: 1.4828
+  std: 1.7984
+  min: 0.3873
+  max: 56.2825
+pt:
+  type: min_max_sym
+  fn: sqrt
+  mean: 1.2925
+  std: 0.4646
+  min: 1.0
+  max: 614.7784
+cluster_pt:
+  type: min_max_sym
+  fn: sqrt
+  mean: 0.8665
+  std: 0.8013
+  min: 0.1036
+  max: 34.6402
+sigma_eta:
+  type: std
+  fn: sqrt
+  mean: 0.1627
+  std: 0.0891
+  min: 0.0
+  max: 0.6425
+sigma_phi:
+  type: std
+  fn: sqrt
+  mean: 0.1973
+  std: 0.2165
+  min: 0.0
+  max: 2.1078
+sigma_rho:
+  type: std
+  fn: sqrt
+  mean: 5.3306
+  std: 2.2508
+  min: 0.0
+  max: 16.1784
+d0:
+  type: min_max_sym
+  mean: 0.0004
+  std: 0.5346
+  min: -17.8558
+  max: 17.0398
+z0:
+  type: min_max_sym
+  mean: 0.0103
+  std: 65.5337
+  min: -355.9535
+  max: 368.545
+tanlambda:
+  type: min_max_sym
+  mean: -0.0028
+  std: 3.771
+  min: -10.0179
+  max: 10.0179
+omega:
+  type: std
+  mean: -0.0
+  std: 0.0006
+  min: -0.0009
+  max: 0.0009
