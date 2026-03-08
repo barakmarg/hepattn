@@ -1,78 +1,78 @@
 eta:
   type: min_max_sym
-  mean: 0.0129
-  std: 1.9129
-  min: -3.4077
-  max: 3.4132
+  mean: 0.0003
+  std: 1.7599
+  min: -3.4189
+  max: 3.513
 rho:
   type: min_max_sym
-  mean: 1124.8562
-  std: 506.372
-  min: 312.0095
-  max: 3489.8362
+  mean: 1193.3315
+  std: 388.2537
+  min: 298.2659
+  max: 3495.3765
 e:
   type: min_max_sym
   fn: sqrt
-  mean: 1.2464
-  std: 1.2909
-  min: 0.5
-  max: 35.0785
+  mean: 1.4828
+  std: 1.7984
+  min: 0.3873
+  max: 56.2825
 pt:
   type: min_max_sym
   fn: sqrt
-  mean: 2.0245
-  std: 1.2137
-  min: 0.8439
-  max: 42.8814
+  mean: 1.2925
+  std: 0.4646
+  min: 1.0
+  max: 614.7784
 cluster_pt:
   type: min_max_sym
   fn: sqrt
-  mean: 0.7611
-  std: 0.824
-  min: 0.1301
-  max: 21.882
+  mean: 0.8665
+  std: 0.8013
+  min: 0.1036
+  max: 34.6402
 sigma_eta:
   type: std
   fn: sqrt
-  mean: 0.1845
-  std: 0.0878
+  mean: 0.1627
+  std: 0.0891
   min: 0.0
-  max: 0.6089
+  max: 0.6425
 sigma_phi:
   type: std
   fn: sqrt
-  mean: 0.2323
-  std: 0.2366
+  mean: 0.1973
+  std: 0.2165
   min: 0.0
-  max: 2.1056
+  max: 2.1078
 sigma_rho:
   type: std
   fn: sqrt
-  mean: 5.9852
-  std: 2.0357
+  mean: 5.3306
+  std: 2.2508
   min: 0.0
-  max: 14.501
+  max: 16.1784
 d0:
   type: min_max_sym
-  mean: 0.0001
-  std: 0.3791
-  min: -7.5895
-  max: 10.0326
+  mean: 0.0004
+  std: 0.5346
+  min: -17.8558
+  max: 17.0398
 z0:
   type: min_max_sym
-  mean: -0.5599
-  std: 54.7377
-  min: -152.9118
-  max: 238.8475
+  mean: 0.0103
+  std: 65.5337
+  min: -355.9535
+  max: 368.545
 tanlambda:
   type: min_max_sym
-  mean: 0.0258
-  std: 3.0561
-  min: -10.0253
-  max: 10.0293
+  mean: -0.0028
+  std: 3.771
+  min: -10.0179
+  max: 10.0179
 omega:
   type: std
-  mean: 0.0
-  std: 0.0005
-  min: -0.0013
-  max: 0.0012
+  mean: -0.0
+  std: 0.0006
+  min: -0.0009
+  max: 0.0009

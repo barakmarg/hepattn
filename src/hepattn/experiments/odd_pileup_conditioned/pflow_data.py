@@ -168,7 +168,8 @@ class ODDDatasetPileup(Dataset):
             "n_clusters": [],
             "n_particles": [],
             "n_deps": [],
-            "event_id": []
+            "event_id": [],
+            "hard_scatter_vz": [],
         }
         
         total_events_loaded = 0
@@ -276,6 +277,17 @@ class ODDDatasetPileup(Dataset):
                 flat_arr = df_deps.select(pl.col(var).explode()).to_series().to_torch()
                 safe_append(f"deps_{var}", flat_arr)
 
+            # Hard scatter vertex z (one per event): pre-computed in preprocess_hook
+            if "hard_scatter_vz" in df_tracks.columns:
+                accumulated_counts["hard_scatter_vz"].append(
+                    df_tracks.select(pl.col("hard_scatter_vz").list.first()).to_series().to_numpy().astype(np.float32)
+                )
+            else:
+                # Fallback: no truth vertex info available (e.g. pu0 data or inference)
+                n_events_in_batch = int(mask.sum())
+                raise ValueError("No hard_scatter_vz column found in tracks data. This is required for the vertex token feature. Please ensure your data contains this column or implement an alternative method to compute it.")
+                accumulated_counts["hard_scatter_vz"].append(np.zeros(n_events_in_batch, dtype=np.float32))
+
             # Cleanup
             del df_particles, df_clusters, df_deps, df_tracks, n_tracks, n_clusters, n_nodes, mask, n_particles, n_deps
             # Explicit garbage collection to free Polars memory
@@ -303,7 +315,8 @@ class ODDDatasetPileup(Dataset):
         self.n_clusters = np.concatenate(accumulated_counts["n_clusters"])
         self.n_particles = np.concatenate(accumulated_counts["n_particles"])
         self.n_deps = np.concatenate(accumulated_counts["n_deps"])
-        self.event_number = np.concatenate(accumulated_counts["event_id"]) # Original used pl.Series/DataFrame column behaviour
+        self.event_number = np.concatenate(accumulated_counts["event_id"])
+        self.hard_scatter_vz = np.concatenate(accumulated_counts["hard_scatter_vz"]) # Original used pl.Series/DataFrame column behaviour
         print("event numbers 10:", self.event_number[:10]) # Show first 10 event numbers for debugging
         # Concatenate features
         for key, tensor_list in accumulated_data.items():
@@ -566,6 +579,12 @@ class ODDDatasetPileup(Dataset):
         node_q_mask[:n_nodes] = True
         node_inp_features = torch.stack(list(node_features.values()), dim=-1)
 
+        # Hard scatter vertex token: single scalar (truth_vz_pt2_weighted for vertex_primary==1)
+        hs_vz_raw = torch.tensor([self.hard_scatter_vz[idx]], dtype=torch.float32)
+        hs_vz_scaled = self.scaler.transforms["truth_vz_pt2_weighted"].transform(hs_vz_raw)
+        # Shape (1, 1): [n_vertex_tokens=1, n_features=1]
+        vertex_token_features = hs_vz_scaled.unsqueeze(0)
+
         return {
             "node_inp_features": node_inp_features,
             "node_raw_features": node_raw_features,
@@ -573,6 +592,7 @@ class ODDDatasetPileup(Dataset):
             "node_eta": node_features["eta"],
             "node_phi": node_features["phi"],
             "node_deltaR_idx": node_deltaR_idx,
+            "vertex_token_features": vertex_token_features,
         }
 
     def __getitem__(self, idx: int) -> tuple[dict, dict]:
@@ -596,6 +616,7 @@ class ODDDatasetPileup(Dataset):
             "node_deltaR_idx": data_dict["node_deltaR_idx"],
             "node_e": data_dict["node_raw_features"]["total_e"],
             "node_is_track": data_dict["node_raw_features"]["is_track"],
+            "vertex_token_features": data_dict["vertex_token_features"],
         }
 
         labels["tracks_mask"] = data_dict["node_raw_features"]["track_vertex_primary_mask"]
@@ -636,7 +657,7 @@ class ODDDatasetPileup(Dataset):
                     #    We use .len() for count and .min() for min_pt over the groups
                     .with_columns([
                         pl.col('pt').len().over(['event_id', 'majority_particle_id']).alias('_count'),
-                        pl.col('pt').min().over(['event_id', 'majority_particle_id']).alias('_min_pt')
+                        pl.col('pt').max().over(['event_id', 'majority_particle_id']).alias('_max_pt')
                     ])
                     
                     # 3. Filter: Apply the logic immediately.
@@ -647,23 +668,34 @@ class ODDDatasetPileup(Dataset):
                         ~(
                             (pl.col('majority_particle_id') != -1) &
                             (pl.col('_count') > 1) &
-                            ((pl.col('pt') - pl.col('_min_pt')).abs() < 1e-3)
+                            ((pl.col('pt') - pl.col('_max_pt')).abs() > 1e-3) # Remove pt that are not the max_pt
                         )
                     )
 
-                    # 4. Compute pt^2-weighted vertex z per (event_id, majority_particle_vertex_primary)
-                    #    This gives each track its common collision vertex z position
+                    # 4. Compute vertex z statistics per (event_id, majority_particle_vertex_primary)
+                    #    This gives each track its common collision vertex z position and spread
                     .with_columns(
-                        (
-                            (pl.col("majority_particle_vz") * pl.col("pt").pow(2)).sum().over(["event_id", "majority_particle_vertex_primary"]) /
-                            pl.col("pt").pow(2).sum().over(["event_id", "majority_particle_vertex_primary"])
-                        ).alias("truth_vz_pt2_weighted")
+                        [
+                            (
+                                (pl.col("majority_particle_vz") * pl.col("pt").pow(2)).sum().over(["event_id", "majority_particle_vertex_primary"]) /
+                                pl.col("pt").pow(2).sum().over(["event_id", "majority_particle_vertex_primary"])
+                            ).alias("truth_vz_pt2_weighted")]
                     )
 
-                    # 5. Group back to lists
+                    # 5. Compute hard scatter vertex z per event (truth_vz_pt2_weighted where vertex_primary==1)
+                    .with_columns(
+                        pl.when(pl.col("majority_particle_vertex_primary") == 1)
+                        .then(pl.col("truth_vz_pt2_weighted"))
+                        .otherwise(None)
+                        .max()
+                        .over("event_id")
+                        .alias("hard_scatter_vz")
+                    )
+
+                    # 6. Group back to lists
                     #    maintain_order=True is faster than re-sorting and keeps track alignment
                     .group_by('event_id', maintain_order=True)
-                    .agg(pl.col(cols_to_explode + ["truth_vz_pt2_weighted"]))
+                    .agg(pl.col(cols_to_explode + ["truth_vz_pt2_weighted", "hard_scatter_vz"]))
                     .sort('event_id') # Ensure final event order matches original expectations
                     .collect()
                 )

@@ -122,13 +122,24 @@ model:
 
       # Loss weights
       track_loss_weight: 1.0
-      calo_loss_weight: 1.0
+      calo_loss_weight: 0.0
 
       # Inference and loss hyperparameters
       track_threshold: 0.5
       track_pos_weight: 16.24
       calo_signal_threshold: 0.05
       calo_signal_weight: 25.3
+
+      # Vertex token: one special token per event = truth hard-scatter vertex z (cheat)
+      enable_vertex_token: true
+      use_global_context: false   # redundant when vertex token provides global info via attention
+      vertex_input_net:
+        class_path: hepattn.models.Dense
+        init_args:
+          input_size: 1
+          output_size: *dim
+          hidden_layers: [64,64]
+          activation: torch.nn.SiLU
 
       # Raw variables passed through from inputs for loss calculation
       raw_variables:
@@ -167,7 +178,7 @@ model:
         init_args:
           num_layers: 8
           dim: *dim
-          attn_type: flash-varlen
+          attn_type: flex
           window_size: 512   # Each token attends to ±128 nearest neighbors in Z-order
           window_wrap: false # Z-order space is not periodic
           hybrid_norm: true
@@ -180,7 +191,7 @@ model:
           init_args:
             input_size: *dim
             output_size: 1
-            context_size: *dim
+            context_size: 0   # global context disabled: vertex token provides global info via attention
             activation: torch.nn.SiLU
             hidden_layers: [256, 128, 64, 32]
 
@@ -189,7 +200,7 @@ model:
           init_args:
             input_size: *dim
             output_size: 1
-            context_size: *dim
+            context_size: 0   # global context disabled: vertex token provides global info via attention
             activation: torch.nn.SiLU
             hidden_layers: [256, 128, 64, 32]
             final_activation:

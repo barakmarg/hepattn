@@ -19,11 +19,13 @@ ATTN_TYPES = {
 VARLEN_ATTN_TYPES = [
     "torch",
     "flash-varlen",
+    "flex",
 ]
 
 # Which attention types support attention masking
 ATTN_MASK_ATTN_TYPES = [
     "torch",
+    "flex",
 ]
 
 # Which attention types support attention biasing
@@ -35,6 +37,7 @@ ATTN_BIAS_ATTN_TYPES = [
 WINDOW_ATTN_TYPES = [
     "flash",
     "flash-varlen",
+    "flex",
 ]
 
 # For now basically just defines which attention types expect (B, S, H, Dh) instead of (B, H, S, Dh)

@@ -627,6 +627,7 @@ class ODDDatasetPileup(Dataset):
             return df_particles, df_clusters, df_deps, df_tracks
         cols_to_explode = [col for col in df_tracks.columns if col != 'event_id']
         # We remove double matched tracks to the same particle, only in the non-test stages. 
+        raise ValueError("fix particled idx, min to max also")
         df_tracks = (
                     df_tracks.lazy()
                     # 1. Explode everything once

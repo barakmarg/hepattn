@@ -76,3 +76,12 @@ omega:
   std: 0.0006
   min: -0.0009
   max: 0.0009
+truth_vz_pt2_weighted:
+  type: min_max_sym
+  mean: -23.2408
+  std: 84.891
+  min: -3258.8792
+  max: 3710.9431
+#truth_vz_pt2_weighted	truth_vz_mean	truth_vz_std	truth_vz_min	truth_vz_max
+#f32	f32	f32	f32	f32
+#-23.240768	-0.436598	84.890968	-3258.87915	3710.943115

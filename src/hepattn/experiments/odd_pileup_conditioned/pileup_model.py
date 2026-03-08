@@ -21,6 +21,9 @@ class PileupRemovalModel(nn.Module):
         track_pos_weight: float = 17.0,
         calo_signal_threshold: float = 0.05,
         calo_signal_weight: float = 15.5,
+        enable_vertex_token: bool = False,
+        vertex_input_net: nn.Module | None = None,
+        use_global_context: bool = True,
     ):
         super().__init__()
         self.input_nets = input_nets
@@ -36,6 +39,9 @@ class PileupRemovalModel(nn.Module):
         self.track_pos_weight = track_pos_weight
         self.calo_signal_threshold = calo_signal_threshold
         self.calo_signal_weight = calo_signal_weight
+        self.enable_vertex_token = enable_vertex_token
+        self.vertex_input_net = vertex_input_net
+        self.use_global_context = use_global_context
 
         # Define tasks list for the ModelWrapper to iterate over if needed
         # (Even though we calculate loss internally, the wrapper might check this)
@@ -71,19 +77,47 @@ class PileupRemovalModel(nn.Module):
         if self.input_sort_field is not None:
             x[f"key_{self.input_sort_field}"] = inputs.get(f"node_{self.input_sort_field}")
 
-        # 5. Encoder
+        # 5a. Optionally append hard-scatter vertex token to the node sequence
+        n_vertex_tokens = 0
+        if self.enable_vertex_token and self.vertex_input_net is not None:
+            vtx_feat = inputs["vertex_token_features"]              # (B, 1, 1)
+            vtx_embed = self.vertex_input_net(vtx_feat)             # (B, 1, dim)
+            vtx_valid = torch.ones(vtx_embed.shape[0], 1, dtype=torch.bool, device=vtx_embed.device)
+
+            # Append to node sequence
+            x["key_embed"] = torch.cat([x["key_embed"], vtx_embed], dim=1)   # (B, N+1, dim)
+            x["key_valid"] = torch.cat([x["key_valid"], vtx_valid], dim=1)   # (B, N+1)
+
+            # Sort value: place vertex token last (after all sorted regular tokens)
+            if self.input_sort_field is not None:
+                sort_vals = x[f"key_{self.input_sort_field}"]              # (B, N)
+                vtx_sort = torch.full((sort_vals.shape[0], 1), float("inf"), device=sort_vals.device)
+                x[f"key_{self.input_sort_field}"] = torch.cat([sort_vals, vtx_sort], dim=1)
+
+            n_vertex_tokens = 1
+
+        # 5b. Encoder
         if self.encoder is not None:
             x["key_embed"] = self.encoder(
                 x["key_embed"],
                 x_sort_value=x.get(f"key_{self.input_sort_field}"),
-                kv_mask=x.get("key_valid")
+                kv_mask=x.get("key_valid"),
+                n_global_tokens=n_vertex_tokens,
             )
+
+        # 5c. Slice off vertex token before MLP heads
+        if n_vertex_tokens > 0:
+            x["key_embed"] = x["key_embed"][:, :-n_vertex_tokens, :]
+            x["key_valid"] = x["key_valid"][:, :-n_vertex_tokens]
 
         latent = x["key_embed"]   # [B, N, D]
         mask = x["key_valid"].bool().unsqueeze(-1)   # [B, N, 1]
 
-        # 6. Compute global context: mean of valid node embeddings
-        global_context = (latent * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-9)  # [B, D]
+        # 6. Optionally compute global context: mean of valid node embeddings
+        if self.use_global_context:
+            global_context = (latent * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-9)  # [B, D]
+        else:
+            global_context = None
 
         # 7. Apply Heads (with optional global context)
         track_logits = self.tracks_mlp(latent, context=global_context)

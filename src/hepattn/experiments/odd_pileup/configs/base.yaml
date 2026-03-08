@@ -48,9 +48,9 @@ data:
   num_val_workers: 1
   num_test_workers: 1
   #prefetch_factor: 1
-  num_train: -1   # -1 for all events
-  num_test: -1
-  num_val: -1
+  num_train: 45000   # -1 for all events
+  num_test: 4000
+  num_val: 4000
 
   batch_size: 64   # Increased from 128 to match CLIC
   incidence_cutval: 0.01
