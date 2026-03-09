@@ -99,54 +99,34 @@ trainer:
         refresh_rate: 50
 
 # =============================================================================
-# Model Configuration
+# Model Configuration — MaskFormer with Proxy PV Query
 # =============================================================================
 model:
-  optimizer: AdamW  # Changed from AdamW to match CLIC
+  optimizer: AdamW
 
   lrs_config:
-    initial: 1.25e-6     # (Was 1e-5) / 8
-    max: 1e-4            # (Was 8e-4) / 8
-    end: 1.25e-6         # (Was 1e-5) / 8
+    initial: 1.25e-6
+    max: 1e-4
+    end: 1.25e-6
     pct_start: 0.05
-    weight_decay: 0.01   # Keep constant
+    weight_decay: 0.01
     skip_scheduler: false
-
 
   mtl: false
 
   model:
-    class_path: hepattn.experiments.odd_pileup_maskformer.pileup_model.PileupRemovalModel
+    class_path: hepattn.models.MaskFormer
     init_args:
       dim: &dim 256
+      target_object: particle
+      matcher: null  # No Hungarian matching — single query = single hard scatter event
 
-      # Loss weights
-      track_loss_weight: 1.0
-      calo_loss_weight: 0.0
-
-      # Inference and loss hyperparameters
-      track_threshold: 0.5
-      track_pos_weight: 16.24
-      calo_signal_threshold: 0.05
-      calo_signal_weight: 25.3
-
-      # Vertex token: one special token per event = truth hard-scatter vertex z (cheat)
-      enable_vertex_token: false
-      use_global_context: true   # redundant when vertex token provides global info via attention
-      vertex_input_net:
-        class_path: hepattn.models.Dense
-        init_args:
-          input_size: 1
-          output_size: *dim
-          hidden_layers: [64,64]
-          activation: torch.nn.SiLU
-
-      # Raw variables passed through from inputs for loss calculation
+      # Raw variables forwarded through x dict for loss calculation
       raw_variables:
         - "node_e"
         - "node_is_track"
 
-      # Input network configuration
+      # Input network: embed all nodes (tracks + clusters) into dim-D space
       input_nets:
         class_path: torch.nn.ModuleList
         init_args:
@@ -159,7 +139,7 @@ model:
                 net:
                   class_path: hepattn.models.Dense
                   init_args:
-                    input_size: 21 
+                    input_size: 21
                     output_size: *dim
                 posenc:
                   class_path: hepattn.models.posenc.FourierPositionEncoder
@@ -169,39 +149,96 @@ model:
                     fields: [eta, phi]
                     scale: 0.1
 
-      # Sort field for windowed attention: nodes are sorted by this key before the encoder
-      input_sort_field: deltaR_idx  # Z-order Morton index in eta-phi for delta-R locality
+      # Sort field for windowed attention: Z-order Morton index in eta-phi
+      input_sort_field: deltaR_idx
 
-      # Encoder (transformer) configuration
+      # Encoder: windowed attention over all nodes
       encoder:
         class_path: hepattn.models.Encoder
         init_args:
           num_layers: 8
           dim: *dim
           attn_type: flash-varlen
-          window_size: 512   # Each token attends to ±128 nearest neighbors in Z-order
-          window_wrap: false # Z-order space is not periodic
+          window_size: 512
+          window_wrap: false
           hybrid_norm: true
           value_residual: true
           attn_kwargs:
             num_heads: 16
 
-      tracks_mlp:
-          class_path: hepattn.models.Dense
-          init_args:
-            input_size: *dim
-            output_size: 1
-            context_size: 0   # global context disabled: vertex token provides global info via attention
-            activation: torch.nn.SiLU
-            hidden_layers: [256, 128, 64, 32]
+      # MaskFormer decoder: 1 query = "Proxy PV" with iterative learnable masks
+      decoder:
+        num_decoder_layers: 4
+        num_queries: 1
+        mask_attention: true
+        use_query_masks: false
+        decoder_layer_config:
+          dim: *dim
+          hybrid_norm: true
+          bidirectional_ca: true
+          attn_kwargs:
+            num_heads: 16
 
-      calo_mlp:
-          class_path: hepattn.models.Dense
-          init_args:
-            input_size: *dim
-            output_size: 1
-            context_size: 0   # global context disabled: vertex token provides global info via attention
-            activation: torch.nn.SiLU
-            hidden_layers: [256, 128, 64, 32]
-            final_activation:
-              class_path: torch.nn.Sigmoid
+      # Task heads
+      tasks:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            # Task 1: Iterative learnable attention mask (MaskFormer core)
+            # Produces the cross-attention mask refined at each decoder layer.
+            # Target: particle_node_valid (True for HS tracks only)
+            - class_path: hepattn.models.task.ObjectHitMaskTask
+              init_args:
+                name: mask
+                input_hit: node
+                input_object: query
+                output_object: pflow
+                target_object: particle
+                pred_threshold: 0.5
+                logit_scale: 4
+                losses:
+                  mask_bce: 5.0
+                  mask_dice: 1.0
+                costs: {}
+                dim: *dim
+                null_weight: 1.0
+                has_intermediate_loss: true
+
+            # Task 2: Vertex z regression from query embedding
+            # The query learns to encode the hard scatter vertex position
+            - class_path: hepattn.models.task.ObjectRegressionTask
+              init_args:
+                name: vz_regression
+                input_object: query
+                output_object: pflow
+                target_object: particle
+                fields: [vz]
+                loss_weight: 1.0
+                cost_weight: 0.0
+                dim: *dim
+                loss: smooth_l1
+                has_intermediate_loss: false
+
+            # Task 3: Track binary classification (per-node, conditioned on query)
+            - class_path: hepattn.experiments.odd_pileup_maskformer.tasks.PileupTrackClassTask
+              init_args:
+                name: track_class
+                input_hit: node
+                input_object: query
+                dim: *dim
+                loss_weight: 1.0
+                pos_weight: 16.24
+                threshold: 0.5
+                has_intermediate_loss: false
+
+            # Task 4: Calo energy fraction regression (per-node, conditioned on query)
+            - class_path: hepattn.experiments.odd_pileup_maskformer.tasks.PileupCaloFractionTask
+              init_args:
+                name: calo_fraction
+                input_hit: node
+                input_object: query
+                dim: *dim
+                loss_weight: 1.0
+                signal_weight: 25.3
+                signal_threshold: 0.05
+                has_intermediate_loss: false

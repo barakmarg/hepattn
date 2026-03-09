@@ -631,6 +631,24 @@ class ODDDatasetPileup(Dataset):
 
         labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
 
+        # MaskFormer targets (1 target object = 1 hard scatter vertex)
+        labels["particle_valid"] = torch.tensor([True])  # shape (1,)
+
+        # Per-query-per-node binary mask: shape (1, max_nodes)
+        # True ONLY for hard-scatter tracks. False for ALL calo and pileup tracks.
+        # This teaches the iterative mask to attend exclusively to HS tracks,
+        # enforcing the physics prior (calo has zero vertex resolution) through learning.
+        hs_track = data_dict["node_raw_features"]["track_vertex_primary_mask"].bool()
+        is_track_mask = data_dict["node_raw_features"]["is_track"].bool()
+        particle_node_valid = hs_track & is_track_mask
+        labels["particle_node_valid"] = particle_node_valid.unsqueeze(0).float()  # (1, max_nodes)
+
+        # Vertex z regression target (truth hard-scatter vz)
+        labels["particle_vz"] = torch.tensor([self.hard_scatter_vz[idx]], dtype=torch.float32)
+
+        # Per-node is_track accessible as target for per-node tasks
+        labels["node_is_track"] = data_dict["node_raw_features"]["is_track"]
+
         return inputs, labels
 
     def preprocess_hook(self, file_dir: Path, index: int) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:

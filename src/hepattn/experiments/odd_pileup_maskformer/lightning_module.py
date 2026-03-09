@@ -104,14 +104,15 @@ class ODDPFlow(ModelWrapper):
         if stage == "train":
             return
 
+        # MaskFormer predict output: {layer_name: {task_name: {output_name: tensor}}}
         final_preds = preds["final"]
         node_valid = labels["node_valid"].bool()
-        is_track = labels["is_track"].bool()
+        is_track = labels["node_is_track"].bool()
 
         # --- Track Classification Metrics (only on track nodes) ---
         track_node_mask = node_valid & is_track
-        if track_node_mask.any():
-            track_prob = final_preds["track_prob"].squeeze(-1)[track_node_mask]
+        if track_node_mask.any() and "track_class" in final_preds:
+            track_prob = final_preds["track_class"]["track_prob"].squeeze(-1)[track_node_mask]
             track_truth = labels["tracks_mask"][track_node_mask].int()
 
             self.track_f1(track_prob, track_truth)
@@ -132,8 +133,8 @@ class ODDPFlow(ModelWrapper):
 
         # --- Cluster Metrics (only on cluster nodes) ---
         cluster_node_mask = node_valid & (~is_track)
-        if cluster_node_mask.any():
-            calo_frac_pred = final_preds["calo_hs_fraction"].squeeze(-1)[cluster_node_mask]
+        if cluster_node_mask.any() and "calo_fraction" in final_preds:
+            calo_frac_pred = final_preds["calo_fraction"]["calo_hs_fraction"].squeeze(-1)[cluster_node_mask]
             calo_frac_true = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
 
             # Overall MAE
@@ -141,11 +142,6 @@ class ODDPFlow(ModelWrapper):
             self.log(f"{stage}/calo_frac_mae", mae, **kwargs)
 
             # Per-type MAE based on true HS energy fraction
-            # a) pileup only:       < 2%  HS
-            # b) mix pileup:       3-30%  HS
-            # c) balanced:        30-70%  HS
-            # d) mix hard scatter: 70-97% HS (3-30% pileup)
-            # e) hs only:          > 98%  HS
             type_masks = {
                 "pu_only":   calo_frac_true < 0.02,
                 "mix_pu":   (calo_frac_true >= 0.03) & (calo_frac_true <= 0.30),
@@ -173,3 +169,10 @@ class ODDPFlow(ModelWrapper):
                 self._val_cluster_data["true_frac"].append(calo_frac_true.detach().float().cpu().numpy())
                 self._val_cluster_data["total_e"].append(node_e.detach().float().cpu().numpy())
                 self._val_cluster_data["true_hs_e"].append(true_hs_energy.detach().float().cpu().numpy())
+
+        # --- Vz Regression Metrics ---
+        if "vz_regression" in final_preds:
+            pred_vz = final_preds["vz_regression"]["pflow_vz"]  # (B, 1)
+            true_vz = labels["particle_vz"]  # (B, 1)
+            vz_mae = F.l1_loss(pred_vz, true_vz)
+            self.log(f"{stage}/vz_mae", vz_mae, **kwargs)

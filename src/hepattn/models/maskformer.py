@@ -184,63 +184,56 @@ class MaskFormer(nn.Module):
         targets:
             The data containing the targets.
         """
-        # Will hold the costs between all pairs of objects - cost axes are (batch, pred, true)
-        costs = {}
-        batch_idxs = torch.arange(targets[f"{self.target_object}_valid"].shape[0]).unsqueeze(1)
-        for layer_name, layer_outputs in outputs.items():
-            layer_costs = None
+        # Perform Hungarian matching and output permutation only when a matcher is provided.
+        # When matcher is None (e.g. single-query setups), skip matching entirely.
+        if self.matcher is not None:
+            # Will hold the costs between all pairs of objects - cost axes are (batch, pred, true)
+            costs = {}
+            batch_idxs = torch.arange(targets[f"{self.target_object}_valid"].shape[0]).unsqueeze(1)
+            for layer_name, layer_outputs in outputs.items():
+                layer_costs = None
 
-            # Get the cost contribution from each of the tasks
-            for task in self.tasks:
-                # Skip tasks that do not contribute intermediate losses
-                if layer_name != "final" and not task.has_intermediate_loss:
+                # Get the cost contribution from each of the tasks
+                for task in self.tasks:
+                    # Skip tasks that do not contribute intermediate losses
+                    if layer_name != "final" and not task.has_intermediate_loss:
+                        continue
+
+                    # Only use the cost from the final set of predictions
+                    task_costs = task.cost(layer_outputs[task.name], targets)
+                    # Add the cost on to our running cost total, otherwise initialise a running cost matrix
+                    for cost in task_costs.values():
+                        if layer_costs is None:
+                            layer_costs = cost
+                        else:
+                            layer_costs += cost
+
+                # Added to allow completely turning off inter layer loss
+                # Possibly redundant as completely switching them off performs worse
+                if layer_costs is not None:
+                    layer_costs = layer_costs.detach()
+
+                costs[layer_name] = layer_costs
+
+            # Permute the outputs for each output in each layer
+            for layer_name, cost in costs.items():
+                if cost is None:
                     continue
 
-                # Only use the cost from the final set of predictions
-                task_costs = task.cost(layer_outputs[task.name], targets)
-                # ADD DEBUGGING CODE HERE:
-                #for name, c in task_costs.items():
-                #    if torch.isnan(c).any():
-                #        print(f"NaN in cost from task {task.name}, component {name}")
-                # Add the cost on to our running cost total, otherwise initialise a running cost matrix
-                for cost in task_costs.values():
-                    if layer_costs is None:
-                        layer_costs = cost
-                    else:
-                        layer_costs += cost
+                # Get the indicies that can permute the predictions to yield their optimal matching
+                pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
 
-            # Added to allow completely turning off inter layer loss
-            # Possibly redundant as completely switching them off performs worse
-            if layer_costs is not None:
-                layer_costs = layer_costs.detach()
+                for task in self.tasks:
+                    # Tasks without a object dimension do not need permutation (constituent-level or sample-level)
+                    if not task.permute_loss:
+                        continue
 
-            costs[layer_name] = layer_costs
+                    # The task didn't produce an output for this layer, so skip it
+                    if layer_name != "final" and not task.has_intermediate_loss:
+                        continue
 
-        # Permute the outputs for each output in each layer
-        for layer_name, cost in costs.items():
-            if cost is None:
-                continue
-
-            #if torch.isnan(cost).any():
-            #    print(f"Warning: NaN value found in cost matrix at layer {layer_name}")
-            
-            #if torch.isinf(cost).any():
-            #    print(f"Warning: Inf value found in cost matrix at layer {layer_name}")
-
-            # Get the indicies that can permute the predictions to yield their optimal matching
-            pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
-
-            for task in self.tasks:
-                # Tasks without a object dimension do not need permutation (constituent-level or sample-level)
-                if not task.permute_loss:
-                    continue
-
-                # The task didn't produce an output for this layer, so skip it
-                if layer_name != "final" and not task.has_intermediate_loss:
-                    continue
-
-                for output_name in task.outputs:
-                    outputs[layer_name][task.name][output_name] = outputs[layer_name][task.name][output_name][batch_idxs, pred_idxs]
+                    for output_name in task.outputs:
+                        outputs[layer_name][task.name][output_name] = outputs[layer_name][task.name][output_name][batch_idxs, pred_idxs]
 
         # Compute the losses for each task in each block
         losses = {}
