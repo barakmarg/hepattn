@@ -79,22 +79,22 @@ class PileupRemovalModel(nn.Module):
 
         # 5a. Optionally append hard-scatter vertex token to the node sequence
         n_vertex_tokens = 0
-        if self.enable_vertex_token and self.vertex_input_net is not None:
-            vtx_feat = inputs["vertex_token_features"]              # (B, 1, 1)
-            vtx_embed = self.vertex_input_net(vtx_feat)             # (B, 1, dim)
-            vtx_valid = torch.ones(vtx_embed.shape[0], 1, dtype=torch.bool, device=vtx_embed.device)
+        # if self.enable_vertex_token and self.vertex_input_net is not None:
+        #     vtx_feat = inputs["vertex_token_features"]              # (B, 1, 1)
+        #     vtx_embed = self.vertex_input_net(vtx_feat)             # (B, 1, dim)
+        #     vtx_valid = torch.ones(vtx_embed.shape[0], 1, dtype=torch.bool, device=vtx_embed.device)
 
-            # Append to node sequence
-            x["key_embed"] = torch.cat([x["key_embed"], vtx_embed], dim=1)   # (B, N+1, dim)
-            x["key_valid"] = torch.cat([x["key_valid"], vtx_valid], dim=1)   # (B, N+1)
+        #     # Append to node sequence
+        #     x["key_embed"] = torch.cat([x["key_embed"], vtx_embed], dim=1)   # (B, N+1, dim)
+        #     x["key_valid"] = torch.cat([x["key_valid"], vtx_valid], dim=1)   # (B, N+1)
 
-            # Sort value: place vertex token last (after all sorted regular tokens)
-            if self.input_sort_field is not None:
-                sort_vals = x[f"key_{self.input_sort_field}"]              # (B, N)
-                vtx_sort = torch.full((sort_vals.shape[0], 1), float("inf"), device=sort_vals.device)
-                x[f"key_{self.input_sort_field}"] = torch.cat([sort_vals, vtx_sort], dim=1)
+        #     # Sort value: place vertex token last (after all sorted regular tokens)
+        #     if self.input_sort_field is not None:
+        #         sort_vals = x[f"key_{self.input_sort_field}"]              # (B, N)
+        #         vtx_sort = torch.full((sort_vals.shape[0], 1), float("inf"), device=sort_vals.device)
+        #         x[f"key_{self.input_sort_field}"] = torch.cat([sort_vals, vtx_sort], dim=1)
 
-            n_vertex_tokens = 1
+        #     n_vertex_tokens = 1
 
         # 5b. Encoder
         if self.encoder is not None:

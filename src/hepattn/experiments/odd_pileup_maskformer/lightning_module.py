@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torchmetrics as tm
 from torch import nn
 
-from hepattn.experiments.odd_pileup_conditioned.plots import PhysicsPlotter
+from hepattn.experiments.odd_pileup_maskformer.plots import PhysicsPlotter
 from hepattn.models.wrapper import ModelWrapper
 
 

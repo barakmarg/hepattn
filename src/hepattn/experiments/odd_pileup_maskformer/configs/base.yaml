@@ -59,7 +59,7 @@ data:
   hard_scatter_energy_threshold: 0.1
 
   # Path to variable transformation config
-  scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup/configs/odd_var_transform.yaml
+  scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_maskformer/configs/odd_var_transform.yaml
 
   # TODO: Adjust max_nodes based on your data
   max_nodes: 5500
@@ -79,7 +79,7 @@ trainer:
 
   # TODO: Configure your logger
   logger:
-    class_path: hepattn.experiments.odd_pileup_conditioned.logger_utils.FixedCometLogger
+    class_path: hepattn.experiments.odd_pileup_maskformer.logger_utils.FixedCometLogger
     init_args:
       project: odd-pflow-pileup-removal
 
@@ -91,7 +91,7 @@ trainer:
       init_args:
         monitor: val/loss
         save_last: true
-    - class_path: hepattn.experiments.odd_pileup_conditioned.PflowPredictionWriter
+    - class_path: hepattn.experiments.odd_pileup_maskformer.PflowPredictionWriter
     - class_path: lightning.pytorch.callbacks.ModelSummary
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
     - class_path: lightning.pytorch.callbacks.TQDMProgressBar
@@ -116,7 +116,7 @@ model:
   mtl: false
 
   model:
-    class_path: hepattn.experiments.odd_pileup_conditioned.pileup_model.PileupRemovalModel
+    class_path: hepattn.experiments.odd_pileup_maskformer.pileup_model.PileupRemovalModel
     init_args:
       dim: &dim 256
 
