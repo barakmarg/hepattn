@@ -111,8 +111,9 @@ class ODDPFlow(ModelWrapper):
 
         # --- Track Classification Metrics (only on track nodes) ---
         track_node_mask = node_valid & is_track
-        if track_node_mask.any() and "track_class" in final_preds:
-            track_prob = final_preds["track_class"]["track_prob"].squeeze(-1)[track_node_mask]
+        if track_node_mask.any() and "mask" in final_preds:
+            # Mask task output shape: (B, 1, N) → squeeze query dim → (B, N)
+            track_prob = final_preds["mask"]["pflow_node_prob"].squeeze(-2)[track_node_mask]
             track_truth = labels["tracks_mask"][track_node_mask].int()
 
             self.track_f1(track_prob, track_truth)

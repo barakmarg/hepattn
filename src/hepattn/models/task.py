@@ -335,7 +335,11 @@ class ObjectHitMaskTask(Task):
 
     def predict(self, outputs: dict[str, Tensor]) -> dict[str, Tensor]:
         # Object-hit pairs that have a predicted probability above the threshold are predicted as being associated to one-another
-        return {self.output_object_hit + "_valid": outputs[self.output_object_hit + "_logit"].detach().sigmoid() >= self.pred_threshold}
+        prob = outputs[self.output_object_hit + "_logit"].detach().sigmoid()
+        return {
+            self.output_object_hit + "_valid": prob >= self.pred_threshold,
+            self.output_object_hit + "_prob": prob,
+        }
 
     def cost(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
         output = outputs[self.output_object_hit + "_logit"].detach().to(torch.float32)

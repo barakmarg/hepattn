@@ -33,9 +33,9 @@ class PflowPredictionWriter(Callback):
 
         batch_data = {
             "event_number": targets["event_number"].cpu().numpy(),
-            "track_prob": final_preds["track_prob"].squeeze(-1).cpu().float().numpy(),
-            "track_is_hard_scatter": final_preds["track_is_hard_scatter"].squeeze(-1).cpu().numpy(),
-            "calo_hs_fraction": final_preds["calo_hs_fraction"].squeeze(-1).cpu().float().numpy(),
+            "track_prob": final_preds["mask"]["pflow_node_prob"].squeeze(-2).cpu().float().numpy(),
+            "track_is_hard_scatter": final_preds["mask"]["pflow_node_valid"].squeeze(-2).cpu().numpy(),
+            "calo_hs_fraction": final_preds["calo_fraction"]["calo_hs_fraction"].squeeze(-1).cpu().float().numpy(),
             "tracks_mask_truth": targets["tracks_mask"].cpu().float().numpy(),
             "calo_energy_truth": targets["calo_hard_scatter_energy"].cpu().float().numpy(),
             "node_valid": targets["node_valid"].cpu().numpy(),

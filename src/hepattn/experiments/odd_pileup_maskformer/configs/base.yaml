@@ -166,18 +166,21 @@ model:
           attn_kwargs:
             num_heads: 16
 
-      # MaskFormer decoder: 1 query = "Proxy PV" with iterative learnable masks
+      # MaskFormer decoder with is_track physics prior on attention mask
       decoder:
-        num_decoder_layers: 4
-        num_queries: 1
-        mask_attention: true
-        use_query_masks: false
-        decoder_layer_config:
-          dim: *dim
-          hybrid_norm: true
-          bidirectional_ca: true
-          attn_kwargs:
-            num_heads: 16
+        class_path: hepattn.experiments.odd_pileup_maskformer.decoder.PileupMaskFormerDecoder
+        init_args:
+          prior_mask_key: "node_is_track"
+          num_decoder_layers: 4
+          num_queries: 1
+          mask_attention: true
+          use_query_masks: false
+          decoder_layer_config:
+            dim: *dim
+            hybrid_norm: true
+            bidirectional_ca: true
+            attn_kwargs:
+              num_heads: 16
 
       # Task heads
       tasks:
@@ -201,7 +204,7 @@ model:
                   mask_dice: 1.0
                 costs: {}
                 dim: *dim
-                null_weight: 1.0
+                null_weight: 0.06
                 has_intermediate_loss: true
 
             # Task 2: Vertex z regression from query embedding
@@ -217,21 +220,9 @@ model:
                 cost_weight: 0.0
                 dim: *dim
                 loss: smooth_l1
-                has_intermediate_loss: false
+                has_intermediate_loss: true
 
-            # Task 3: Track binary classification (per-node, conditioned on query)
-            - class_path: hepattn.experiments.odd_pileup_maskformer.tasks.PileupTrackClassTask
-              init_args:
-                name: track_class
-                input_hit: node
-                input_object: query
-                dim: *dim
-                loss_weight: 1.0
-                pos_weight: 16.24
-                threshold: 0.5
-                has_intermediate_loss: false
-
-            # Task 4: Calo energy fraction regression (per-node, conditioned on query)
+            # Task 3: Calo energy fraction regression (per-node, conditioned on query)
             - class_path: hepattn.experiments.odd_pileup_maskformer.tasks.PileupCaloFractionTask
               init_args:
                 name: calo_fraction
