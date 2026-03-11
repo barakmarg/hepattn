@@ -210,6 +210,49 @@ class PhysicsPlotter:
         return fig
 
     @staticmethod
+    def plot_track_z0_distribution(probs: np.ndarray, truth: np.ndarray, z0: np.ndarray,
+                                   threshold: float = 0.5) -> Figure:
+        """Overlaid z0 histograms: predicted HS tracks vs truth HS tracks."""
+        is_true_hs = truth == 1
+        is_pred_hs = probs > threshold
+        z0_range = np.percentile(np.abs(z0[is_true_hs | is_pred_hs] if (is_true_hs | is_pred_hs).any() else z0), 99)
+        z0_range = max(z0_range, 1.0)
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(z0[is_true_hs], bins=100, range=(-z0_range, z0_range), density=True,
+                alpha=0.7, color="steelblue", label="Truth HS Tracks")
+        ax.hist(z0[is_pred_hs], bins=100, range=(-z0_range, z0_range), density=True,
+                alpha=0.7, color="tomato", label="Predicted HS Tracks (score > 0.5)")
+        ax.set_xlabel("Track z0 [mm]")
+        ax.set_ylabel("Normalised Density")
+        ax.set_title("z0 Distribution: Truth vs Predicted HS Tracks")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_track_pt_distribution(probs: np.ndarray, truth: np.ndarray, pt: np.ndarray,
+                                   threshold: float = 0.5) -> Figure:
+        """Overlaid pT histograms: predicted HS tracks vs truth HS tracks (log scale)."""
+        is_true_hs = truth == 1
+        is_pred_hs = probs > threshold
+        pt_max = max(np.percentile(pt[is_true_hs | is_pred_hs] if (is_true_hs | is_pred_hs).any() else pt, 99), 1.0)
+        bins = np.logspace(np.log10(0.3), np.log10(pt_max), 60)
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(pt[is_true_hs], bins=bins, density=True,
+                alpha=0.7, color="steelblue", label="Truth HS Tracks")
+        ax.hist(pt[is_pred_hs], bins=bins, density=True,
+                alpha=0.7, color="tomato", label="Predicted HS Tracks (score > 0.5)")
+        ax.set_xscale("log")
+        ax.set_xlabel("Track pT [GeV]")
+        ax.set_ylabel("Normalised Density")
+        ax.set_title("pT Distribution: Truth vs Predicted HS Tracks")
+        ax.legend()
+        ax.grid(True, which="both", alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
     def plot_roc_curve(probs: np.ndarray, truth: np.ndarray) -> Figure:
         """ROC curve with AUC score."""
         from sklearn.metrics import auc, roc_curve

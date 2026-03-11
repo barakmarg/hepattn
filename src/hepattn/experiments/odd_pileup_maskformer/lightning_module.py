@@ -80,6 +80,13 @@ class ODDPFlow(ModelWrapper):
             figs["track/roc"] = PhysicsPlotter.plot_roc_curve(
                 track["probs"], track["truth"]
             )
+            if track.get("z0") is not None and len(track["z0"]) > 0:
+                figs["track/z0_dist"] = PhysicsPlotter.plot_track_z0_distribution(
+                    track["probs"], track["truth"], track["z0"]
+                )
+            figs["track/pt_dist"] = PhysicsPlotter.plot_track_pt_distribution(
+                track["probs"], track["truth"], track["pt"]
+            )
 
         # Log to CometML
         if self.logger is not None and hasattr(self.logger, "experiment"):
@@ -131,6 +138,7 @@ class ODDPFlow(ModelWrapper):
                 self._val_track_data["truth"].append(track_truth.detach().cpu().numpy())
                 self._val_track_data["pt"].append(labels["node_pt"][track_node_mask].detach().float().cpu().numpy())
                 self._val_track_data["eta"].append(labels["node_eta"][track_node_mask].detach().float().cpu().numpy())
+                self._val_track_data["z0"].append(labels["node_z0"][track_node_mask].detach().float().cpu().numpy())
 
         # --- Cluster Metrics (only on cluster nodes) ---
         cluster_node_mask = node_valid & (~is_track)

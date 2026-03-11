@@ -570,6 +570,7 @@ class ODDDatasetPileup(Dataset):
             # Raw (unscaled) kinematic quantities for plotting
             "node_pt":  torch.cat([t_pt,  torch.zeros(n_clusters, device=t_pt.device)], -1),
             "node_eta": torch.cat([t_eta, c_eta], -1),
+            "node_z0":  torch.cat([t_z0,  torch.zeros(n_clusters, device=t_z0.device)], -1),
         }
 
         # Compute Z-order (Morton) index from raw eta/phi for locality-preserving sort
@@ -584,7 +585,9 @@ class ODDDatasetPileup(Dataset):
         for key, val in node_raw_features.items():
             node_raw_features[key] = do_padding(val, self.max_nodes)
         node_deltaR_idx = do_padding(node_deltaR_idx, self.max_nodes)
+        node_deltaR_idx[n_nodes:] = float('inf')  # padding sorts to end so kv_mask stays aligned
         node_deltaR_idx_shifted = do_padding(node_deltaR_idx_shifted, self.max_nodes)
+        node_deltaR_idx_shifted[n_nodes:] = float('inf')
 
         node_q_mask = torch.zeros(self.max_nodes, dtype=bool)
         node_q_mask[:n_nodes] = True
@@ -641,6 +644,7 @@ class ODDDatasetPileup(Dataset):
         labels["calo_hard_scatter_energy_frac"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy_frac"]
         labels["node_pt"]  = data_dict["node_raw_features"]["node_pt"]
         labels["node_eta"] = data_dict["node_raw_features"]["node_eta"]
+        labels["node_z0"]  = data_dict["node_raw_features"]["node_z0"]
 
         labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
 

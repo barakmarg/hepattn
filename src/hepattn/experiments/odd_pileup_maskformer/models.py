@@ -61,34 +61,35 @@ class ShiftedWindowEncoder(Encoder):
             sv = sort_values[i]
             sort_idx = torch.argsort(sv, dim=-1)  # (B, N)
 
-            # Sort x into the current layer's token order
-            x = torch.gather(x, -2, sort_idx.unsqueeze(-1).expand_as(x))
-
-            # Re-sort initial_values["v"] from the previous layer's order into the
-            # current layer's order.  initial_values["v"] lives in the unpadded domain
-            # with shape (total_valid, H, Dh); we repad, unsort, sort, re-unpad.
-            if initial_values is not None and "v" in initial_values:
-                v0 = initial_values["v"]  # (total_valid, H, Dh)
-                head_shape = v0.shape[1:]  # (H, Dh)
-
-                # repad: (total_valid, H*Dh) → (B, N, H*Dh)
-                v0_padded = repad_from_flash_varlen(
-                    v0.flatten(-2), batch_size, seq_len, prev_unpad_indices
-                )
-                v0_padded = v0_padded.unflatten(-1, head_shape)  # (B, N, H, Dh)
-
-                # unsort back to original order using previous sort_idx
+            if i == 0:
+                # First layer: sort from original order
+                x = torch.gather(x, -2, sort_idx.unsqueeze(-1).expand_as(x))
+            else:
+                # Composite permutation: prev_sorted → current_sorted in one gather
+                # unsort_prev[k] = prev_sorted position of token at original position k
+                # composite[j] = unsort_prev[sort_idx[j]] = prev_sorted position of
+                #     the token that belongs at current_sorted position j
                 unsort_prev = torch.argsort(prev_sort_idx, dim=-1)  # (B, N)
-                expand = unsort_prev.unsqueeze(-1).unsqueeze(-1).expand_as(v0_padded)
-                v0_padded = torch.gather(v0_padded, 1, expand)
+                composite = torch.gather(unsort_prev, -1, sort_idx)  # (B, N)
+                x = torch.gather(x, -2, composite.unsqueeze(-1).expand_as(x))
 
-                # sort into current layer's order
-                expand = sort_idx.unsqueeze(-1).unsqueeze(-1).expand_as(v0_padded)
-                v0_padded = torch.gather(v0_padded, 1, expand)
+                # Re-sort initial_values["v"] with the same composite permutation
+                if initial_values is not None and "v" in initial_values:
+                    v0 = initial_values["v"]  # (1, total_valid, H, Dh)
+                    head_shape = v0.shape[2:]  # (H, Dh)
 
-                # unpad again
-                v0_flat, _, _ = unpad_for_flash_varlen(v0_padded.flatten(-2), kv_mask)
-                initial_values["v"] = v0_flat.unflatten(-1, head_shape)
+                    # repad to (B, N, H, Dh) in prev_sorted order
+                    v0_padded = repad_from_flash_varlen(
+                        v0.flatten(-2), batch_size, seq_len, prev_unpad_indices
+                    ).unflatten(-1, head_shape)
+
+                    # Single composite gather (replaces unsort + sort)
+                    expand = composite.unsqueeze(-1).unsqueeze(-1).expand_as(v0_padded)
+                    v0_padded = torch.gather(v0_padded, 1, expand)
+
+                    # Unpad in current sort order
+                    v0_flat, _, _ = unpad_for_flash_varlen(v0_padded.flatten(-2), kv_mask)
+                    initial_values["v"] = v0_flat.unflatten(-1, head_shape)
 
             # Unpad x for flash-varlen
             x_unpadded, unpad_indices, varlen_kwargs = unpad_for_flash_varlen(x, kv_mask)
@@ -107,12 +108,12 @@ class ShiftedWindowEncoder(Encoder):
                 **layer_kwargs,
             )
 
-            # Repad
+            # Repad — x stays in current sorted order (no per-layer unsort)
             x = repad_from_flash_varlen(x_unpadded, batch_size, seq_len, unpad_indices)
 
-            # Unsort back to original token order
-            unsort_idx = torch.argsort(sort_idx, dim=-1)
-            x = torch.gather(x, -2, unsort_idx.unsqueeze(-1).expand_as(x))
+        # Unsort from last layer's order back to original
+        unsort_last = torch.argsort(prev_sort_idx, dim=-1)
+        x = torch.gather(x, -2, unsort_last.unsqueeze(-1).expand_as(x))
 
         return x
 

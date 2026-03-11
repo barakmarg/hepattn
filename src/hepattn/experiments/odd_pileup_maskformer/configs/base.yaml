@@ -52,7 +52,7 @@ data:
   num_test: -1
   num_val: -1
 
-  batch_size: 64   # Increased from 128 to match CLIC
+  batch_size: 48   # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Energy threshold for cluster filtering
