@@ -24,7 +24,8 @@ Raw Nodes (tracks + clusters)
 | `node_valid` | `(B, 5500)` | Bool mask — True for real nodes, False for padding |
 | `node_eta` | `(B, 5500)` | Raw eta coordinate |
 | `node_phi` | `(B, 5500)` | Raw phi coordinate |
-| `node_deltaR_idx` | `(B, 5500)` | Z-order Morton index for windowed attention sorting |
+| `node_deltaR_idx` | `(B, 5500)` | Z-order Morton index for windowed attention sorting (base ordering) |
+| `node_deltaR_idx_shifted` | `(B, 5500)` | Morton index with phi rotated by π — moves the periodic boundary from ±π to 0 (shifted ordering) |
 | `node_e` | `(B, 5500)` | Raw total energy per node (raw variable, passed through) |
 | `node_is_track` | `(B, 5500)` | 1 for tracks, 0 for calo clusters (raw variable, passed through) |
 
@@ -65,20 +66,41 @@ Also sets `key_is_node` — a bool vector of length 5500 (all True, since we onl
 
 ---
 
-## Stage 2: Windowed Self-Attention Encoder
+## Stage 2: Windowed Self-Attention Encoder (Shifted-Window Morton)
 
-**File:** `hepattn/models/transformer.py`
+**File:** `hepattn/experiments/odd_pileup_maskformer/models.py` (`ShiftedWindowEncoder`)
 
 ```
 node_embed  (B, 5500, 256)
-    sorted by node_deltaR_idx (Z-order Morton — nearby particles are adjacent)
-    → 8× Transformer Encoder Layer (flash-varlen, window_size=512, hybrid_norm)
-       each layer: windowed self-attention (16 heads) + FFN + residual
-    sorted back to original order
-    → key_embed  (B, 5500, 256)    [updated, context-aware node embeddings]
+
+  For each of the 8 encoder layers:
+    even layers (0, 2, 4, 6): sort by node_deltaR_idx         (base Morton order)
+    odd  layers (1, 3, 5, 7): sort by node_deltaR_idx_shifted (phi-rotated Morton order)
+
+    → sort tokens into current layer's order
+    → (flash-varlen) unpad to remove padding tokens
+    → windowed self-attention (16 heads, window_size=512) + FFN + residual
+    → repad
+    → unsort back to original token order
+
+  → key_embed  (B, 5500, 256)    [updated, context-aware node embeddings]
 ```
 
-Each node now encodes its local neighbourhood context (within ΔR ≈ 0.5).
+**Why two orderings?**
+phi is periodic: particles at phi=+π and phi=−π are genuine ΔR≈0 neighbours, but a
+single Morton ordering places them at opposite ends of the sorted sequence, so they
+never share a window. By rotating phi by π in alternating layers (Swin-style shifted
+windows), the "tear" in the ordering migrates between ±π and 0 each layer:
+
+- Base order: particles near phi=0 are co-located; ±π boundary is a blind spot.
+- Shifted order: particles near ±π are co-located; phi=0 becomes the blind spot.
+
+Each token pair that is split in even layers is guaranteed to be within the same
+window in odd layers, and vice-versa. Every region of the eta-phi cylinder gets full
+coverage over two consecutive layers.
+
+Each node now encodes its local neighbourhood context (within ΔR ≈ 0.5) with no
+systematic dead zone at the phi=±π boundary.
 
 ---
 
@@ -330,7 +352,8 @@ preds = {
 ```
 Dataset
   ├── inputs["node_features"]  (B,5500,21) ──→ InputNet ──→ node_embed (B,5500,256)
-  ├── inputs["node_deltaR_idx"] ──────────────────────────→ sort key for Encoder
+  ├── inputs["node_deltaR_idx"]         ───────────────────→ base sort key for even encoder layers
+  ├── inputs["node_deltaR_idx_shifted"] ───────────────────→ shifted sort key for odd encoder layers
   └── inputs["node_e"], ["node_is_track"] ───────────────→ x (raw variables, for loss + prior)
 
 InputNet

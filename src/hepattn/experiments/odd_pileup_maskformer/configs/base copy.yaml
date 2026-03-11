@@ -115,7 +115,7 @@ model:
   mtl: false
 
   model:
-    class_path: hepattn.experiments.odd_pileup_maskformer.models.ShiftedWindowMaskFormer
+    class_path: hepattn.models.MaskFormer
     init_args:
       dim: &dim 256
       target_object: particle
@@ -154,12 +154,12 @@ model:
 
       # Encoder: windowed attention over all nodes
       encoder:
-        class_path: hepattn.experiments.odd_pileup_maskformer.models.ShiftedWindowEncoder
+        class_path: hepattn.models.Encoder
         init_args:
           num_layers: 8
           dim: *dim
           attn_type: flash-varlen
-          window_size: 256
+          window_size: 512
           window_wrap: false
           hybrid_norm: true
           value_residual: true

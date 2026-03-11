@@ -38,15 +38,25 @@ def is_valid_file(path: str | Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
-def morton_encode(eta: torch.Tensor, phi: torch.Tensor, n_bits: int = 16) -> torch.Tensor:
+def morton_encode(eta: torch.Tensor, phi: torch.Tensor, n_bits: int = 16, shift_phi: bool = False) -> torch.Tensor:
     """Map 2D (eta, phi) to 1D Z-order (Morton) index for locality-preserving sort.
 
     Tokens nearby in the eta-phi plane (small delta-R) will be close in the
     1D Morton index with high probability, enabling windowed attention as an
     approximation of delta-R local attention.
+
+    Parameters
+    ----------
+    shift_phi : bool
+        When True, rotate phi by π before quantisation (add 0.5 in normalised [0,1]
+        space via fmod). This moves the periodic "tear" from ±π to 0, so that tokens
+        near phi=±π — which are genuinely close in ΔR — end up adjacent in the sorted
+        order. Used for Swin-style shifted-window attention.
     """
     eta_norm = torch.clamp((eta + 6.0) / 12.0, 0.0, 1.0)
     phi_norm = torch.clamp((phi + torch.pi) / (2 * torch.pi), 0.0, 1.0)
+    if shift_phi:
+        phi_norm = torch.fmod(phi_norm + 0.5, 1.0)
     scale = (1 << n_bits) - 1
     ei = (eta_norm * scale).long()
     pi = (phi_norm * scale).long()
@@ -563,10 +573,10 @@ class ODDDatasetPileup(Dataset):
         }
 
         # Compute Z-order (Morton) index from raw eta/phi for locality-preserving sort
-        node_deltaR_idx = morton_encode(
-            torch.cat([t_eta, c_eta], -1),
-            torch.cat([t_phi, c_phi], -1),
-        )
+        _eta_cat = torch.cat([t_eta, c_eta], -1)
+        _phi_cat = torch.cat([t_phi, c_phi], -1)
+        node_deltaR_idx = morton_encode(_eta_cat, _phi_cat)
+        node_deltaR_idx_shifted = morton_encode(_eta_cat, _phi_cat, shift_phi=True)
 
         # Pad everything
         for key, val in node_features.items():
@@ -574,6 +584,7 @@ class ODDDatasetPileup(Dataset):
         for key, val in node_raw_features.items():
             node_raw_features[key] = do_padding(val, self.max_nodes)
         node_deltaR_idx = do_padding(node_deltaR_idx, self.max_nodes)
+        node_deltaR_idx_shifted = do_padding(node_deltaR_idx_shifted, self.max_nodes)
 
         node_q_mask = torch.zeros(self.max_nodes, dtype=bool)
         node_q_mask[:n_nodes] = True
@@ -592,6 +603,7 @@ class ODDDatasetPileup(Dataset):
             "node_eta": node_features["eta"],
             "node_phi": node_features["phi"],
             "node_deltaR_idx": node_deltaR_idx,
+            "node_deltaR_idx_shifted": node_deltaR_idx_shifted,
             "vertex_token_features": vertex_token_features,
         }
 
@@ -614,6 +626,7 @@ class ODDDatasetPileup(Dataset):
             "node_eta": data_dict["node_eta"],
             "node_phi": data_dict["node_phi"],
             "node_deltaR_idx": data_dict["node_deltaR_idx"],
+            "node_deltaR_idx_shifted": data_dict["node_deltaR_idx_shifted"],
             "node_e": data_dict["node_raw_features"]["total_e"],
             "node_is_track": data_dict["node_raw_features"]["is_track"],
             "vertex_token_features": data_dict["vertex_token_features"],
