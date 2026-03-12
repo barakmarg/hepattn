@@ -197,7 +197,7 @@ class PileupRemovalModel(nn.Module):
             is_signal = (E_HS_true  > self.calo_signal_threshold).float()
             weights = 1 + self.calo_signal_weight * is_signal
             E_HS_pred = pred_alpha * E_total
-            loss_calo = torch.mean(torch.abs(E_HS_pred - E_HS_true) * weights)
+            loss_calo =torch.mean(torch.abs(E_HS_pred - E_HS_true) * weights)
         else:
             loss_calo = torch.tensor(0.0, device=valid.device, requires_grad=True)
 
@@ -205,7 +205,7 @@ class PileupRemovalModel(nn.Module):
         if outputs.get("vertex_pred") is not None and outputs.get("true_vertex_z") is not None:
             v_pred = outputs["vertex_pred"]                        # (B, 1)
             v_true = outputs["true_vertex_z"].squeeze(-1)          # (B, 1)
-            loss_vertex = F.l1_loss(v_pred / 84.891, v_true / 84.891)
+            loss_vertex = F.l1_loss(v_pred , v_true )
         else:
             loss_vertex = torch.tensor(0.0, device=valid.device, requires_grad=True)
 

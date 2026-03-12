@@ -122,7 +122,8 @@ model:
 
       # Loss weights
       track_loss_weight: 1.0
-      calo_loss_weight: 0.0
+      calo_loss_weight: 0.1
+      vertex_loss_weight: 0.0119
 
       # Inference and loss hyperparameters
       track_threshold: 0.5
@@ -136,7 +137,6 @@ model:
       enable_vertex_token: true
       use_global_context: false   # vertex token context replaces global mean
 
-      vertex_loss_weight: 1.0
 
       vertex_mlp:
         class_path: hepattn.models.Dense
@@ -183,7 +183,7 @@ model:
         init_args:
           num_layers: 8
           dim: *dim
-          attn_type: flash-varlen
+          attn_type: flex
           window_size: 512   # Each token attends to ±128 nearest neighbors in Z-order
           window_wrap: false # Z-order space is not periodic
           hybrid_norm: true
