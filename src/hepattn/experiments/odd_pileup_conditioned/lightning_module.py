@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torchmetrics as tm
 from torch import nn
 
-from hepattn.experiments.odd_pileup_conditioned.plots import PhysicsPlotter
+from hepattn.experiments.odd_pileup_maskformer.plots import PhysicsPlotter
 from hepattn.models.wrapper import ModelWrapper
 
 
@@ -80,6 +80,13 @@ class ODDPFlow(ModelWrapper):
             figs["track/roc"] = PhysicsPlotter.plot_roc_curve(
                 track["probs"], track["truth"]
             )
+            if track.get("z0") is not None and len(track["z0"]) > 0:
+                figs["track/z0_dist"] = PhysicsPlotter.plot_track_z0_distribution(
+                    track["probs"], track["truth"], track["z0"]
+                )
+            figs["track/pt_dist"] = PhysicsPlotter.plot_track_pt_distribution(
+                track["probs"], track["truth"], track["pt"]
+            )
 
         # Log to CometML
         if self.logger is not None and hasattr(self.logger, "experiment"):
@@ -104,13 +111,14 @@ class ODDPFlow(ModelWrapper):
         if stage == "train":
             return
 
+        # pileup_model predict output: {"final": {output_name: tensor}}
         final_preds = preds["final"]
         node_valid = labels["node_valid"].bool()
-        is_track = labels["is_track"].bool()
+        is_track = labels["node_is_track"].bool()
 
         # --- Track Classification Metrics (only on track nodes) ---
         track_node_mask = node_valid & is_track
-        if track_node_mask.any():
+        if track_node_mask.any() and "track_prob" in final_preds:
             track_prob = final_preds["track_prob"].squeeze(-1)[track_node_mask]
             track_truth = labels["tracks_mask"][track_node_mask].int()
 
@@ -129,10 +137,11 @@ class ODDPFlow(ModelWrapper):
                 self._val_track_data["truth"].append(track_truth.detach().cpu().numpy())
                 self._val_track_data["pt"].append(labels["node_pt"][track_node_mask].detach().float().cpu().numpy())
                 self._val_track_data["eta"].append(labels["node_eta"][track_node_mask].detach().float().cpu().numpy())
+                self._val_track_data["z0"].append(labels["node_z0"][track_node_mask].detach().float().cpu().numpy())
 
         # --- Cluster Metrics (only on cluster nodes) ---
         cluster_node_mask = node_valid & (~is_track)
-        if cluster_node_mask.any():
+        if cluster_node_mask.any() and "calo_hs_fraction" in final_preds:
             calo_frac_pred = final_preds["calo_hs_fraction"].squeeze(-1)[cluster_node_mask]
             calo_frac_true = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
 
@@ -141,11 +150,6 @@ class ODDPFlow(ModelWrapper):
             self.log(f"{stage}/calo_frac_mae", mae, **kwargs)
 
             # Per-type MAE based on true HS energy fraction
-            # a) pileup only:       < 2%  HS
-            # b) mix pileup:       3-30%  HS
-            # c) balanced:        30-70%  HS
-            # d) mix hard scatter: 70-97% HS (3-30% pileup)
-            # e) hs only:          > 98%  HS
             type_masks = {
                 "pu_only":   calo_frac_true < 0.02,
                 "mix_pu":   (calo_frac_true >= 0.03) & (calo_frac_true <= 0.30),
@@ -173,3 +177,12 @@ class ODDPFlow(ModelWrapper):
                 self._val_cluster_data["true_frac"].append(calo_frac_true.detach().float().cpu().numpy())
                 self._val_cluster_data["total_e"].append(node_e.detach().float().cpu().numpy())
                 self._val_cluster_data["true_hs_e"].append(true_hs_energy.detach().float().cpu().numpy())
+
+        # --- Vz Regression Metrics ---
+        if "vertex_z_pred" in final_preds and final_preds["vertex_z_pred"] is not None:
+            pred_vz = final_preds["vertex_z_pred"]              # (B, 1)
+            true_vz = labels.get("vertex_token_features")
+            if true_vz is not None:
+                true_vz = true_vz.squeeze(-1)                   # (B, 1)
+                vz_mae = F.l1_loss(pred_vz.float(), true_vz.float())
+                self.log(f"{stage}/vz_mae", vz_mae, **kwargs)

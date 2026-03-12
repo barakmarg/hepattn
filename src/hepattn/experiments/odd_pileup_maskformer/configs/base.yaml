@@ -216,7 +216,7 @@ model:
                 output_object: pflow
                 target_object: particle
                 fields: [vz]
-                loss_weight: 1.0
+                loss_weight: 0.01179   # 1/84.891 (normalized by vz std)
                 cost_weight: 0.0
                 dim: *dim
                 loss: smooth_l1
@@ -229,7 +229,7 @@ model:
                 input_hit: node
                 input_object: query
                 dim: *dim
-                loss_weight: 1.0
+                loss_weight: 0.1
                 signal_weight: 25.3
                 signal_threshold: 0.05
                 has_intermediate_loss: false

@@ -130,15 +130,20 @@ model:
       calo_signal_threshold: 0.05
       calo_signal_weight: 25.3
 
-      # Vertex token: one special token per event = truth hard-scatter vertex z (cheat)
-      enable_vertex_token: false
-      use_global_context: true   # redundant when vertex token provides global info via attention
-      vertex_input_net:
+      # Vertex token: learnable global token that attends to all nodes.
+      # The encoder populates it with event-level context; MLP heads condition on it.
+      # A vertex_mlp head predicts truth vz to force it to encode vertex info.
+      enable_vertex_token: true
+      use_global_context: false   # vertex token context replaces global mean
+
+      vertex_loss_weight: 1.0
+
+      vertex_mlp:
         class_path: hepattn.models.Dense
         init_args:
-          input_size: 1
-          output_size: *dim
-          hidden_layers: [64,64]
+          input_size: *dim
+          output_size: 1
+          hidden_layers: [64, 64]
           activation: torch.nn.SiLU
 
       # Raw variables passed through from inputs for loss calculation
@@ -191,7 +196,7 @@ model:
           init_args:
             input_size: *dim
             output_size: 1
-            context_size: 0   # global context disabled: vertex token provides global info via attention
+            context_size: *dim   # conditioned on post-encoder vertex token
             activation: torch.nn.SiLU
             hidden_layers: [256, 128, 64, 32]
 
@@ -200,7 +205,7 @@ model:
           init_args:
             input_size: *dim
             output_size: 1
-            context_size: 0   # global context disabled: vertex token provides global info via attention
+            context_size: *dim   # conditioned on post-encoder vertex token
             activation: torch.nn.SiLU
             hidden_layers: [256, 128, 64, 32]
             final_activation:

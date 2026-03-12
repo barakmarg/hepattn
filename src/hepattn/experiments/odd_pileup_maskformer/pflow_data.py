@@ -64,7 +64,7 @@ def morton_encode(eta: torch.Tensor, phi: torch.Tensor, n_bits: int = 16, shift_
     for bit in range(n_bits):
         result |= ((ei >> bit & 1) << (2 * bit + 1))
         result |= ((pi >> bit & 1) << (2 * bit))
-    return result.float()
+    return result.double()  # float64: 52 mantissa bits → exact up to n_bits=26
 
 
 class ODDDatasetPileup(Dataset):
