@@ -1,4 +1,4 @@
-# Proxy PV MaskFormer — Model Flow Documentation (Base)
+# Proxy PV MaskFormer — Model Flow Documentation
 
 ## Overview
 
@@ -7,14 +7,10 @@ of the hard scatter vertex, then broadcasts that context to every node for per-n
 
 ```
 Raw Nodes (tracks + clusters)
-    → InputNet → Encoder (windowed attention, fixed Morton order)
-        → PileupMaskFormerDecoder (4 layers, 1 query, iterative mask deep supervision)
+    → InputNet → Encoder (windowed attention)
+        → PileupMaskFormerDecoder (4 layers, 1 query, iterative mask + vz deep supervision)
             → 3 Task Heads (mask, vz, calo_fraction)
 ```
-
-**Difference from Swing variant:** Uses the standard `hepattn.models.Encoder` with a single
-fixed sort order (`deltaR_idx`) instead of alternating base/shifted Morton orders. Also,
-vz regression has **no intermediate loss** — it is only computed at the final decoder layer.
 
 ---
 
@@ -28,11 +24,10 @@ vz regression has **no intermediate loss** — it is only computed at the final 
 | `node_valid` | `(B, 5500)` | Bool mask — True for real nodes, False for padding |
 | `node_eta` | `(B, 5500)` | Raw eta coordinate |
 | `node_phi` | `(B, 5500)` | Raw phi coordinate |
-| `node_deltaR_idx` | `(B, 5500)` | Z-order Morton index for windowed attention sorting |
+| `node_deltaR_idx` | `(B, 5500)` | Z-order Morton index for windowed attention sorting (base ordering) |
+| `node_deltaR_idx_shifted` | `(B, 5500)` | Morton index with phi rotated by π — moves the periodic boundary from ±π to 0 (shifted ordering) |
 | `node_e` | `(B, 5500)` | Raw total energy per node (raw variable, passed through) |
 | `node_is_track` | `(B, 5500)` | 1 for tracks, 0 for calo clusters (raw variable, passed through) |
-
-> No `node_deltaR_idx_shifted` — the standard encoder uses a single fixed sort order.
 
 **Feature ordering in `node_features[:, :, 21]`:**
 Tracks use: `phi, cosphi, sinphi, eta, eta_int, phi_int, cosphi_int, sinphi_int, pt, d0, z0, tanlambda, omega` + zeros for calo fields + `is_track=1, is_cluster=0`
@@ -71,38 +66,47 @@ Also sets `key_is_node` — a bool vector of length 5500 (all True, since we onl
 
 ---
 
-## Stage 2: Windowed Self-Attention Encoder (Fixed Morton Order)
+## Stage 2: Windowed Self-Attention Encoder (Shifted-Window Morton)
 
-**File:** `hepattn/models/encoder.py` (`hepattn.models.Encoder`)
+**File:** `hepattn/experiments/odd_pileup_maskformer/models.py` (`ShiftedWindowEncoder`)
 
 ```
 node_embed  (B, 5500, 256)
 
-  Tokens sorted once by node_deltaR_idx (Z-order Morton in eta-phi) — fixed for all 8 layers.
-
   For each of the 8 encoder layers:
-    → sort tokens by node_deltaR_idx  (same order every layer)
+    even layers (0, 2, 4, 6): sort by node_deltaR_idx         (base Morton order)
+    odd  layers (1, 3, 5, 7): sort by node_deltaR_idx_shifted (phi-rotated Morton order)
+
+    → sort tokens into current layer's order
     → (flash-varlen) unpad to remove padding tokens
-    → windowed self-attention (16 heads, window_size=256) + FFN + residual
+    → windowed self-attention (16 heads, window_size=512) + FFN + residual
     → repad
     → unsort back to original token order
 
   → key_embed  (B, 5500, 256)    [updated, context-aware node embeddings]
 ```
 
-**Single sort order:** Unlike the Swing variant, all 8 layers use the same `deltaR_idx`
-Morton ordering. Particles near phi=±π that fall at opposite ends of the sorted sequence
-may not share a window in any layer. This is the key architectural trade-off vs. the
-Swing variant's shifted-window approach.
+**Why two orderings?**
+phi is periodic: particles at phi=+π and phi=−π are genuine ΔR≈0 neighbours, but a
+single Morton ordering places them at opposite ends of the sorted sequence, so they
+never share a window. By rotating phi by π in alternating layers (Swin-style shifted
+windows), the "tear" in the ordering migrates between ±π and 0 each layer:
 
-Each node encodes its local neighbourhood context (within ΔR ≈ 0.5) relative to the
-base Morton ordering.
+- Base order: particles near phi=0 are co-located; ±π boundary is a blind spot.
+- Shifted order: particles near ±π are co-located; phi=0 becomes the blind spot.
+
+Each token pair that is split in even layers is guaranteed to be within the same
+window in odd layers, and vice-versa. Every region of the eta-phi cylinder gets full
+coverage over two consecutive layers.
+
+Each node now encodes its local neighbourhood context (within ΔR ≈ 0.5) with no
+systematic dead zone at the phi=±π boundary.
 
 ---
 
 ## Stage 3: MaskFormer Decoder — 4 Iterative Layers
 
-**File:** `hepattn/experiments/odd_pileup_maskformer/decoder.py`
+**File:** `hepattn/models/decoder.py`
 
 ### Initial State
 ```
@@ -177,19 +181,34 @@ kv_dense: key_embed  → FFN → key_embed  (B, 5500, 256)
 
 After bidirectional CA, every node embedding carries information about the Proxy PV.
 
-#### Step F — Intermediate Mask Loss (deep supervision)
+#### Step F — Intermediate vz Regression (deep supervision)
+```
+query_embed  (B, 1, 256)
+    → Dense(256 → 1)
+    → pflow_regr  (B, 1, 1)   ← predicted vz at this layer
+
+Loss: smooth_L1(pflow_regr, particle_vz)
+```
+
+vz is predicted at every decoder layer (deep supervision), forcing the query to learn the
+vertex position early. This gives later layers a better-informed query for masking.
+
+#### Step G — Intermediate Loss (logged per-layer)
 ```
 outputs["layer_0"]["mask"] = {
     "pflow_node_logit": (B, 1, 5500)   ← mask logits at this layer
 }
+outputs["layer_0"]["vz_regression"] = {
+    "pflow_regr": (B, 1, 1)            ← vz prediction at this layer
+}
 ```
 
-Losses computed at every intermediate layer (mask only — vz has no intermediate loss):
+Losses computed at every intermediate layer:
 - `mask_bce`:  5.0 × BCE(sigmoid(logit), particle_node_valid)  [null_weight=0.06 for class imbalance]
 - `mask_dice`: 1.0 × Dice(sigmoid(logit), particle_node_valid)
+- `vz_regression_smooth_l1`: smooth_L1(pflow_regr, particle_vz)
 
-> **No intermediate vz loss** (`has_intermediate_loss: false` for ObjectRegressionTask).
-> Vz regression is deferred to the final task head only.
+This forces both the mask and vz to sharpen progressively across layers.
 
 ---
 
@@ -219,7 +238,7 @@ The mask is the model's unified track classifier — `pflow_node_prob` gives con
 
 ---
 
-### Task 2 — ObjectRegressionTask: Vz Regression (final only)
+### Task 2 — ObjectRegressionTask: Vz Regression (with deep supervision)
 
 ```
 Input:   query_embed  (B, 1, 256)
@@ -229,12 +248,11 @@ Output:  pflow_regr  (B, 1, 1)   ← predicted hard scatter vertex z
 Loss target:  particle_vz  (B, 1)   [truth vz, NOT given to the model]
 Loss:
   final_vz_regression_smooth_l1 = smooth_L1(pflow_regr, particle_vz)
-  (loss_weight = 0.01179 = 1/84.891, normalised by vz std)
 ```
 
-**No deep supervision:** Unlike the Swing variant, vz regression only runs at the final
-decoder layer (`has_intermediate_loss: false`). The query is not forced to encode vertex
-position early — it accumulates this representation organically across the 4 decoder layers.
+**Deep supervision:** Unlike the final-only pattern, vz regression runs at every decoder layer
+(same as the mask task). This forces the query to learn the vertex position from Layer 0 onwards,
+rather than deferring it to the final stage.
 
 **Why this matters:** The query must encode the vertex position to classify tracks by z0 proximity.
 Vz is in the loss only — the model must discover it from the pattern of track z0 values.
@@ -273,18 +291,20 @@ All losses flow back through the entire network.
 |---|---|---|---|
 | `layer_0_mask_mask_bce` | ObjectHitMaskTask | Decoder layer 0 | `particle_node_valid` |
 | `layer_0_mask_mask_dice` | ObjectHitMaskTask | Decoder layer 0 | `particle_node_valid` |
+| `layer_0_vz_regression_smooth_l1` | ObjectRegressionTask | Decoder layer 0 | `particle_vz` |
 | `layer_1_mask_mask_bce` | ObjectHitMaskTask | Decoder layer 1 | `particle_node_valid` |
 | `layer_1_mask_mask_dice` | ObjectHitMaskTask | Decoder layer 1 | `particle_node_valid` |
+| `layer_1_vz_regression_smooth_l1` | ObjectRegressionTask | Decoder layer 1 | `particle_vz` |
 | `layer_2_mask_mask_bce` | ObjectHitMaskTask | Decoder layer 2 | `particle_node_valid` |
 | `layer_2_mask_mask_dice` | ObjectHitMaskTask | Decoder layer 2 | `particle_node_valid` |
+| `layer_2_vz_regression_smooth_l1` | ObjectRegressionTask | Decoder layer 2 | `particle_vz` |
 | `layer_3_mask_mask_bce` | ObjectHitMaskTask | Decoder layer 3 | `particle_node_valid` |
 | `layer_3_mask_mask_dice` | ObjectHitMaskTask | Decoder layer 3 | `particle_node_valid` |
+| `layer_3_vz_regression_smooth_l1` | ObjectRegressionTask | Decoder layer 3 | `particle_vz` |
 | `final_mask_mask_bce` | ObjectHitMaskTask | Final | `particle_node_valid` |
 | `final_mask_mask_dice` | ObjectHitMaskTask | Final | `particle_node_valid` |
-| `final_vz_regression_smooth_l1` | ObjectRegressionTask | Final only | `particle_vz` |
+| `final_vz_regression_smooth_l1` | ObjectRegressionTask | Final | `particle_vz` |
 | `final_calo_fraction_l1` | PileupCaloFractionTask | Final | `calo_hard_scatter_energy` |
-
-> Compared to Swing: no `layer_X_vz_regression_smooth_l1` entries — vz deep supervision is absent.
 
 ---
 
@@ -304,7 +324,7 @@ preds = {
             "calo_hs_fraction": (B, 5500),  # HS energy fraction per node ∈ [0,1]
         },
     },
-    "layer_0": { "mask": { ... } },   # no vz_regression at intermediate layers
+    "layer_0": { "mask": { ... }, "vz_regression": { ... } },
     "layer_1": { ... },
     "layer_2": { ... },
     "layer_3": { ... },
@@ -332,13 +352,14 @@ preds = {
 ```
 Dataset
   ├── inputs["node_features"]  (B,5500,21) ──→ InputNet ──→ node_embed (B,5500,256)
-  ├── inputs["node_deltaR_idx"]         ───────────────────→ sort key for all encoder layers
+  ├── inputs["node_deltaR_idx"]         ───────────────────→ base sort key for even encoder layers
+  ├── inputs["node_deltaR_idx_shifted"] ───────────────────→ shifted sort key for odd encoder layers
   └── inputs["node_e"], ["node_is_track"] ───────────────→ x (raw variables, for loss + prior)
 
 InputNet
   └── node_embed (B,5500,256) ──→ Encoder
 
-Encoder (8 layers, window=256, fixed Morton order)
+Encoder (8 layers, window=512)
   └── key_embed (B,5500,256) ──→ PileupMaskFormerDecoder
 
 PileupMaskFormerDecoder (4 layers)
@@ -347,15 +368,19 @@ PileupMaskFormerDecoder (4 layers)
   └─── For each layer:
         ├── ObjectHitMaskTask.forward(query_embed, key_embed)
         │     └── learned_mask (B,1,5500) bool  [HS vs PU tracks]
-        │         intermediate loss: BCE+Dice on mask
+        │
+        ├── ObjectRegressionTask.forward(query_embed)  [deep supervision]
+        │     └── pflow_regr (B,1,1) → vz prediction at this layer
         │
         ├── Physics prior (hard constraint)
         │     └── attn_mask = learned_mask & node_is_track  (B,1,5500)
         │         calo positions always False — enforced, not learned
         │
-        └── Decoder Layer (cross-attn with attn_mask)
-              ├── query attends to tracks only, focused on HS tracks
-              └── key attends back to query → all nodes (incl. calo) get PV context
+        ├── Decoder Layer (cross-attn with attn_mask)
+        │     ├── query attends to tracks only, focused on HS tracks
+        │     └── key attends back to query → all nodes (incl. calo) get PV context
+        │
+        └── intermediate loss: BCE+Dice on mask + smooth_L1 on vz
 
 Final Task Heads (receive final query_embed + key_embed)
   ├── ObjectHitMaskTask (unified track classifier)
@@ -363,7 +388,7 @@ Final Task Heads (receive final query_embed + key_embed)
   │     └── out: pflow_node_logit (B,1,5500) → loss: mask_bce + mask_dice
   │         also: pflow_node_prob (B,1,5500) → used for track metrics
   │
-  ├── ObjectRegressionTask  [FINAL ONLY — no intermediate loss]
+  ├── ObjectRegressionTask
   │     ├── in:  query_embed (B,1,256)
   │     └── out: pflow_regr (B,1,1) → loss: smooth_L1 vs particle_vz
   │
