@@ -52,7 +52,7 @@ data:
   num_test: -1
   num_val: -1
 
-  batch_size: 48   # Increased from 128 to match CLIC
+  batch_size: 64   # Increased from 128 to match CLIC
   incidence_cutval: 0.01
 
   # Energy threshold for cluster filtering
@@ -115,7 +115,7 @@ model:
   mtl: false
 
   model:
-    class_path: hepattn.experiments.odd_pileup_maskformer.models.ShiftedWindowMaskFormer
+    class_path: hepattn.models.MaskFormer
     init_args:
       dim: &dim 256
       target_object: particle
@@ -154,7 +154,7 @@ model:
 
       # Encoder: windowed attention over all nodes
       encoder:
-        class_path: hepattn.experiments.odd_pileup_maskformer.models.ShiftedWindowEncoder
+        class_path: hepattn.models.Encoder
         init_args:
           num_layers: 8
           dim: *dim
@@ -220,7 +220,7 @@ model:
                 cost_weight: 0.0
                 dim: *dim
                 loss: smooth_l1
-                has_intermediate_loss: true
+                has_intermediate_loss: false
 
             # Task 3: Calo energy fraction regression (per-node, conditioned on query)
             - class_path: hepattn.experiments.odd_pileup_maskformer.tasks.PileupCaloFractionTask
