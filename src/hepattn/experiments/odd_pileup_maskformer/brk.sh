@@ -4,5 +4,5 @@ export IOTHROTTLE_LIMIT=100
 source /usr/wipp/conda/24.5.0u/bin/activate /usr/wipp/conda/24.5.0u/envs/common
 pushd /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_maskformer
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python main.py fit --config configs/base.yaml  #--data.num_workers 0
+python main.py fit --config configs/base_maskformer.yaml  #--data.num_workers 0
 popd

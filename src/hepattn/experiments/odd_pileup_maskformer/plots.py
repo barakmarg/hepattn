@@ -54,6 +54,7 @@ class PhysicsPlotter:
         ax.set_xlabel("HS Fraction")
         ax.set_ylabel("Normalised Density")
         ax.set_title("Calo: HS Fraction Distribution")
+        ax.set_yscale("log")
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
