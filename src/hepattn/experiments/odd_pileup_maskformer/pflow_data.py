@@ -633,6 +633,7 @@ class ODDDatasetPileup(Dataset):
             "node_e": data_dict["node_raw_features"]["total_e"],
             "node_is_track": data_dict["node_raw_features"]["is_track"],
             "vertex_token_features": data_dict["vertex_token_features"],
+            "tracks_mask": data_dict["node_raw_features"]["track_vertex_primary_mask"],
         }
 
         labels["tracks_mask"] = data_dict["node_raw_features"]["track_vertex_primary_mask"]
