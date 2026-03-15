@@ -75,9 +75,43 @@ class PhysicsPlotter:
         ax.axvline(0, color="red", lw=1, ls="--", label="Ideal")
         ax.set_xlabel("(E_pred − E_true) / E_true")
         ax.set_ylabel("Count")
+        ax.set_yscale("log")
         ax.set_title("Calo: HS Energy Residual")
         ax.legend()
         ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_hs_energy_distribution(pred_frac: np.ndarray, total_e: np.ndarray, true_hs_e: np.ndarray) -> Figure:
+        """Overlaid 1D histograms of predicted vs truth HS energy (log-log scale)."""
+        pred_hs_e = pred_frac * total_e
+        # Filter to positive energies for log scale
+        mask_true = true_hs_e > 1e-3
+        mask_pred = pred_hs_e > 1e-3
+        if mask_true.sum() == 0 and mask_pred.sum() == 0:
+            fig, ax = plt.subplots()
+            ax.text(0.5, 0.5, "No clusters with E > 0", ha="center", va="center")
+            return fig
+        emax = max(
+            np.percentile(true_hs_e[mask_true], 99.5) if mask_true.any() else 1.0,
+            np.percentile(pred_hs_e[mask_pred], 99.5) if mask_pred.any() else 1.0,
+            1.0,
+        )
+        emin = 1e-2
+        bins = np.logspace(np.log10(emin), np.log10(emax), 80)
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(true_hs_e[mask_true], bins=bins, density=True,
+                alpha=0.7, color="steelblue", label="Truth HS Energy")
+        ax.hist(pred_hs_e[mask_pred], bins=bins, density=True,
+                alpha=0.7, color="tomato", label="Predicted HS Energy")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Hard Scatter Energy [GeV]")
+        ax.set_ylabel("Normalised Density")
+        ax.set_title("Calo: Predicted vs Truth HS Energy Distribution")
+        ax.legend()
+        ax.grid(True, which="both", alpha=0.3)
         plt.tight_layout()
         return fig
 

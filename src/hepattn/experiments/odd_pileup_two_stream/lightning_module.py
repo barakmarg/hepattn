@@ -79,6 +79,9 @@ class ODDPFlowTwoStream(ModelWrapper):
             figs["calo/energy_resid"] = PhysicsPlotter.plot_energy_residual(
                 cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
             )
+            figs["calo/hs_energy_dist"] = PhysicsPlotter.plot_hs_energy_distribution(
+                cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
+            )
 
         if track.get("probs") is not None and len(track["probs"]) > 0:
             figs["track/score_dist"] = PhysicsPlotter.plot_track_score_distribution(

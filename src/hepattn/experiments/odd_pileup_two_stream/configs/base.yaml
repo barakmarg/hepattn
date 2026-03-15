@@ -47,7 +47,7 @@ data:
   num_test: -1
   num_val: -1
 
-  batch_size: 64
+  batch_size: 48
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
@@ -108,7 +108,7 @@ model:
     init_args:
       dim: &dim 256
       target_object: particle
-      max_hs_tracks: 200
+      max_hs_tracks: 190
       teacher_forcing: true
 
       # Raw variables forwarded through x dict
@@ -220,13 +220,13 @@ model:
         init_args:
           prior_mask_key: "node_is_track"
           num_decoder_layers: 4
-          num_queries: 201   # max_hs_tracks (200) + 1 global calo query
+          num_queries: 191   # max_hs_tracks (190) + 1 global calo query
           mask_attention: true
           use_query_masks: false
           decoder_layer_config:
             dim: *dim
             hybrid_norm: true
-            bidirectional_ca: true
+            bidirectional_ca: false
             attn_kwargs:
               num_heads: 16
 
