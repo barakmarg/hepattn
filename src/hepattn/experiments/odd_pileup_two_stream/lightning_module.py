@@ -57,6 +57,7 @@ class ODDPFlowTwoStream(ModelWrapper):
     def on_validation_epoch_start(self) -> None:
         self._val_track_data = defaultdict(list)
         self._val_cluster_data = defaultdict(list)
+        self._val_event_counter = 0
 
     def on_validation_epoch_end(self) -> None:
         if not self._val_track_data and not self._val_cluster_data:
@@ -82,12 +83,30 @@ class ODDPFlowTwoStream(ModelWrapper):
             figs["calo/hs_energy_dist"] = PhysicsPlotter.plot_hs_energy_distribution(
                 cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
             )
+            if cluster.get("event_idx") is not None:
+                figs["calo/event_hs_energy_ratio"] = PhysicsPlotter.plot_calo_event_hs_energy_ratio(
+                    cluster["pred_frac"], cluster["total_e"],
+                    cluster["true_hs_e"], cluster["event_idx"],
+                )
+
+        if cluster.get("mask_pred") is not None and len(cluster.get("mask_pred", [])) > 0:
+            for bin_key, bin_fig in PhysicsPlotter.plot_calo_mask_errors_by_energy(
+                cluster["mask_pred"], cluster["mask_truth"],
+                cluster["total_e"], cluster["true_hs_e"], cluster["pred_frac"],
+            ).items():
+                figs[f"calo/mask_errors_by_energy/{bin_key}"] = bin_fig
+            figs["calo/mistag_eta"] = PhysicsPlotter.plot_calo_mistag_vs_eta(
+                cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
+            )
 
         if track.get("probs") is not None and len(track["probs"]) > 0:
             figs["track/score_dist"] = PhysicsPlotter.plot_track_score_distribution(
                 track["probs"], track["truth"]
             )
             figs["track/eff_vs_pt"] = PhysicsPlotter.plot_track_efficiency_vs_pt(
+                track["probs"], track["truth"], track["pt"]
+            )
+            figs["track/f1_vs_pt"] = PhysicsPlotter.plot_track_f1_vs_pt(
                 track["probs"], track["truth"], track["pt"]
             )
             figs["track/rej_vs_pt"] = PhysicsPlotter.plot_pileup_rejection_vs_pt(
@@ -225,3 +244,23 @@ class ODDPFlowTwoStream(ModelWrapper):
                 self._val_cluster_data["true_frac"].append(calo_frac_true.detach().float().cpu().numpy())
                 self._val_cluster_data["total_e"].append(node_e.detach().float().cpu().numpy())
                 self._val_cluster_data["true_hs_e"].append(true_hs_energy.detach().float().cpu().numpy())
+
+                # Accumulate for diagnostic plots (regional energy + cluster swap)
+                self._val_cluster_data["eta"].append(labels["node_eta"][cluster_node_mask].detach().float().cpu().numpy())
+                self._val_cluster_data["phi"].append(labels["node_phi"][cluster_node_mask].detach().float().cpu().numpy())
+
+                # Calo mask predictions for cluster swap plot
+                if "calo_mask" in calo_final:
+                    calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
+                    calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
+                    self._val_cluster_data["mask_pred"].append((calo_prob_flat > 0.5).detach().cpu().numpy())
+                    self._val_cluster_data["mask_truth"].append((calo_hs_e_flat > 0.15).detach().cpu().numpy())
+
+                # Per-event indices for grouping clusters by event
+                counts = cluster_node_mask.sum(dim=-1).cpu().numpy()  # (B,)
+                event_indices = np.repeat(
+                    np.arange(self._val_event_counter, self._val_event_counter + len(counts)),
+                    counts,
+                )
+                self._val_cluster_data["event_idx"].append(event_indices)
+                self._val_event_counter += len(counts)

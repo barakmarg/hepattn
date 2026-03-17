@@ -116,6 +116,129 @@ class PhysicsPlotter:
         return fig
 
     @staticmethod
+    def plot_calo_mask_errors_by_energy(
+        mask_pred: np.ndarray, mask_truth: np.ndarray,
+        total_e: np.ndarray, true_hs_e: np.ndarray,
+        pred_frac: np.ndarray,
+    ) -> dict:
+        """FP/FN HS-energy histograms binned by total cluster energy.
+
+        Returns a dict of {bin_label: Figure}, one figure per energy bin.
+        FP (blue): predicted HS energy (pred_frac * total_e) for clusters that are actually PU.
+        FN (red):  true HS energy for clusters that are actually HS but predicted as PU.
+        """
+        mask_pred = mask_pred.astype(bool)
+        mask_truth = mask_truth.astype(bool)
+        pred_hs_e = pred_frac * total_e
+        e_bins = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0, np.inf]
+
+        figs = {}
+        for lo, hi in zip(e_bins[:-1], e_bins[1:]):
+            in_bin = (total_e >= lo) & (total_e < hi)
+            fp = in_bin & mask_pred & ~mask_truth
+            fn = in_bin & ~mask_pred & mask_truth
+
+            all_vals = np.concatenate([
+                pred_hs_e[fp] if fp.any() else np.array([]),
+                true_hs_e[fn] if fn.any() else np.array([]),
+            ])
+            e_max = max(all_vals.max() if len(all_vals) > 0 else 1.0, 1e-3)
+            bins = np.linspace(0, e_max, 40)
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+            if fp.any():
+                ax.hist(pred_hs_e[fp], bins=bins, alpha=0.7, color="steelblue",
+                        label=f"FP — pred HS energy (n={fp.sum()})")
+            if fn.any():
+                ax.hist(true_hs_e[fn], bins=bins, alpha=0.7, color="tomato",
+                        label=f"FN — true HS energy (n={fn.sum()})")
+
+            hi_label = f"{hi:.0f}" if not np.isinf(hi) else "∞"
+            ax.set_title(f"Calo Mask Errors: E_total ∈ [{lo:.1f}, {hi_label}) GeV\n"
+                         f"FP = predicted HS energy  |  FN = true HS energy")
+            ax.set_xlabel("HS Energy [GeV]  (FP: predicted · FN: true)")
+            ax.set_ylabel("Count")
+            ax.set_yscale("log")
+            ax.legend()
+            ax.grid(True, which="both", alpha=0.3)
+            plt.tight_layout()
+
+            key = f"{lo:.1f}_{hi_label}"
+            figs[key] = fig
+
+        return figs
+
+    @staticmethod
+    def plot_calo_mistag_vs_eta(
+        mask_pred: np.ndarray, mask_truth: np.ndarray, eta: np.ndarray,
+    ) -> Figure:
+        """Pileup mistag rate (FPR) vs cluster η for calo clusters."""
+        mask_pred = mask_pred.astype(bool)
+        mask_truth = mask_truth.astype(bool)
+        is_true_pu = ~mask_truth
+
+        bins = np.linspace(-5, 5, 25)
+        centers = (bins[:-1] + bins[1:]) / 2
+        mistag, err = [], []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            m = (eta >= lo) & (eta < hi) & is_true_pu
+            n = m.sum()
+            if n > 0:
+                fpr = mask_pred[m].sum() / n
+                mistag.append(fpr)
+                err.append(np.sqrt(fpr * (1 - fpr) / n))
+            else:
+                mistag.append(np.nan)
+                err.append(np.nan)
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.errorbar(centers, mistag, yerr=err, fmt="x-", capsize=3, color="tomato")
+        ax.set_xlabel("Cluster η")
+        ax.set_ylabel("Pileup Mistag Rate (FPR)")
+        ax.set_title("Calo Pileup Mistag Rate vs η")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_event_hs_energy_ratio(
+        pred_frac: np.ndarray, total_e: np.ndarray,
+        true_hs_e: np.ndarray, event_idx: np.ndarray,
+    ) -> Figure:
+        """Histogram of per-event (sum predicted HS energy / sum true HS energy).
+
+        A perfect model gives a distribution centred at 1.
+        Values < 1 mean the model under-predicts total HS energy per event;
+        values > 1 mean over-prediction.
+        """
+        pred_hs_e = pred_frac * total_e
+        # Remap event_idx to 0..N-1 so bincount works without gaps
+        _, inv = np.unique(event_idx, return_inverse=True)
+        sum_pred = np.bincount(inv, weights=pred_hs_e)
+        sum_true = np.bincount(inv, weights=true_hs_e)
+        valid = sum_true > 0
+        ratios = sum_pred[valid] / sum_true[valid]
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        if len(ratios) == 0:
+            ax.text(0.5, 0.5, "No events with true HS energy > 0", ha="center", va="center")
+            plt.tight_layout()
+            return fig
+
+        clipped = np.clip(ratios, 0, 3)
+        ax.hist(clipped, bins=60, color="steelblue", alpha=0.8, edgecolor="none")
+        ax.axvline(1.0, color="red", lw=1.5, ls="--", label="Ideal (1.0)")
+        mean, std = ratios.mean(), ratios.std()
+        ax.set_xlabel("Σ Predicted HS Energy / Σ True HS Energy  (per event)")
+        ax.set_ylabel("Events")
+        ax.set_yscale("log")
+        ax.set_title("Per-Event HS Energy Ratio")
+        ax.legend(title=f"mean={mean:.3f}, std={std:.3f}\nN events={len(ratios)}")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
     def plot_track_score_distribution(probs: np.ndarray, truth: np.ndarray) -> Figure:
         """1D score histogram: HS tracks vs PU tracks overlaid."""
         fig, ax = plt.subplots(figsize=(7, 5))
@@ -159,6 +282,42 @@ class PhysicsPlotter:
         ax.set_ylabel("Signal Efficiency (Recall)")
         ax.set_ylim(0, 1.1)
         ax.set_title("Track Signal Efficiency vs pT")
+        ax.grid(True, which="both", alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_track_f1_vs_pt(probs: np.ndarray, truth: np.ndarray, pt: np.ndarray,
+                            threshold: float = 0.5) -> Figure:
+        """Binary F1 score vs log-pT with error bars."""
+        bins = np.logspace(np.log10(0.3), np.log10(200), 25)
+        centers = np.sqrt(bins[:-1] * bins[1:])
+        is_pred_hs = probs > threshold
+        is_true_hs = truth == 1
+        f1_vals, f1_errs = [], []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            m = (pt >= lo) & (pt < hi)
+            n = m.sum()
+            if n > 0:
+                tp = (is_pred_hs[m] & is_true_hs[m]).sum()
+                fp = (is_pred_hs[m] & ~is_true_hs[m]).sum()
+                fn = (~is_pred_hs[m] & is_true_hs[m]).sum()
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+                f1_vals.append(f1)
+                f1_errs.append(np.sqrt(f1 * (1 - f1) / n))
+            else:
+                f1_vals.append(np.nan)
+                f1_errs.append(np.nan)
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.errorbar(centers, f1_vals, yerr=f1_errs, fmt="o-", capsize=3, color="steelblue")
+        ax.axhline(1.0, color="gray", lw=1, ls="--")
+        ax.set_xscale("log")
+        ax.set_xlabel("Track pT [GeV]")
+        ax.set_ylabel("F1 Score")
+        ax.set_ylim(0, 1.1)
+        ax.set_title("Track F1 vs pT")
         ax.grid(True, which="both", alpha=0.3)
         plt.tight_layout()
         return fig

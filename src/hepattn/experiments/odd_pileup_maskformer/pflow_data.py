@@ -88,6 +88,7 @@ class ODDDatasetPileup(Dataset):
         is_inference: bool = False,
         files_list: list[Path] | None = None,
         hard_scatter_energy_threshold: float = 0.03,
+        window_size: int = 512,
     ):
         """
         Initialize ODD Dataset.
@@ -104,6 +105,7 @@ class ODDDatasetPileup(Dataset):
             incidence_cutval: Threshold for incidence matrix values
             is_inference: Whether running in inference mode
             files_list: Optional list of files to load (supercedes globbing in filepath)
+            window_size: Window size for windowed attention (used in deltaR stats)
         """
         super().__init__()
 
@@ -125,6 +127,7 @@ class ODDDatasetPileup(Dataset):
         self.remove_wrong_idxs = remove_wrong_idxs
         self.incidence_cutval = incidence_cutval
         self.is_inference = is_inference
+        self.window_size = window_size
         self.hard_scatter_energy_threshold = hard_scatter_energy_threshold
 
         print(f"Loading ODD dataset from {filepath} with {num_events} samples")
@@ -383,7 +386,7 @@ class ODDDatasetPileup(Dataset):
             deps_to_cluster_ratio = total_deps_energy / total_cluster_energy if total_cluster_energy > 0 else 0
             print(f"Energy composition: Total deposited HS energy {total_deps_energy:.2e} | Total cluster energy {total_cluster_energy:.2e} | Ratio {deps_to_cluster_ratio:.4f}")
 
-        self.print_deltaR_stats()
+        self.print_deltaR_stats(window_size=self.window_size)
 
     def print_deltaR_stats(self, n_sample: int = 100, window_size: int = 512) -> None:
         """Sample events and print delta R statistics within a Z-order sorted window.
@@ -570,6 +573,7 @@ class ODDDatasetPileup(Dataset):
             # Raw (unscaled) kinematic quantities for plotting
             "node_pt":  torch.cat([t_pt,  torch.zeros(n_clusters, device=t_pt.device)], -1),
             "node_eta": torch.cat([t_eta, c_eta], -1),
+            "node_phi": torch.cat([t_phi, c_phi], -1),
             "node_z0":  torch.cat([t_z0,  torch.zeros(n_clusters, device=t_z0.device)], -1),
         }
 
@@ -645,6 +649,7 @@ class ODDDatasetPileup(Dataset):
         labels["calo_hard_scatter_energy_frac"] = data_dict["node_raw_features"]["calo_raw_hard_scatter_energy_frac"]
         labels["node_pt"]  = data_dict["node_raw_features"]["node_pt"]
         labels["node_eta"] = data_dict["node_raw_features"]["node_eta"]
+        labels["node_phi"] = data_dict["node_raw_features"]["node_phi"]
         labels["node_z0"]  = data_dict["node_raw_features"]["node_z0"]
 
         labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
@@ -946,6 +951,7 @@ class ODDDataModule(L.LightningDataModule):
         overtrain: bool = False,
         seed: int = 42,
         hard_scatter_energy_threshold: float = 0.03,
+        window_size: int = 512,
         **kwargs,
     ):
         super().__init__()
@@ -963,7 +969,7 @@ class ODDDataModule(L.LightningDataModule):
         self.pin_memory = pin_memory
         self.test_suff = test_suff
         self.scale_dict_path = scale_dict_path
-        
+
         self.unify_path = unify_path
         self.enable_split = enable_split
         self.train_split = train_split
@@ -972,7 +978,7 @@ class ODDDataModule(L.LightningDataModule):
         self.val_and_test_split_same = val_and_test_split_same
         self.overtrain = overtrain
         self.seed = seed
-        
+
         # Dataset kwargs
         self.dataset_kwargs = {
             "inputs": inputs,
@@ -982,6 +988,7 @@ class ODDDataModule(L.LightningDataModule):
             "incidence_cutval": incidence_cutval,
             "is_inference": is_inference,
             "hard_scatter_energy_threshold": hard_scatter_energy_threshold,
+            "window_size": window_size,
         }
         self.dataset_kwargs.update(kwargs)
 
