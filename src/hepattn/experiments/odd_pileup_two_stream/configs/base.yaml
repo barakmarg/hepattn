@@ -249,6 +249,7 @@ model:
                 logit_scale: 4
                 pred_threshold: 0.5
                 hs_energy_threshold: 0.15
+                hs_frac_threshold: 0.2
                 has_intermediate_loss: true
 
             # Task 2: Calo energy fraction regression (loss only on HS clusters)
@@ -261,4 +262,5 @@ model:
                 loss_weight: 1.0
                 signal_weight: 25.3
                 hs_energy_threshold: 0.15
+                hs_frac_threshold: 0.2
                 has_intermediate_loss: false

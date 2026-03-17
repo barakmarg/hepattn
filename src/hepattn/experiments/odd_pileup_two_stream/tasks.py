@@ -32,6 +32,7 @@ class CaloHitMaskTask(Task):
         attn_threshold: float = 0.1,
         mask_attn: bool = True,
         hs_energy_threshold: float = 0.15,
+        hs_frac_threshold: float = 0.2,
         has_intermediate_loss: bool = True,
     ):
         super().__init__(has_intermediate_loss=has_intermediate_loss, permute_loss=False)
@@ -45,6 +46,7 @@ class CaloHitMaskTask(Task):
         self.attn_threshold = attn_threshold
         self.mask_attn = mask_attn
         self.hs_energy_threshold = hs_energy_threshold
+        self.hs_frac_threshold = hs_frac_threshold
         self.outputs = ["calo_node_logit", "per_query_logit"]
 
         self.object_net = Dense(dim, dim)
@@ -95,9 +97,10 @@ class CaloHitMaskTask(Task):
         is_track = targets["node_is_track"].bool().squeeze(-1)  # (B, N)
         valid = targets["node_valid"].bool()  # (B, N)
 
-        # Target: calo cluster is hard scatter if its HS energy exceeds threshold
+        # Target: calo cluster is hard scatter if HS fraction and absolute energy exceed thresholds
         calo_hs_energy = targets["calo_hard_scatter_energy"]  # (B, N)
-        calo_is_hs = (calo_hs_energy > self.hs_energy_threshold) & ~is_track & valid
+        calo_hs_frac = targets["calo_hard_scatter_energy_frac"]  # (B, N)
+        calo_is_hs = (calo_hs_frac > self.hs_frac_threshold) & (calo_hs_energy > self.hs_energy_threshold) & ~is_track & valid
         # Shape to (B, 1, N) to match master_logit
         target = calo_is_hs.unsqueeze(1).float()
 
@@ -139,6 +142,7 @@ class PileupCaloFractionTaskV2(Task):
         loss_weight: float = 1.0,
         signal_weight: float = 25.3,
         hs_energy_threshold: float = 0.15,
+        hs_frac_threshold: float = 0.2,
         has_intermediate_loss: bool = False,
     ):
         super().__init__(has_intermediate_loss=has_intermediate_loss, permute_loss=False)
@@ -148,6 +152,7 @@ class PileupCaloFractionTaskV2(Task):
         self.loss_weight = loss_weight
         self.signal_weight = signal_weight
         self.hs_energy_threshold = hs_energy_threshold
+        self.hs_frac_threshold = hs_frac_threshold
         self.outputs = ["calo_frac"]
 
         self.query_net = Dense(dim, dim)
@@ -177,8 +182,10 @@ class PileupCaloFractionTaskV2(Task):
         valid = targets["node_valid"].bool()
         calo_hs_energy = targets["calo_hard_scatter_energy"]
 
-        # CRITICAL: Only compute loss on true HS clusters
-        mask = valid & ~is_track & (calo_hs_energy > self.hs_energy_threshold)
+        calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
+
+        # CRITICAL: Only compute loss on true HS clusters (fraction AND absolute energy thresholds)
+        mask = valid & ~is_track & (calo_hs_frac > self.hs_frac_threshold) & (calo_hs_energy > self.hs_energy_threshold)
 
         if mask.any():
             pred_frac = outputs["calo_frac"][mask]

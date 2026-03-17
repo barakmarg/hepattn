@@ -195,8 +195,13 @@ class ODDPFlowTwoStream(ModelWrapper):
         if cluster_node_mask.any() and "calo_mask" in calo_final:
             calo_mask_prob = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
             calo_hs_energy = labels["calo_hard_scatter_energy"]
-            # Use the same threshold from the task config (default 0.15)
-            calo_mask_truth = (calo_hs_energy[cluster_node_mask] > 0.15).int()
+            calo_hs_frac = labels["calo_hard_scatter_energy_frac"]
+            # Derive thresholds from the CaloHitMaskTask config
+            calo_mask_task = self.model.calo_tasks[0]
+            calo_mask_truth = (
+                (calo_hs_frac[cluster_node_mask] > calo_mask_task.hs_frac_threshold)
+                & (calo_hs_energy[cluster_node_mask] > calo_mask_task.hs_energy_threshold)
+            ).int()
 
             self.calo_mask_f1(calo_mask_prob, calo_mask_truth)
             self.log(f"{stage}/calo_mask_f1", self.calo_mask_f1, **kwargs)
@@ -253,8 +258,12 @@ class ODDPFlowTwoStream(ModelWrapper):
                 if "calo_mask" in calo_final:
                     calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
                     calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
+                    calo_hs_frac_flat = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
+                    calo_mask_task = self.model.calo_tasks[0]
                     self._val_cluster_data["mask_pred"].append((calo_prob_flat > 0.5).detach().cpu().numpy())
-                    self._val_cluster_data["mask_truth"].append((calo_hs_e_flat > 0.15).detach().cpu().numpy())
+                    self._val_cluster_data["mask_truth"].append(
+                        ((calo_hs_frac_flat > calo_mask_task.hs_frac_threshold) & (calo_hs_e_flat > calo_mask_task.hs_energy_threshold)).detach().cpu().numpy()
+                    )
 
                 # Per-event indices for grouping clusters by event
                 counts = cluster_node_mask.sum(dim=-1).cpu().numpy()  # (B,)
