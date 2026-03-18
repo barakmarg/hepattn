@@ -240,3 +240,57 @@ class MaskFormerDecoderLayer(nn.Module):
 
         if self.bidirectional_ca:
             self.kv_ca.fn.set_backend(attn_type)
+
+
+class BiCrossAttentionLayer(nn.Module):
+    """Bidirectional cross-attention layer.
+
+    stream_a cross-attends to stream_b -> FFN, then
+    stream_b cross-attends to (updated) stream_a -> FFN.
+
+    No self-attention, no mask attention.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        norm: str = "LayerNorm",
+        depth: int = 0,
+        dense_kwargs: dict | None = None,
+        attn_kwargs: dict | None = None,
+        hybrid_norm: bool = False,
+    ) -> None:
+        super().__init__()
+
+        qkv_norm = hybrid_norm
+        if depth == 0:
+            hybrid_norm = False
+        attn_norm = norm if not hybrid_norm else None
+        dense_post_norm = not hybrid_norm
+
+        attn_kwargs = attn_kwargs or {}
+        dense_kwargs = dense_kwargs or {}
+
+        residual = partial(Residual, dim=dim, norm=norm)
+
+        # stream_a attends to stream_b
+        self.a_ca = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
+        self.a_dense = residual(Dense(dim, **dense_kwargs), norm=norm, post_norm=dense_post_norm)
+
+        # stream_b attends to stream_a
+        self.b_ca = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
+        self.b_dense = residual(Dense(dim, **dense_kwargs), norm=norm, post_norm=dense_post_norm)
+
+    def forward(self, a: Tensor, b: Tensor, **kwargs) -> tuple[Tensor, Tensor]:
+        ab_kwargs = kwargs.get("ab_kwargs", {})
+        ba_kwargs = kwargs.get("ba_kwargs", {})
+
+        # stream_a cross-attends to stream_b
+        a = self.a_ca(a, kv=b, **ab_kwargs)
+        a = self.a_dense(a)
+
+        # stream_b cross-attends to (updated) stream_a
+        b = self.b_ca(b, kv=a, **ba_kwargs)
+        b = self.b_dense(b)
+
+        return a, b

@@ -24,7 +24,7 @@ class TwoStreamMaskFormer(nn.Module):
         encoder: nn.Module | None,
         track_decoder: MaskFormerDecoder,
         track_tasks: nn.ModuleList,
-        calo_decoder: MaskFormerDecoder,
+        calo_decoder: nn.Module,
         calo_tasks: nn.ModuleList,
         dim: int,
         max_hs_tracks: int = 200,
@@ -47,7 +47,6 @@ class TwoStreamMaskFormer(nn.Module):
         # Stream B
         self.calo_decoder = calo_decoder
         self.calo_tasks = calo_tasks
-        self.calo_decoder.tasks = calo_tasks
 
         self.dim = dim
         self.max_hs_tracks = max_hs_tracks

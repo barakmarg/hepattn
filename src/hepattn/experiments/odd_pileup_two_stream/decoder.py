@@ -1,7 +1,9 @@
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from hepattn.experiments.odd_pileup_maskformer.decoder import PileupMaskFormerDecoder
+from hepattn.models.attention import repad_from_flash_varlen, unpad_for_flash_varlen
+from hepattn.models.decoder import BiCrossAttentionLayer
 from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
 
 
@@ -82,3 +84,92 @@ class CaloMaskFormerDecoder(PileupMaskFormerDecoder):
                 x[input_name + "_embed"] = x["key_embed"][..., x[f"key_is_{input_name}"], :]
 
         return x, outputs
+
+
+class CaloFlashCrossAttentionDecoder(nn.Module):
+    """Pure bidirectional cross-attention decoder using flash-varlen.
+
+    Replaces MaskFormer decoder with bidirectional cross-attention between
+    hybrid track queries (learnable global calo token + HS track embeddings)
+    and calorimeter cluster embeddings.
+
+    No self-attention, no mask attention, no intermediate tasks.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_decoder_layers: int,
+        attn_kwargs: dict | None = None,
+        dense_kwargs: dict | None = None,
+        norm: str = "LayerNorm",
+        hybrid_norm: bool = False,
+    ) -> None:
+        super().__init__()
+
+        attn_kwargs = attn_kwargs or {}
+        dense_kwargs = dense_kwargs or {}
+
+        self.layers = nn.ModuleList([
+            BiCrossAttentionLayer(
+                dim=dim,
+                norm=norm,
+                depth=i,
+                dense_kwargs=dense_kwargs,
+                attn_kwargs=attn_kwargs,
+                hybrid_norm=hybrid_norm,
+            )
+            for i in range(num_decoder_layers)
+        ])
+
+        # Not used internally, but set for interface compatibility with model.py
+        self.preserve_posenc = False
+
+    def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
+        query_embed = x["query_embed"]  # (B, Q, D) — learnable calo token + HS tracks
+        query_valid = x["query_valid"]  # (B, Q)
+        key_embed = x["key_embed"]  # (B, N, D) — all nodes (tracks + calo)
+        key_valid = x["key_valid"]  # (B, N)
+        node_is_track = x["node_is_track"].bool().squeeze(-1)  # (B, N)
+
+        batch_size = query_embed.shape[0]
+        num_queries = query_embed.shape[-2]
+        num_keys = key_embed.shape[-2]
+
+        # Isolate calo nodes only
+        calo_mask = key_valid & ~node_is_track  # (B, N) — True for valid calo nodes
+
+        # Unpad both sequences for flash-varlen
+        q_flat, q_indices, q_varlen = unpad_for_flash_varlen(query_embed, query_valid)
+        kv_flat, kv_indices, kv_varlen = unpad_for_flash_varlen(key_embed, calo_mask)
+
+        # Build cross-attention varlen kwargs
+        ab_kwargs = {"varlen_kwargs": {
+            "cu_seqlens_q": q_varlen["cu_seqlens"],
+            "cu_seqlens_k": kv_varlen["cu_seqlens"],
+            "max_seqlen_q": q_varlen["max_seqlen"],
+            "max_seqlen_k": kv_varlen["max_seqlen"],
+        }}
+        ba_kwargs = {"varlen_kwargs": {
+            "cu_seqlens_q": kv_varlen["cu_seqlens"],
+            "cu_seqlens_k": q_varlen["cu_seqlens"],
+            "max_seqlen_q": kv_varlen["max_seqlen"],
+            "max_seqlen_k": q_varlen["max_seqlen"],
+        }}
+
+        # Run through layers (no intermediate tasks)
+        for layer in self.layers:
+            q_flat, kv_flat = layer(q_flat, kv_flat, ab_kwargs=ab_kwargs, ba_kwargs=ba_kwargs)
+
+        # Repad both sequences
+        x["query_embed"] = repad_from_flash_varlen(q_flat, batch_size, num_queries, q_indices)
+        calo_repadded = repad_from_flash_varlen(kv_flat, batch_size, num_keys, kv_indices)
+
+        # Scatter updated calo embeddings back into key_embed
+        x["key_embed"] = torch.where(calo_mask.unsqueeze(-1), calo_repadded, key_embed)
+
+        # Unmerge per-input-type embeddings
+        for input_name in input_names:
+            x[input_name + "_embed"] = x["key_embed"][..., x[f"key_is_{input_name}"], :]
+
+        return x, {}

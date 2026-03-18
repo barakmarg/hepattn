@@ -217,19 +217,14 @@ model:
       # Stream B: Calo Decoder + Tasks
       # =====================================================================
       calo_decoder:
-        class_path: hepattn.experiments.odd_pileup_two_stream.decoder.CaloMaskFormerDecoder
+        class_path: hepattn.experiments.odd_pileup_two_stream.decoder.CaloFlashCrossAttentionDecoder
         init_args:
-          prior_mask_key: "node_is_track"
+          dim: *dim
           num_decoder_layers: 4
-          num_queries: 191   # max_hs_tracks (190) + 1 global calo query
-          mask_attention: true
-          use_query_masks: false
-          decoder_layer_config:
-            dim: *dim
-            hybrid_norm: true
-            bidirectional_ca: false
-            attn_kwargs:
-              num_heads: 16
+          hybrid_norm: true
+          attn_kwargs:
+            num_heads: 16
+            attn_type: flash-varlen
 
       calo_tasks:
         class_path: torch.nn.ModuleList
@@ -250,7 +245,7 @@ model:
                 pred_threshold: 0.5
                 hs_energy_threshold: 0.15
                 hs_frac_threshold: 0.2
-                has_intermediate_loss: true
+                has_intermediate_loss: false
 
             # Task 2: Calo energy fraction regression (loss only on HS clusters)
             - class_path: hepattn.experiments.odd_pileup_two_stream.tasks.PileupCaloFractionTaskV2

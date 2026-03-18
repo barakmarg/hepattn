@@ -258,13 +258,22 @@ class Attention(nn.Module):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        cu_seqlens: Tensor,
-        max_seqlen: int,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int | None = None,
+        cu_seqlens_q: Tensor | None = None,
+        cu_seqlens_k: Tensor | None = None,
+        max_seqlen_q: int | None = None,
+        max_seqlen_k: int | None = None,
     ) -> Tensor:
         # Assume unpadding has been handled by the caller, so inputs are (1, total_valid_tokens, dim)
+        # For self-attention: pass cu_seqlens/max_seqlen (used for both Q and K)
+        # For cross-attention: pass cu_seqlens_q/k and max_seqlen_q/k separately
+        if cu_seqlens is not None:
+            cu_seqlens_q = cu_seqlens_k = cu_seqlens
+            max_seqlen_q = max_seqlen_k = max_seqlen
         # Flatten for flash attention which expects (total_valid_tokens, num_heads, head_dim)
         q_flat, k_flat, v_flat = q.squeeze(0), k.squeeze(0), v.squeeze(0)
-        out = self.attn(q_flat, k_flat, v_flat, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, window_size=self.window_size)
+        out = self.attn(q_flat, k_flat, v_flat, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, window_size=self.window_size)
         return out.view(q.shape[0], -1, self.dim)
 
     def forward(
