@@ -90,11 +90,11 @@ class ODDPFlowTwoStream(ModelWrapper):
                 )
 
         if cluster.get("mask_pred") is not None and len(cluster.get("mask_pred", [])) > 0:
-            for bin_key, bin_fig in PhysicsPlotter.plot_calo_mask_errors_by_energy(
-                cluster["mask_pred"], cluster["mask_truth"],
-                cluster["total_e"], cluster["true_hs_e"], cluster["pred_frac"],
-            ).items():
-                figs[f"calo/mask_errors_by_energy/{bin_key}"] = bin_fig
+            # for bin_key, bin_fig in PhysicsPlotter.plot_calo_mask_errors_by_energy(
+            #     cluster["mask_pred"], cluster["mask_truth"],
+            #     cluster["total_e"], cluster["true_hs_e"], cluster["pred_frac"],
+            # ).items():
+            #     figs[f"calo/mask_errors_by_energy/{bin_key}"] = bin_fig
             figs["calo/mistag_eta"] = PhysicsPlotter.plot_calo_mistag_vs_eta(
                 cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
             )

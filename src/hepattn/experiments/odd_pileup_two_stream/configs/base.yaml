@@ -43,9 +43,9 @@ data:
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: 1000
-  num_test: 1000
-  num_val: 1000
+  num_train: -1
+  num_test: -1
+  num_val: -1
 
   batch_size: 48
   incidence_cutval: 0.01
