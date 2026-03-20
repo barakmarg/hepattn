@@ -89,6 +89,15 @@ class ODDPFlowTwoStream(ModelWrapper):
                     cluster["true_hs_e"], cluster["event_idx"],
                 )
 
+        if cluster.get("calo_mask_probs") is not None and len(cluster.get("calo_mask_probs", [])) > 0:
+            figs["calo/mask_f1_vs_threshold"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold(
+                cluster["calo_mask_probs"], cluster["mask_truth"], cluster["total_e"],
+            )
+            if cluster.get("true_frac") is not None:
+                figs["calo/mask_f1_vs_threshold_by_hs_frac"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold_by_hs_frac(
+                    cluster["calo_mask_probs"], cluster["mask_truth"], cluster["true_frac"],
+                )
+
         if cluster.get("mask_pred") is not None and len(cluster.get("mask_pred", [])) > 0:
             # for bin_key, bin_fig in PhysicsPlotter.plot_calo_mask_errors_by_energy(
             #     cluster["mask_pred"], cluster["mask_truth"],
@@ -98,6 +107,21 @@ class ODDPFlowTwoStream(ModelWrapper):
             figs["calo/mistag_eta"] = PhysicsPlotter.plot_calo_mistag_vs_eta(
                 cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
             )
+            figs["calo/mask_metrics_vs_eta"] = PhysicsPlotter.plot_calo_mask_metrics_vs_eta(
+                cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
+            )
+            if cluster.get("phi") is not None:
+                figs["calo/mask_metrics_vs_phi"] = PhysicsPlotter.plot_calo_mask_metrics_vs_phi(
+                    cluster["mask_pred"], cluster["mask_truth"], cluster["phi"],
+                )
+            if cluster.get("total_e") is not None:
+                figs["calo/mask_metrics_vs_energy"] = PhysicsPlotter.plot_calo_mask_metrics_vs_cluster_energy(
+                    cluster["mask_pred"], cluster["mask_truth"], cluster["total_e"],
+                )
+            if cluster.get("true_frac") is not None:
+                figs["calo/mask_metrics_vs_hs_frac"] = PhysicsPlotter.plot_calo_mask_metrics_vs_hs_frac(
+                    cluster["mask_pred"], cluster["mask_truth"], cluster["true_frac"],
+                )
 
         if track.get("probs") is not None and len(track["probs"]) > 0:
             figs["track/score_dist"] = PhysicsPlotter.plot_track_score_distribution(
@@ -116,6 +140,9 @@ class ODDPFlowTwoStream(ModelWrapper):
                 track["probs"], track["truth"], track["eta"]
             )
             figs["track/score_by_pt"] = PhysicsPlotter.plot_track_score_by_pt(
+                track["probs"], track["truth"], track["pt"]
+            )
+            figs["track/f1_vs_threshold"] = PhysicsPlotter.plot_track_f1_vs_threshold(
                 track["probs"], track["truth"], track["pt"]
             )
             figs["track/roc"] = PhysicsPlotter.plot_roc_curve(
@@ -261,6 +288,7 @@ class ODDPFlowTwoStream(ModelWrapper):
                     calo_hs_frac_flat = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
                     calo_mask_task = self.model.calo_tasks[0]
                     self._val_cluster_data["mask_pred"].append((calo_prob_flat > 0.5).detach().cpu().numpy())
+                    self._val_cluster_data["calo_mask_probs"].append(calo_prob_flat.detach().float().cpu().numpy())
                     self._val_cluster_data["mask_truth"].append(
                         ((calo_hs_frac_flat > calo_mask_task.hs_frac_threshold) & (calo_hs_e_flat > calo_mask_task.hs_energy_threshold)).detach().cpu().numpy()
                     )

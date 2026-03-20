@@ -1,0 +1,19 @@
+# Profiling config overlay — run with:
+#   python main.py fit --config configs/base.yaml --config configs/profile.yaml
+#
+# Runs 5 warmup + 50 profiled training steps, prints a timing breakdown, then stops.
+
+trainer:
+  max_epochs: 1
+  limit_val_batches: 0
+  enable_checkpointing: false
+  logger: false
+  callbacks:
+    - class_path: hepattn.callbacks.ProfilingCallback
+      init_args:
+        warmup_steps: 5
+        active_steps: 50
+    - class_path: hepattn.callbacks.Compile
+    - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 10

@@ -166,6 +166,7 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
                     calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
                     calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
                     cluster_data["mask_pred"].append((calo_prob_flat > 0.5).cpu().numpy())
+                    cluster_data["calo_mask_probs"].append(calo_prob_flat.float().cpu().numpy())
                     cluster_data["mask_truth"].append((calo_hs_e_flat > 0.15).cpu().numpy())
 
                 # Per-event indices
@@ -215,6 +216,19 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
                   cluster_data["pred_frac"], cluster_data["total_e"],
                   cluster_data["true_hs_e"], cluster_data["event_idx"])
 
+    # ── Calo mask F1 vs threshold ──
+    if cluster_data.get("calo_mask_probs") is not None and len(cluster_data.get("calo_mask_probs", [])) > 0:
+        _plot("calo/mask_f1_vs_threshold", PhysicsPlotter.plot_calo_mask_f1_vs_threshold,
+              cluster_data["calo_mask_probs"], cluster_data["mask_truth"], cluster_data["total_e"])
+        if cluster_data.get("true_frac") is not None:
+            _plot("calo/mask_f1_vs_threshold_by_hs_frac", PhysicsPlotter.plot_calo_mask_f1_vs_threshold_by_hs_frac,
+                  cluster_data["calo_mask_probs"], cluster_data["mask_truth"], cluster_data["true_frac"])
+
+    # ── HS fraction category counts ──
+    if cluster_data.get("true_frac") is not None and len(cluster_data.get("true_frac", [])) > 0:
+        _plot("calo/hs_frac_category_counts", PhysicsPlotter.plot_calo_hs_frac_category_counts,
+              cluster_data["true_frac"])
+
     # ── Cluster swap ΔR ──
     if cluster_data.get("mask_pred") is not None and len(cluster_data.get("mask_pred", [])) > 0:
         is_fn = cluster_data["mask_truth"].astype(bool) & ~cluster_data["mask_pred"].astype(bool)
@@ -228,6 +242,17 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
         print(f"  {'calo/mask_errors_by_energy':<40s} {time.perf_counter() - t0:.2f}s")
         _plot("calo/mistag_eta", PhysicsPlotter.plot_calo_mistag_vs_eta,
               cluster_data["mask_pred"], cluster_data["mask_truth"], cluster_data["eta"])
+        _plot("calo/mask_metrics_vs_eta", PhysicsPlotter.plot_calo_mask_metrics_vs_eta,
+              cluster_data["mask_pred"], cluster_data["mask_truth"], cluster_data["eta"])
+        if cluster_data.get("phi") is not None:
+            _plot("calo/mask_metrics_vs_phi", PhysicsPlotter.plot_calo_mask_metrics_vs_phi,
+                  cluster_data["mask_pred"], cluster_data["mask_truth"], cluster_data["phi"])
+        if cluster_data.get("total_e") is not None:
+            _plot("calo/mask_metrics_vs_energy", PhysicsPlotter.plot_calo_mask_metrics_vs_cluster_energy,
+                  cluster_data["mask_pred"], cluster_data["mask_truth"], cluster_data["total_e"])
+        if cluster_data.get("true_frac") is not None:
+            _plot("calo/mask_metrics_vs_hs_frac", PhysicsPlotter.plot_calo_mask_metrics_vs_hs_frac,
+                  cluster_data["mask_pred"], cluster_data["mask_truth"], cluster_data["true_frac"])
 
     # ── Track plots ──
     if track_data.get("probs") is not None and len(track_data.get("probs", [])) > 0:
@@ -242,6 +267,8 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
         _plot("track/mistag_eta", PhysicsPlotter.plot_mistag_rate_vs_eta,
               track_data["probs"], track_data["truth"], track_data["eta"])
         _plot("track/score_by_pt", PhysicsPlotter.plot_track_score_by_pt,
+              track_data["probs"], track_data["truth"], track_data["pt"])
+        _plot("track/f1_vs_threshold", PhysicsPlotter.plot_track_f1_vs_threshold,
               track_data["probs"], track_data["truth"], track_data["pt"])
         _plot("track/roc", PhysicsPlotter.plot_roc_curve,
               track_data["probs"], track_data["truth"])

@@ -254,7 +254,7 @@ model:
                 input_hit: node
                 input_object: query
                 dim: *dim
-                loss_weight: 1.0
+                loss_weight: 0.1
                 signal_weight: 25.3
                 hs_energy_threshold: 0.15
                 hs_frac_threshold: 0.2

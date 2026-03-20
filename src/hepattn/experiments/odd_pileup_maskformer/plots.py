@@ -447,6 +447,340 @@ class PhysicsPlotter:
         return fig
 
     @staticmethod
+    def plot_track_f1_vs_threshold(probs: np.ndarray, truth: np.ndarray, pt: np.ndarray) -> Figure:
+        """Track F1 vs classification threshold, one line per pT bin [0,1,2,5,10,20,∞] GeV."""
+        thresholds = np.round(np.arange(0.1, 1.0, 0.1), 1)
+        bin_edges = [0, 1, 2, 5, 10, 20, np.inf]
+        bin_labels = ["0–1 GeV", "1–2 GeV", "2–5 GeV", "5–10 GeV", "10–20 GeV", "> 20 GeV"]
+        colors = cm.plasma(np.linspace(0, 0.88, len(bin_labels)))
+        is_true_hs = truth == 1
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for (lo, hi), label, color in zip(zip(bin_edges[:-1], bin_edges[1:]), bin_labels, colors):
+            m = (pt >= lo) & (pt < hi)
+            if m.sum() < 5:
+                continue
+            f1_vals = []
+            for thr in thresholds:
+                is_pred = probs[m] > thr
+                tp = (is_pred & is_true_hs[m]).sum()
+                fp = (is_pred & ~is_true_hs[m]).sum()
+                fn = (~is_pred & is_true_hs[m]).sum()
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1_vals.append(2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0)
+            ax.plot(thresholds, f1_vals, "o-", color=color, label=label)
+
+        ax.axvline(0.5, color="gray", lw=1, ls=":", label="Default (0.5)")
+        ax.set_xlabel("Classification Threshold")
+        ax.set_ylabel("F1 Score")
+        ax.set_ylim(0, 1.05)
+        ax.set_xticks(thresholds)
+        ax.set_title("Track F1 vs Threshold by pT Bin")
+        ax.legend(title="Track pT", bbox_to_anchor=(1.05, 1), loc="upper left")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_mask_f1_vs_threshold(probs: np.ndarray, truth: np.ndarray, total_e: np.ndarray) -> Figure:
+        """Calo mask F1 vs classification threshold, one line per cluster energy bin [0,1,2,5,10,20,∞] GeV."""
+        thresholds = np.round(np.arange(0.1, 1.0, 0.1), 1)
+        bin_edges = [0, 1, 2, 5, 10, 20, np.inf]
+        bin_labels = ["0–1 GeV", "1–2 GeV", "2–5 GeV", "5–10 GeV", "10–20 GeV", "> 20 GeV"]
+        colors = cm.plasma(np.linspace(0, 0.88, len(bin_labels)))
+        is_true_hs = truth.astype(bool)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for (lo, hi), label, color in zip(zip(bin_edges[:-1], bin_edges[1:]), bin_labels, colors):
+            m = (total_e >= lo) & (total_e < hi)
+            if m.sum() < 5:
+                continue
+            f1_vals = []
+            for thr in thresholds:
+                is_pred = probs[m] > thr
+                tp = (is_pred & is_true_hs[m]).sum()
+                fp = (is_pred & ~is_true_hs[m]).sum()
+                fn = (~is_pred & is_true_hs[m]).sum()
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1_vals.append(2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0)
+            ax.plot(thresholds, f1_vals, "o-", color=color, label=label)
+
+        ax.axvline(0.5, color="gray", lw=1, ls=":", label="Default (0.5)")
+        ax.set_xlabel("Classification Threshold")
+        ax.set_ylabel("F1 Score")
+        ax.set_ylim(0, 1.05)
+        ax.set_xticks(thresholds)
+        ax.set_title("Calo Mask F1 vs Threshold by Cluster Energy Bin")
+        ax.legend(title="Cluster Energy", bbox_to_anchor=(1.05, 1), loc="upper left")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_mask_f1_vs_threshold_by_hs_frac(
+        probs: np.ndarray, truth: np.ndarray, true_frac: np.ndarray,
+    ) -> Figure:
+        """Calo mask F1 vs classification threshold, one line per HS fraction bin [0,0.2,0.4,...,1.0]."""
+        thresholds = np.round(np.arange(0.1, 1.0, 0.1), 1)
+        bin_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        bin_labels = ["0.0–0.2", "0.2–0.4", "0.4–0.6", "0.6–0.8", "0.8–1.0"]
+        colors = cm.viridis(np.linspace(0.05, 0.92, len(bin_labels)))
+        is_true_hs = truth.astype(bool)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for (lo, hi), label, color in zip(zip(bin_edges[:-1], bin_edges[1:]), bin_labels, colors):
+            m = (true_frac >= lo) & (true_frac < hi)
+            if m.sum() < 5:
+                continue
+            f1_vals = []
+            for thr in thresholds:
+                is_pred = probs[m] > thr
+                tp = (is_pred & is_true_hs[m]).sum()
+                fp = (is_pred & ~is_true_hs[m]).sum()
+                fn = (~is_pred & is_true_hs[m]).sum()
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1_vals.append(2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0)
+            ax.plot(thresholds, f1_vals, "o-", color=color, label=label)
+
+        ax.axvline(0.5, color="gray", lw=1, ls=":", label="Default (0.5)")
+        ax.set_xlabel("Classification Threshold")
+        ax.set_ylabel("F1 Score")
+        ax.set_ylim(0, 1.05)
+        ax.set_xticks(thresholds)
+        ax.set_title("Calo Mask F1 vs Threshold by HS Fraction Bin")
+        ax.legend(title="E_HS / E_cluster", bbox_to_anchor=(1.05, 1), loc="upper left")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_hs_frac_category_counts(true_frac: np.ndarray) -> Figure:
+        """Bar chart of calo hit counts by HS fraction category.
+
+        Bins (exclusive):
+            frac = 0          pure pileup
+            0 < frac ≤ 1%
+            1% < frac ≤ 5%
+            5% < frac ≤ 10%
+            frac > 10%
+        Plus total as a dashed line annotation.
+        """
+        frac = np.asarray(true_frac, dtype=float)
+        total = len(frac)
+
+        labels = [
+            "frac = 0",
+            "0 < frac ≤ 1%",
+            "1% < frac ≤ 5%",
+            "5% < frac ≤ 10%",
+            "frac > 10%",
+        ]
+        masks = [
+            frac == 0,
+            (frac > 0) & (frac <= 0.01),
+            (frac > 0.01) & (frac <= 0.05),
+            (frac > 0.05) & (frac <= 0.10),
+            frac > 0.10,
+        ]
+        counts = [m.sum() for m in masks]
+        colors = ["#4c72b0", "#55a868", "#c44e52", "#dd8452", "#8172b2"]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        bars = ax.bar(labels, counts, color=colors, edgecolor="white", linewidth=0.5)
+        for bar, cnt in zip(bars, counts):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() * 1.02,
+                f"{cnt:,}\n({100 * cnt / total:.1f}%)" if total > 0 else "0",
+                ha="center", va="bottom", fontsize=8,
+            )
+        ax.axhline(total, color="gray", lw=1.2, ls="--", label=f"Total = {total:,}")
+        ax.set_ylabel("Number of Calo Hits")
+        ax.set_title("Calo Hits by HS Energy Fraction Category")
+        ax.set_yscale("log")
+        ax.legend()
+        ax.grid(True, axis="y", alpha=0.3)
+        plt.xticks(rotation=15, ha="right")
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_mask_metrics_vs_eta(
+        mask_pred: np.ndarray, mask_truth: np.ndarray,
+        eta: np.ndarray,
+    ) -> Figure:
+        """F1 and Recall vs cluster η."""
+        mask_pred = mask_pred.astype(bool)
+        mask_truth = mask_truth.astype(bool)
+
+        bins = np.linspace(-5, 5, 26)
+        centers = (bins[:-1] + bins[1:]) / 2
+
+        f1_vals, recall_vals = [], []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            m = (eta >= lo) & (eta < hi)
+            if m.sum() > 0:
+                tp = (mask_pred[m] & mask_truth[m]).sum()
+                fp = (mask_pred[m] & ~mask_truth[m]).sum()
+                fn = (~mask_pred[m] & mask_truth[m]).sum()
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+                f1_vals.append(f1)
+                recall_vals.append(rec)
+            else:
+                f1_vals.append(np.nan)
+                recall_vals.append(np.nan)
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(centers, f1_vals, "o-", color="steelblue", label="F1")
+        ax.plot(centers, recall_vals, "s-", color="tomato", label="Recall")
+        ax.axhline(1.0, color="gray", lw=1, ls="--")
+        ax.set_xlabel("Cluster η")
+        ax.set_ylabel("Score")
+        ax.set_ylim(0, 1.1)
+        ax.set_title("Calo Mask F1 and Recall vs η")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_mask_metrics_vs_phi(
+        mask_pred: np.ndarray, mask_truth: np.ndarray,
+        phi: np.ndarray,
+    ) -> Figure:
+        """F1 and Recall vs cluster φ."""
+        mask_pred = mask_pred.astype(bool)
+        mask_truth = mask_truth.astype(bool)
+
+        bins = np.linspace(-np.pi, np.pi, 26)
+        centers = (bins[:-1] + bins[1:]) / 2
+
+        f1_vals, recall_vals = [], []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            m = (phi >= lo) & (phi < hi)
+            if m.sum() > 0:
+                tp = (mask_pred[m] & mask_truth[m]).sum()
+                fp = (mask_pred[m] & ~mask_truth[m]).sum()
+                fn = (~mask_pred[m] & mask_truth[m]).sum()
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+                f1_vals.append(f1)
+                recall_vals.append(rec)
+            else:
+                f1_vals.append(np.nan)
+                recall_vals.append(np.nan)
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(centers, f1_vals, "o-", color="steelblue", label="F1")
+        ax.plot(centers, recall_vals, "s-", color="tomato", label="Recall")
+        ax.axhline(1.0, color="gray", lw=1, ls="--")
+        ax.set_xlabel("Cluster φ [rad]")
+        ax.set_ylabel("Score")
+        ax.set_ylim(0, 1.1)
+        ax.set_title("Calo Mask F1 and Recall vs φ")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_mask_metrics_vs_cluster_energy(
+        mask_pred: np.ndarray, mask_truth: np.ndarray,
+        total_e: np.ndarray,
+    ) -> Figure:
+        """F1 and Recall vs cluster total energy (log-spaced bins)."""
+        mask_pred = mask_pred.astype(bool)
+        mask_truth = mask_truth.astype(bool)
+
+        e_pos = total_e[total_e > 0]
+        if len(e_pos) == 0:
+            fig, ax = plt.subplots()
+            ax.text(0.5, 0.5, "No clusters with E > 0", ha="center", va="center")
+            return fig
+
+        emin = max(np.percentile(e_pos, 1), 1e-2)
+        emax = np.percentile(e_pos, 99)
+        bins = np.logspace(np.log10(emin), np.log10(emax), 25)
+        centers = np.sqrt(bins[:-1] * bins[1:])
+
+        f1_vals, recall_vals = [], []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            m = (total_e >= lo) & (total_e < hi)
+            if m.sum() > 0:
+                tp = (mask_pred[m] & mask_truth[m]).sum()
+                fp = (mask_pred[m] & ~mask_truth[m]).sum()
+                fn = (~mask_pred[m] & mask_truth[m]).sum()
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+                f1_vals.append(f1)
+                recall_vals.append(rec)
+            else:
+                f1_vals.append(np.nan)
+                recall_vals.append(np.nan)
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(centers, f1_vals, "o-", color="steelblue", label="F1")
+        ax.plot(centers, recall_vals, "s-", color="tomato", label="Recall")
+        ax.axhline(1.0, color="gray", lw=1, ls="--")
+        ax.set_xscale("log")
+        ax.set_xlabel("Cluster Total Energy [GeV]")
+        ax.set_ylabel("Score")
+        ax.set_ylim(0, 1.1)
+        ax.set_title("Calo Mask F1 and Recall vs Cluster Energy")
+        ax.legend()
+        ax.grid(True, which="both", alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_mask_metrics_vs_hs_frac(
+        mask_pred: np.ndarray, mask_truth: np.ndarray,
+        true_frac: np.ndarray,
+    ) -> Figure:
+        """F1 and Recall vs true HS energy fraction (E_HS / E_cluster)."""
+        mask_pred = mask_pred.astype(bool)
+        mask_truth = mask_truth.astype(bool)
+
+        bins = np.linspace(0, 1, 26)
+        centers = (bins[:-1] + bins[1:]) / 2
+
+        f1_vals, recall_vals = [], []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            m = (true_frac >= lo) & (true_frac < hi)
+            if m.sum() > 0:
+                tp = (mask_pred[m] & mask_truth[m]).sum()
+                fp = (mask_pred[m] & ~mask_truth[m]).sum()
+                fn = (~mask_pred[m] & mask_truth[m]).sum()
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+                f1_vals.append(f1)
+                recall_vals.append(rec)
+            else:
+                f1_vals.append(np.nan)
+                recall_vals.append(np.nan)
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(centers, f1_vals, "o-", color="steelblue", label="F1")
+        ax.plot(centers, recall_vals, "s-", color="tomato", label="Recall")
+        ax.axhline(1.0, color="gray", lw=1, ls="--")
+        ax.set_xlabel("True HS Fraction (E_HS / E_cluster)")
+        ax.set_ylabel("Score")
+        ax.set_ylim(0, 1.1)
+        ax.set_title("Calo Mask F1 and Recall vs HS Energy Fraction")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
     def plot_roc_curve(probs: np.ndarray, truth: np.ndarray) -> Figure:
         """ROC curve with AUC score."""
         from sklearn.metrics import auc, roc_curve

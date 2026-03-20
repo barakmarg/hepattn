@@ -4,6 +4,7 @@ from hepattn.callbacks.compile import Compile
 from hepattn.callbacks.gradient_logger import GradientLoggerCallback
 from hepattn.callbacks.inference_timer import InferenceTimer
 from hepattn.callbacks.prediction_writer import PredictionWriter
+from hepattn.callbacks.profiling import ProfilingCallback
 from hepattn.callbacks.saveconfig import SaveConfig
 from hepattn.callbacks.target_stats import TargetStats
 from hepattn.callbacks.throughput_monitor import MyThroughputMonitor
@@ -17,6 +18,7 @@ __all__ = [
     "InferenceTimer",
     "MyThroughputMonitor",
     "PredictionWriter",
+    "ProfilingCallback",
     "SaveConfig",
     "TargetStats",
     "WeightLoggerCallback",

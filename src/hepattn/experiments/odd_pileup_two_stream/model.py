@@ -18,6 +18,29 @@ class TwoStreamMaskFormer(nn.Module):
     execute a second MaskFormer loop over calo nodes using masked cross-attention.
     """
 
+    # ------------------------------------------------------------------
+    # Lightweight profiling helpers (zero cost when _profiling is False)
+    # ------------------------------------------------------------------
+    _profiling: bool = False
+    _markers: list = []
+    _section_times: dict = {}
+
+    def _mark(self, name: str):
+        if self._profiling:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self._markers.append((name, event))
+
+    def _collect_section_times(self):
+        if not self._profiling or len(self._markers) < 2:
+            return
+        torch.cuda.synchronize()
+        self._section_times = {}
+        for i in range(1, len(self._markers)):
+            name = self._markers[i][0]
+            elapsed = self._markers[i - 1][1].elapsed_time(self._markers[i][1])
+            self._section_times[name] = elapsed
+
     def __init__(
         self,
         input_nets: nn.ModuleList,
@@ -64,6 +87,9 @@ class TwoStreamMaskFormer(nn.Module):
         self.tasks = nn.ModuleList([*track_tasks, *calo_tasks])
 
     def forward(self, inputs: dict[str, Tensor]) -> dict[str, Tensor]:
+        self._markers = []
+        self._mark("start")
+
         input_names = [input_net.input_name for input_net in self.input_nets]
 
         assert "key" not in input_names, "'key' input name is reserved."
@@ -107,9 +133,13 @@ class TwoStreamMaskFormer(nn.Module):
                 [inputs[input_name + "_" + self.input_sort_field] for input_name in input_names], dim=-1
             )
 
+        self._mark("input_nets")
+
         # Shared encoder
         if self.encoder is not None:
             x["key_embed"] = self.encoder(x["key_embed"], x_sort_value=x.get(f"key_{self.input_sort_field}"), kv_mask=x.get("key_valid"))
+
+        self._mark("encoder")
 
         # Unmerge back to per-input-type embeddings
         for input_name in input_names:
@@ -133,6 +163,8 @@ class TwoStreamMaskFormer(nn.Module):
             if isinstance(task, ObjectClassificationTask):
                 x_track["class_probs"] = track_outputs["final"][task.name][task.outputs[0]].detach()
 
+        self._mark("track_decoder")
+
         # =====================================================================
         # BRIDGE: Construct Hybrid Calo Queries
         # =====================================================================
@@ -153,6 +185,8 @@ class TwoStreamMaskFormer(nn.Module):
             node_embed_detached, hs_track_mask, batch_size
         )
 
+        self._mark("bridge")
+
         # =====================================================================
         # STREAM B: Calo MaskFormer
         # =====================================================================
@@ -171,6 +205,8 @@ class TwoStreamMaskFormer(nn.Module):
             if isinstance(task, ObjectClassificationTask):
                 x_calo["class_probs"] = calo_outputs["final"][task.name][task.outputs[0]].detach()
 
+        self._mark("calo_decoder")
+
         # =====================================================================
         # COMBINE OUTPUTS from both streams
         # =====================================================================
@@ -180,6 +216,7 @@ class TwoStreamMaskFormer(nn.Module):
         for layer_name, layer_out in calo_outputs.items():
             outputs[f"calo_{layer_name}"] = layer_out
 
+        self._collect_section_times()
         return outputs
 
     def _build_hybrid_queries(
@@ -226,6 +263,8 @@ class TwoStreamMaskFormer(nn.Module):
         return queries, valid
 
     def loss(self, outputs: dict, targets: dict) -> dict:
+        self._mark("loss_start")
+
         losses = {}
 
         for layer_name, layer_out in outputs.items():
@@ -246,6 +285,8 @@ class TwoStreamMaskFormer(nn.Module):
                     if task.name in layer_out:
                         losses[layer_name][task.name] = task.loss(layer_out[task.name], targets)
 
+        self._mark("loss")
+        self._collect_section_times()
         return losses
 
     def predict(self, outputs: dict) -> dict:
