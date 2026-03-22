@@ -196,7 +196,8 @@ class ODDDatasetPileup(Dataset):
         cluster_vars = ["total_cluster_energy", "cluster_rho",
                         "cluster_eta", "cluster_phi",
                         "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
-        deps_vars = ["hard_scatter_energy_deps_in_cluster", "cluster_idx"]
+        deps_vars = ["hard_scatter_energy_deps_in_cluster", "cluster_idx",
+                     "hs_neutral_energy_in_cluster", "hs_charged_energy_in_cluster"]
 
         if num_events != -1:
             pbar = tqdm(total=num_events, desc="Loading Events", unit="evt")
@@ -528,7 +529,15 @@ class ODDDatasetPileup(Dataset):
         d_energy_hard_scatter_frac[d_cluster_idx] = d_energy_hard_scatter /(c_e[d_cluster_idx] + 1e-6)
         d_energy_hard_scatter_energy = torch.zeros_like(c_e)
         d_energy_hard_scatter_energy[d_cluster_idx] = d_energy_hard_scatter
-        
+
+        # --- Split HS energy by neutral (trackless) vs charged (tracked) particles ---
+        d_neutral = get_t("deps_hs_neutral_energy_in_cluster", d_start, d_end)
+        d_charged = get_t("deps_hs_charged_energy_in_cluster", d_start, d_end)
+        hs_neutral_energy = torch.zeros_like(c_e)
+        hs_charged_energy = torch.zeros_like(c_e)
+        hs_neutral_energy[d_cluster_idx] = d_neutral
+        hs_charged_energy[d_cluster_idx] = d_charged
+
         node_features = {
             # Common freatures
             "phi": torch.cat([t_phi, c_phi], -1), # Usually not scaled, pos encoded
@@ -575,6 +584,8 @@ class ODDDatasetPileup(Dataset):
             "node_eta": torch.cat([t_eta, c_eta], -1),
             "node_phi": torch.cat([t_phi, c_phi], -1),
             "node_z0":  torch.cat([t_z0,  torch.zeros(n_clusters, device=t_z0.device)], -1),
+            "calo_hs_neutral_energy": torch.cat([torch.zeros(n_tracks), hs_neutral_energy], -1),
+            "calo_hs_charged_energy": torch.cat([torch.zeros(n_tracks), hs_charged_energy], -1),
         }
 
         # Compute Z-order (Morton) index from raw eta/phi for locality-preserving sort
@@ -651,6 +662,8 @@ class ODDDatasetPileup(Dataset):
         labels["node_eta"] = data_dict["node_raw_features"]["node_eta"]
         labels["node_phi"] = data_dict["node_raw_features"]["node_phi"]
         labels["node_z0"]  = data_dict["node_raw_features"]["node_z0"]
+        labels["calo_hs_neutral_energy"] = data_dict["node_raw_features"]["calo_hs_neutral_energy"]
+        labels["calo_hs_charged_energy"] = data_dict["node_raw_features"]["calo_hs_charged_energy"]
 
         labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
 
@@ -741,15 +754,29 @@ class ODDDatasetPileup(Dataset):
                     .collect()
                 )
 
+        # Build per-particle has_track lookup for neutral/charged energy split
+        _particles_exploded = (
+            df_particles.lazy()
+            .select("event_id", "particle_idx", "has_track")
+            .explode(["particle_idx", "has_track"])
+        )
+
         df_deps = (
             df_deps.lazy()
-            .select(pl.col("event_id"), pl.col("total_energy_deps_in_cluster"), pl.col("cluster_idx"))
-            .explode(["total_energy_deps_in_cluster", "cluster_idx"])
+            .select("event_id", "total_energy_deps_in_cluster", "cluster_idx", "particle_idx")
+            .explode(["total_energy_deps_in_cluster", "cluster_idx", "particle_idx"])
+            # Join with particles to get has_track per deposit
+            .join(_particles_exploded, on=["event_id", "particle_idx"], how="left")
+            .with_columns(pl.col("has_track").fill_null(False))
             .group_by("event_id", "cluster_idx", maintain_order=True)
-            .agg(pl.col("total_energy_deps_in_cluster").sum().alias("hard_scatter_energy_deps_in_cluster"))
-            .filter(pl.col("hard_scatter_energy_deps_in_cluster") > self.hard_scatter_energy_threshold) # Optional: keep only clusters with non-zero deposited energy
+            .agg(
+                pl.col("total_energy_deps_in_cluster").sum().alias("hard_scatter_energy_deps_in_cluster"),
+                pl.col("total_energy_deps_in_cluster").filter(~pl.col("has_track")).sum().alias("hs_neutral_energy_in_cluster"),
+                pl.col("total_energy_deps_in_cluster").filter(pl.col("has_track")).sum().alias("hs_charged_energy_in_cluster"),
+            )
+            .filter(pl.col("hard_scatter_energy_deps_in_cluster") > self.hard_scatter_energy_threshold)
             .group_by("event_id", maintain_order=True)
-            .agg('cluster_idx', 'hard_scatter_energy_deps_in_cluster')
+            .agg('cluster_idx', 'hard_scatter_energy_deps_in_cluster', 'hs_neutral_energy_in_cluster', 'hs_charged_energy_in_cluster')
             .collect()
         )
         return df_particles, df_clusters, df_deps, df_tracks

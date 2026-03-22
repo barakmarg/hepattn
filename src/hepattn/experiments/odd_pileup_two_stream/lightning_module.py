@@ -89,6 +89,16 @@ class ODDPFlowTwoStream(ModelWrapper):
                     cluster["true_hs_e"], cluster["event_idx"],
                 )
 
+        if cluster.get("evt_pred_neutral_e") is not None and len(cluster.get("evt_pred_neutral_e", [])) > 0:
+            figs["calo/hs_energy_residual_by_type"] = PhysicsPlotter.plot_hs_energy_residual_by_type(
+                cluster["evt_pred_neutral_e"], cluster["evt_truth_neutral_e"],
+                cluster["evt_pred_charged_e"], cluster["evt_truth_charged_e"],
+            )
+            figs["calo/hs_energy_ratio_by_type"] = PhysicsPlotter.plot_hs_energy_ratio_by_type(
+                cluster["evt_pred_neutral_e"], cluster["evt_truth_neutral_e"],
+                cluster["evt_pred_charged_e"], cluster["evt_truth_charged_e"],
+            )
+
         # if cluster.get("calo_mask_probs") is not None and len(cluster.get("calo_mask_probs", [])) > 0:
         #     figs["calo/mask_f1_vs_threshold"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold(
         #         cluster["calo_mask_probs"], cluster["mask_truth"], cluster["total_e"],
@@ -301,3 +311,25 @@ class ODDPFlowTwoStream(ModelWrapper):
                 )
                 self._val_cluster_data["event_idx"].append(event_indices)
                 self._val_event_counter += len(counts)
+
+                # Per-event neutral/charged HS energy (mask-weighted sums)
+                if "calo_mask" in calo_final:
+                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > 0.5).float()  # (B, N)
+                    calo_mask_task = self.model.calo_tasks[0]
+                    truth_mask_b = (
+                        (labels["calo_hard_scatter_energy_frac"] > calo_mask_task.hs_frac_threshold)
+                        & (labels["calo_hard_scatter_energy"] > calo_mask_task.hs_energy_threshold)
+                    ).float()  # (B, N)
+
+                    cluster_valid = cluster_node_mask.float()  # (B, N)
+                    neutral_e = labels["calo_hs_neutral_energy"]  # (B, N)
+                    charged_e = labels["calo_hs_charged_energy"]  # (B, N)
+
+                    self._val_cluster_data["evt_pred_neutral_e"].append(
+                        (pred_mask_b * cluster_valid * neutral_e).sum(dim=-1).detach().cpu().numpy())
+                    self._val_cluster_data["evt_truth_neutral_e"].append(
+                        (truth_mask_b * cluster_valid * neutral_e).sum(dim=-1).detach().cpu().numpy())
+                    self._val_cluster_data["evt_pred_charged_e"].append(
+                        (pred_mask_b * cluster_valid * charged_e).sum(dim=-1).detach().cpu().numpy())
+                    self._val_cluster_data["evt_truth_charged_e"].append(
+                        (truth_mask_b * cluster_valid * charged_e).sum(dim=-1).detach().cpu().numpy())

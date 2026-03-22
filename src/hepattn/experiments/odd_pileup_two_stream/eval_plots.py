@@ -161,6 +161,11 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
                 cluster_data["eta"].append(labels["node_eta"][cluster_node_mask].float().cpu().numpy())
                 cluster_data["phi"].append(labels["node_phi"][cluster_node_mask].float().cpu().numpy())
 
+                # Truth neutral/charged energy per cluster (for composition plot)
+                if "calo_hs_neutral_energy" in labels:
+                    cluster_data["neutral_e"].append(labels["calo_hs_neutral_energy"][cluster_node_mask].float().cpu().numpy())
+                    cluster_data["charged_e"].append(labels["calo_hs_charged_energy"][cluster_node_mask].float().cpu().numpy())
+
                 # Calo mask predictions for cluster swap plot
                 if "calo_mask" in calo_final:
                     calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
@@ -177,6 +182,27 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
                 )
                 cluster_data["event_idx"].append(event_indices)
                 event_counter += len(counts)
+
+                # Per-event neutral/charged HS energy (mask-weighted sums)
+                if "calo_mask" in calo_final and "calo_hs_neutral_energy" in labels:
+                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > 0.5).float()  # (B, N)
+                    truth_mask_b = (
+                        (labels["calo_hard_scatter_energy_frac"] > 0.05)
+                        & (labels["calo_hard_scatter_energy"] > 0.15)
+                    ).float()  # (B, N)
+
+                    cluster_valid = cluster_node_mask.float()  # (B, N)
+                    neutral_e = labels["calo_hs_neutral_energy"]  # (B, N)
+                    charged_e = labels["calo_hs_charged_energy"]  # (B, N)
+
+                    cluster_data["evt_pred_neutral_e"].append(
+                        (pred_mask_b * cluster_valid * neutral_e).sum(dim=-1).cpu().numpy())
+                    cluster_data["evt_truth_neutral_e"].append(
+                        (truth_mask_b * cluster_valid * neutral_e).sum(dim=-1).cpu().numpy())
+                    cluster_data["evt_pred_charged_e"].append(
+                        (pred_mask_b * cluster_valid * charged_e).sum(dim=-1).cpu().numpy())
+                    cluster_data["evt_truth_charged_e"].append(
+                        (truth_mask_b * cluster_valid * charged_e).sum(dim=-1).cpu().numpy())
 
             if (i + 1) % 10 == 0:
                 print(f"  Batch {i + 1} done")
@@ -199,6 +225,15 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
         figs[name] = fn(*args, **kwargs)
         print(f"  {name:<40s} {time.perf_counter() - t0:.2f}s")
 
+    # ── Calo energy composition (truth only) ──
+    if cluster_data.get("neutral_e") is not None and len(cluster_data.get("neutral_e", [])) > 0:
+        _plot("calo/neutral_energy_frac", PhysicsPlotter.plot_calo_neutral_energy_frac,
+              cluster_data["neutral_e"], cluster_data["total_e"])
+        _plot("calo/charged_energy_frac", PhysicsPlotter.plot_calo_charged_energy_frac,
+              cluster_data["charged_e"], cluster_data["total_e"])
+        _plot("calo/cluster_energy_dist", PhysicsPlotter.plot_calo_cluster_energy_dist,
+              cluster_data["total_e"])
+
     # ── Calo fraction plots ──
     if cluster_data.get("pred_frac") is not None and len(cluster_data.get("pred_frac", [])) > 0:
         _plot("calo/energy_corr", PhysicsPlotter.plot_energy_correlation,
@@ -216,6 +251,15 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
                   cluster_data["pred_frac"], cluster_data["total_e"],
                   cluster_data["true_hs_e"], cluster_data["event_idx"])
 
+    # ── Per-event neutral/charged HS energy histograms ──
+    if cluster_data.get("evt_pred_neutral_e") is not None and len(cluster_data.get("evt_pred_neutral_e", [])) > 0:
+        _plot("calo/hs_energy_residual_by_type", PhysicsPlotter.plot_hs_energy_residual_by_type,
+              cluster_data["evt_pred_neutral_e"], cluster_data["evt_truth_neutral_e"],
+              cluster_data["evt_pred_charged_e"], cluster_data["evt_truth_charged_e"])
+        _plot("calo/hs_energy_ratio_by_type", PhysicsPlotter.plot_hs_energy_ratio_by_type,
+              cluster_data["evt_pred_neutral_e"], cluster_data["evt_truth_neutral_e"],
+              cluster_data["evt_pred_charged_e"], cluster_data["evt_truth_charged_e"])
+
     # ── Calo mask F1 vs threshold ──
     if cluster_data.get("calo_mask_probs") is not None and len(cluster_data.get("calo_mask_probs", [])) > 0:
         _plot("calo/mask_f1_vs_threshold", PhysicsPlotter.plot_calo_mask_f1_vs_threshold,
@@ -223,6 +267,15 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
         if cluster_data.get("true_frac") is not None:
             _plot("calo/mask_f1_vs_threshold_by_hs_frac", PhysicsPlotter.plot_calo_mask_f1_vs_threshold_by_hs_frac,
                   cluster_data["calo_mask_probs"], cluster_data["mask_truth"], cluster_data["true_frac"])
+
+        # ── F1 & recall split by neutral vs charged cluster type ──
+        if cluster_data.get("neutral_e") is not None:
+            _plot("calo/mask_f1_recall_neutral_clusters", PhysicsPlotter.plot_calo_mask_f1_recall_neutral,
+                  cluster_data["calo_mask_probs"], cluster_data["mask_truth"],
+                  cluster_data["neutral_e"], cluster_data["charged_e"])
+            _plot("calo/mask_f1_recall_charged_clusters", PhysicsPlotter.plot_calo_mask_f1_recall_charged,
+                  cluster_data["calo_mask_probs"], cluster_data["mask_truth"],
+                  cluster_data["neutral_e"], cluster_data["charged_e"])
 
     # ── HS fraction category counts ──
     if cluster_data.get("true_frac") is not None and len(cluster_data.get("true_frac", [])) > 0:

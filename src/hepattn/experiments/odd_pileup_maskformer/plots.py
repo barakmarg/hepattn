@@ -239,6 +239,148 @@ class PhysicsPlotter:
         return fig
 
     @staticmethod
+    def plot_calo_neutral_energy_frac(neutral_e: np.ndarray, total_e: np.ndarray) -> Figure:
+        """Histogram of neutral HS energy fraction (%) per cluster (truth only)."""
+        total_safe = np.where(total_e > 0, total_e, 1.0)
+        neutral_pct = neutral_e / total_safe * 100.0
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(neutral_pct, bins=100, range=(0, 100), color="steelblue", alpha=0.8, edgecolor="none")
+        mean_n = neutral_pct[total_e > 0].mean() if (total_e > 0).any() else 0.0
+        ax.axvline(mean_n, color="red", lw=1.5, ls="--", label=f"mean={mean_n:.1f}%")
+        ax.set_xlabel("Neutral HS Energy / Total Cluster Energy  [%]")
+        ax.set_ylabel("Clusters")
+        ax.set_yscale("log")
+        ax.set_title("Neutral HS Energy Fraction per Cluster  (Truth)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_charged_energy_frac(charged_e: np.ndarray, total_e: np.ndarray) -> Figure:
+        """Histogram of charged HS energy fraction (%) per cluster (truth only)."""
+        total_safe = np.where(total_e > 0, total_e, 1.0)
+        charged_pct = charged_e / total_safe * 100.0
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(charged_pct, bins=100, range=(0, 100), color="darkorange", alpha=0.8, edgecolor="none")
+        mean_c = charged_pct[total_e > 0].mean() if (total_e > 0).any() else 0.0
+        ax.axvline(mean_c, color="red", lw=1.5, ls="--", label=f"mean={mean_c:.1f}%")
+        ax.set_xlabel("Charged HS Energy / Total Cluster Energy  [%]")
+        ax.set_ylabel("Clusters")
+        ax.set_yscale("log")
+        ax.set_title("Charged HS Energy Fraction per Cluster  (Truth)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_cluster_energy_dist(total_e: np.ndarray) -> Figure:
+        """Histogram of total calo cluster energy (truth only)."""
+        valid = total_e[total_e > 0]
+        fig, ax = plt.subplots(figsize=(7, 5))
+        if len(valid) > 0:
+            lo = np.log10(valid.min())
+            hi = np.log10(np.percentile(valid, 99.5))
+            bins = np.logspace(lo, hi, 80)
+            ax.hist(valid, bins=bins, color="seagreen", alpha=0.8, edgecolor="none")
+            ax.set_xscale("log")
+        ax.set_xlabel("Total Cluster Energy  [GeV]")
+        ax.set_ylabel("Clusters")
+        ax.set_yscale("log")
+        ax.set_title("Total Calo Cluster Energy Distribution  (Truth)")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_hs_energy_residual_by_type(
+        pred_neutral: np.ndarray, truth_neutral: np.ndarray,
+        pred_charged: np.ndarray, truth_charged: np.ndarray,
+    ) -> Figure:
+        """Histogram of per-event energy residual (pred - truth), split by neutral/charged.
+
+        Inputs are per-event sums (already aggregated over clusters).
+        """
+        resid_neutral = pred_neutral - truth_neutral
+        resid_charged = pred_charged - truth_charged
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        if len(resid_neutral) == 0:
+            ax.text(0.5, 0.5, "No events", ha="center", va="center")
+            plt.tight_layout()
+            return fig
+
+        lo = min(np.percentile(resid_neutral, 1), np.percentile(resid_charged, 1))
+        hi = max(np.percentile(resid_neutral, 99), np.percentile(resid_charged, 99))
+        bins = np.linspace(lo, hi, 60)
+
+        ax.hist(resid_neutral, bins=bins, alpha=0.7, color="steelblue", label="Neutral (trackless)", edgecolor="none")
+        ax.hist(resid_charged, bins=bins, alpha=0.7, color="darkorange", label="Charged (tracked)", edgecolor="none")
+        ax.axvline(0.0, color="red", lw=1.5, ls="--", label="Ideal (0)")
+
+        ax.set_xlabel("Σ Predicted Mask HS Energy − Σ Truth Mask HS Energy  [GeV]")
+        ax.set_ylabel("Events")
+        ax.set_yscale("log")
+        ax.set_title("Per-Event HS Energy Residual by Particle Type")
+        ax.legend(title=(
+            f"Neutral: μ={resid_neutral.mean():.2f}, σ={resid_neutral.std():.2f}\n"
+            f"Charged: μ={resid_charged.mean():.2f}, σ={resid_charged.std():.2f}\n"
+            f"N={len(resid_neutral)}"
+        ))
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_hs_energy_ratio_by_type(
+        pred_neutral: np.ndarray, truth_neutral: np.ndarray,
+        pred_charged: np.ndarray, truth_charged: np.ndarray,
+    ) -> Figure:
+        """Histogram of per-event energy ratio (pred / truth), split by neutral/charged.
+
+        Inputs are per-event sums. Events with truth sum == 0 are excluded.
+        """
+        valid_n = truth_neutral > 0
+        valid_c = truth_charged > 0
+        ratio_neutral = pred_neutral[valid_n] / truth_neutral[valid_n]
+        ratio_charged = pred_charged[valid_c] / truth_charged[valid_c]
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        if len(ratio_neutral) == 0 and len(ratio_charged) == 0:
+            ax.text(0.5, 0.5, "No events with truth energy > 0", ha="center", va="center")
+            plt.tight_layout()
+            return fig
+
+        clip_n = np.clip(ratio_neutral, 0, 3) if len(ratio_neutral) > 0 else np.array([])
+        clip_c = np.clip(ratio_charged, 0, 3) if len(ratio_charged) > 0 else np.array([])
+        bins = np.linspace(0, 3, 60)
+
+        if len(clip_n) > 0:
+            ax.hist(clip_n, bins=bins, alpha=0.7, color="steelblue", label="Neutral (trackless)", edgecolor="none")
+        if len(clip_c) > 0:
+            ax.hist(clip_c, bins=bins, alpha=0.7, color="darkorange", label="Charged (tracked)", edgecolor="none")
+        ax.axvline(1.0, color="red", lw=1.5, ls="--", label="Ideal (1.0)")
+
+        ax.set_xlabel("Σ Predicted Mask HS Energy / Σ Truth Mask HS Energy  (per event)")
+        ax.set_ylabel("Events")
+        ax.set_yscale("log")
+        ax.set_title("Per-Event HS Energy Ratio by Particle Type")
+
+        legend_parts = []
+        if len(ratio_neutral) > 0:
+            legend_parts.append(f"Neutral: μ={ratio_neutral.mean():.3f}, σ={ratio_neutral.std():.3f}")
+        if len(ratio_charged) > 0:
+            legend_parts.append(f"Charged: μ={ratio_charged.mean():.3f}, σ={ratio_charged.std():.3f}")
+        legend_parts.append(f"N neutral={len(ratio_neutral)}, N charged={len(ratio_charged)}")
+        ax.legend(title="\n".join(legend_parts))
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
     def plot_track_score_distribution(probs: np.ndarray, truth: np.ndarray) -> Figure:
         """1D score histogram: HS tracks vs PU tracks overlaid."""
         fig, ax = plt.subplots(figsize=(7, 5))
@@ -553,6 +695,91 @@ class PhysicsPlotter:
         ax.set_title("Calo Mask F1 vs Threshold by HS Fraction Bin")
         ax.legend(title="E_HS / E_cluster", bbox_to_anchor=(1.05, 1), loc="upper left")
         ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def _compute_f1_recall_vs_threshold(probs: np.ndarray, truth: np.ndarray) -> tuple:
+        """Return (thresholds, f1_vals, recall_vals) arrays."""
+        thresholds = np.round(np.arange(0.05, 1.0, 0.05), 2)
+        is_true = truth.astype(bool)
+        f1_vals, rec_vals = [], []
+        for thr in thresholds:
+            pred = probs > thr
+            tp = (pred & is_true).sum()
+            fp = (pred & ~is_true).sum()
+            fn = (~pred & is_true).sum()
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1_vals.append(2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0)
+            rec_vals.append(rec)
+        return thresholds, np.array(f1_vals), np.array(rec_vals)
+
+    @staticmethod
+    def plot_calo_mask_f1_recall_neutral(
+        probs: np.ndarray, truth: np.ndarray,
+        neutral_e: np.ndarray, charged_e: np.ndarray,
+    ) -> Figure:
+        """F1 and recall vs threshold when ground truth = true HS neutral clusters.
+
+        Positive class: clusters where neutral_e > charged_e AND true HS.
+        Negative class: all other clusters.
+        Shows how well the model recovers HS energy from trackless particles.
+        """
+        is_true_hs = truth.astype(bool)
+        truth_neutral = ((neutral_e > charged_e) & is_true_hs).astype(int)
+        n_pos = truth_neutral.sum()
+
+        thresholds, f1_vals, rec_vals = PhysicsPlotter._compute_f1_recall_vs_threshold(probs, truth_neutral)
+
+        fig, (ax_f1, ax_rec) = plt.subplots(1, 2, figsize=(13, 5))
+        for ax, vals, ylabel in [
+            (ax_f1, f1_vals, "F1 Score"),
+            (ax_rec, rec_vals, "Recall"),
+        ]:
+            ax.plot(thresholds, vals, "o-", color="steelblue")
+            ax.axvline(0.5, color="gray", lw=1, ls=":", label="Default (0.5)")
+            ax.set_xlabel("Classification Threshold")
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(0, 1.05)
+            ax.set_title(f"True HS Neutral Clusters — {ylabel}  (n={n_pos})")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_calo_mask_f1_recall_charged(
+        probs: np.ndarray, truth: np.ndarray,
+        neutral_e: np.ndarray, charged_e: np.ndarray,
+    ) -> Figure:
+        """F1 and recall vs threshold when ground truth = true HS charged clusters.
+
+        Positive class: clusters where charged_e >= neutral_e AND true HS.
+        Negative class: all other clusters.
+        Shows how well the model recovers HS energy from tracked particles.
+        """
+        is_true_hs = truth.astype(bool)
+        truth_charged = ((charged_e >= neutral_e) & is_true_hs).astype(int)
+        n_pos = truth_charged.sum()
+
+        thresholds, f1_vals, rec_vals = PhysicsPlotter._compute_f1_recall_vs_threshold(probs, truth_charged)
+
+        fig, (ax_f1, ax_rec) = plt.subplots(1, 2, figsize=(13, 5))
+        for ax, vals, ylabel in [
+            (ax_f1, f1_vals, "F1 Score"),
+            (ax_rec, rec_vals, "Recall"),
+        ]:
+            ax.plot(thresholds, vals, "o-", color="darkorange")
+            ax.axvline(0.5, color="gray", lw=1, ls=":", label="Default (0.5)")
+            ax.set_xlabel("Classification Threshold")
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(0, 1.05)
+            ax.set_title(f"True HS Charged Clusters — {ylabel}  (n={n_pos})")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
         plt.tight_layout()
         return fig
 
