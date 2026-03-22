@@ -43,9 +43,9 @@ data:
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: -1
-  num_test: -1
-  num_val: -1
+  num_train: 1000
+  num_test: 1000
+  num_val: 1000
 
   batch_size: 48
   incidence_cutval: 0.01
@@ -107,7 +107,7 @@ model:
   model:
     class_path: hepattn.experiments.odd_pileup_two_stream.model.TwoStreamMaskFormer
     init_args:
-      dim: &dim 128
+      dim: &dim 256
       target_object: particle
       max_hs_tracks: 190
       teacher_forcing: true

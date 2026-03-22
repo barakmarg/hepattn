@@ -89,14 +89,14 @@ class ODDPFlowTwoStream(ModelWrapper):
                     cluster["true_hs_e"], cluster["event_idx"],
                 )
 
-        if cluster.get("calo_mask_probs") is not None and len(cluster.get("calo_mask_probs", [])) > 0:
-            figs["calo/mask_f1_vs_threshold"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold(
-                cluster["calo_mask_probs"], cluster["mask_truth"], cluster["total_e"],
-            )
-            if cluster.get("true_frac") is not None:
-                figs["calo/mask_f1_vs_threshold_by_hs_frac"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold_by_hs_frac(
-                    cluster["calo_mask_probs"], cluster["mask_truth"], cluster["true_frac"],
-                )
+        # if cluster.get("calo_mask_probs") is not None and len(cluster.get("calo_mask_probs", [])) > 0:
+        #     figs["calo/mask_f1_vs_threshold"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold(
+        #         cluster["calo_mask_probs"], cluster["mask_truth"], cluster["total_e"],
+        #     )
+        #     if cluster.get("true_frac") is not None:
+        #         figs["calo/mask_f1_vs_threshold_by_hs_frac"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold_by_hs_frac(
+        #             cluster["calo_mask_probs"], cluster["mask_truth"], cluster["true_frac"],
+        #         )
 
         if cluster.get("mask_pred") is not None and len(cluster.get("mask_pred", [])) > 0:
             # for bin_key, bin_fig in PhysicsPlotter.plot_calo_mask_errors_by_energy(
@@ -104,20 +104,20 @@ class ODDPFlowTwoStream(ModelWrapper):
             #     cluster["total_e"], cluster["true_hs_e"], cluster["pred_frac"],
             # ).items():
             #     figs[f"calo/mask_errors_by_energy/{bin_key}"] = bin_fig
-            figs["calo/mistag_eta"] = PhysicsPlotter.plot_calo_mistag_vs_eta(
-                cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
-            )
-            figs["calo/mask_metrics_vs_eta"] = PhysicsPlotter.plot_calo_mask_metrics_vs_eta(
-                cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
-            )
-            if cluster.get("phi") is not None:
-                figs["calo/mask_metrics_vs_phi"] = PhysicsPlotter.plot_calo_mask_metrics_vs_phi(
-                    cluster["mask_pred"], cluster["mask_truth"], cluster["phi"],
-                )
-            if cluster.get("total_e") is not None:
-                figs["calo/mask_metrics_vs_energy"] = PhysicsPlotter.plot_calo_mask_metrics_vs_cluster_energy(
-                    cluster["mask_pred"], cluster["mask_truth"], cluster["total_e"],
-                )
+            # figs["calo/mistag_eta"] = PhysicsPlotter.plot_calo_mistag_vs_eta(
+            #     cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
+            # )
+            # figs["calo/mask_metrics_vs_eta"] = PhysicsPlotter.plot_calo_mask_metrics_vs_eta(
+            #     cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
+            # )
+            # if cluster.get("phi") is not None:
+            #     figs["calo/mask_metrics_vs_phi"] = PhysicsPlotter.plot_calo_mask_metrics_vs_phi(
+            #         cluster["mask_pred"], cluster["mask_truth"], cluster["phi"],
+            #     )
+            # if cluster.get("total_e") is not None:
+            #     figs["calo/mask_metrics_vs_energy"] = PhysicsPlotter.plot_calo_mask_metrics_vs_cluster_energy(
+            #         cluster["mask_pred"], cluster["mask_truth"], cluster["total_e"],
+            #     )
             if cluster.get("true_frac") is not None:
                 figs["calo/mask_metrics_vs_hs_frac"] = PhysicsPlotter.plot_calo_mask_metrics_vs_hs_frac(
                     cluster["mask_pred"], cluster["mask_truth"], cluster["true_frac"],
@@ -142,12 +142,12 @@ class ODDPFlowTwoStream(ModelWrapper):
             figs["track/score_by_pt"] = PhysicsPlotter.plot_track_score_by_pt(
                 track["probs"], track["truth"], track["pt"]
             )
-            figs["track/f1_vs_threshold"] = PhysicsPlotter.plot_track_f1_vs_threshold(
-                track["probs"], track["truth"], track["pt"]
-            )
-            figs["track/roc"] = PhysicsPlotter.plot_roc_curve(
-                track["probs"], track["truth"]
-            )
+            # figs["track/f1_vs_threshold"] = PhysicsPlotter.plot_track_f1_vs_threshold(
+            #     track["probs"], track["truth"], track["pt"]
+            # )
+            # figs["track/roc"] = PhysicsPlotter.plot_roc_curve(
+            #     track["probs"], track["truth"]
+            # )
             if track.get("z0") is not None and len(track["z0"]) > 0:
                 figs["track/z0_dist"] = PhysicsPlotter.plot_track_z0_distribution(
                     track["probs"], track["truth"], track["z0"]

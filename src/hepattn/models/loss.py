@@ -113,6 +113,38 @@ def mask_dice_cost(pred_logits, targets, input_pad_mask=None, sample_weight=None
     return 1 - (numerator + 1) / (denominator + 1)
 
 
+def mask_tversky_loss(pred_logits, targets, alpha=0.2, beta=0.8, object_valid_mask=None, input_pad_mask=None, sample_weight=None):  # noqa: ARG001
+    """Tversky loss for asymmetric FP/FN penalization in mask prediction.
+
+    Generalizes Dice with separate weights for FP (alpha) and FN (beta).
+    Set beta > alpha to prioritize recall over precision.
+    With alpha=beta=0.5, this reduces to standard Dice loss.
+
+    Args:
+        pred_logits: [batch_size, num_objects, num_inputs] - predicted logits for binary masks
+        targets: [batch_size, num_objects, num_inputs] - ground truth binary masks
+        alpha: FP penalty weight (default 0.2)
+        beta: FN penalty weight (default 0.8)
+        object_valid_mask: [batch_size, num_objects] - mask indicating valid target objects
+        input_pad_mask: [batch_size, num_inputs] - mask indicating valid inputs
+        sample_weight: Not used by Tversky.
+    """
+    if object_valid_mask is not None:
+        pred_logits = pred_logits[object_valid_mask]
+        targets = targets[object_valid_mask]
+
+    probs = pred_logits.sigmoid()
+    if input_pad_mask is not None:
+        probs = probs * input_pad_mask.unsqueeze(1)
+
+    tp = (probs * targets).sum(-1)
+    fp = (probs * (1 - targets)).sum(-1)
+    fn = ((1 - probs) * targets).sum(-1)
+
+    tversky = (tp + 1) / (tp + alpha * fp + beta * fn + 1)
+    return (1 - tversky).mean()
+
+
 def mask_iou_cost(pred_logits, targets, input_pad_mask=None, eps=1e-6):
     # Apply input padding mask
     probs = pred_logits.sigmoid()
@@ -363,6 +395,7 @@ loss_fns = {
     "mask_bce": torch.compile(mask_bce_loss, dynamic=True),
     "mask_dice": torch.compile(mask_dice_loss, dynamic=True),
     "mask_focal": torch.compile(mask_focal_loss, dynamic=True),
+    "mask_tversky": torch.compile(mask_tversky_loss, dynamic=True),
     "kl_div": torch.compile(kl_div_loss, dynamic=True),
     "mask_kl_div": torch.compile(mask_kl_div_loss, dynamic=True),
 }
