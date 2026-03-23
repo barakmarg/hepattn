@@ -36,6 +36,100 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 48
 
 
+def compute_deltaR_window_stats(
+    dataset,
+    window_sizes: list[int] = (32, 64, 80, 128, 256),
+    n_sample: int = 200,
+) -> dict:
+    """Compute mean/max delta R within Morton-sorted windows across sampled events.
+
+    Vectorized per offset (numpy inner loop) — efficient for n_sample~200 events.
+
+    Parameters
+    ----------
+    dataset : ODDDatasetPileup
+        Dataset with full_data_array, track_cumsum, cluster_cumsum.
+    window_sizes : iterable of int
+    n_sample : int
+        Events to sample (capped at dataset size).
+
+    Returns
+    -------
+    dict : {window_size -> {"mean_dR": list[float], "max_dR": list[float]}}
+    """
+    import torch
+    from hepattn.experiments.odd_pileup_maskformer.pflow_data import morton_encode
+
+    window_sizes = sorted(set(window_sizes))
+    max_half_w = max(window_sizes) // 2
+
+    results = {w: {"mean_dR": [], "max_dR": [], "mean_deta": [], "mean_dphi": []} for w in window_sizes}
+
+    n_sample = min(n_sample, dataset.num_events)
+    rng = np.random.default_rng(42)
+    sample_indices = rng.choice(dataset.num_events, size=n_sample, replace=False)
+
+    for evt_idx in sample_indices:
+        t_start = int(dataset.track_cumsum[evt_idx])
+        t_end   = int(dataset.track_cumsum[evt_idx + 1])
+        c_start = int(dataset.cluster_cumsum[evt_idx])
+        c_end   = int(dataset.cluster_cumsum[evt_idx + 1])
+
+        eta = np.concatenate([
+            dataset.full_data_array["track_eta"][t_start:t_end].numpy(),
+            dataset.full_data_array["cluster_eta"][c_start:c_end].numpy(),
+        ])
+        phi = np.concatenate([
+            dataset.full_data_array["track_phi"][t_start:t_end].numpy(),
+            dataset.full_data_array["cluster_phi"][c_start:c_end].numpy(),
+        ])
+        n = len(eta)
+        if n < 2:
+            continue
+
+        sort_idx = torch.argsort(
+            morton_encode(torch.from_numpy(eta), torch.from_numpy(phi))
+        ).numpy()
+        eta = eta[sort_idx]
+        phi = phi[sort_idx]
+
+        half_w = min(max_half_w, n - 1)
+        sum_dR   = {w: 0.0 for w in window_sizes}
+        sum_deta = {w: 0.0 for w in window_sizes}
+        sum_dphi = {w: 0.0 for w in window_sizes}
+        cnt_dR   = {w: 0   for w in window_sizes}
+        max_dR   = {w: 0.0 for w in window_sizes}
+
+        for d in range(1, half_w + 1):
+            deta = eta[d:] - eta[:-d]
+            dphi = phi[d:] - phi[:-d]
+            dphi = np.arctan2(np.sin(dphi), np.cos(dphi))
+            dR = np.sqrt(deta**2 + dphi**2)
+            dR_sum   = float(dR.sum())
+            dR_max   = float(dR.max())
+            dR_cnt   = len(dR)
+            deta_sum = float(np.abs(deta).sum())
+            dphi_sum = float(np.abs(dphi).sum())
+
+            for w in window_sizes:
+                if d <= w // 2:
+                    sum_dR[w]   += dR_sum
+                    sum_deta[w] += deta_sum
+                    sum_dphi[w] += dphi_sum
+                    cnt_dR[w]   += dR_cnt
+                    if dR_max > max_dR[w]:
+                        max_dR[w] = dR_max
+
+        for w in window_sizes:
+            if cnt_dR[w] > 0:
+                results[w]["mean_dR"].append(sum_dR[w]   / cnt_dR[w])
+                results[w]["max_dR"].append(max_dR[w])
+                results[w]["mean_deta"].append(sum_deta[w] / cnt_dR[w])
+                results[w]["mean_dphi"].append(sum_dphi[w] / cnt_dR[w])
+
+    return results
+
+
 def load_config(config_path: str = CONFIG_PATH) -> dict:
     with open(config_path) as f:
         return yaml.safe_load(f)
@@ -83,6 +177,7 @@ def build_dataloader(
         hard_scatter_energy_threshold=data_cfg.get("hard_scatter_energy_threshold", 0.03),
         window_size=data_cfg.get("window_size", 512),
         files_list=files_list,
+        is_inference=False,
     )
     print(f"Dataset: {len(dataset)} events from {len(files_list) if files_list else 'dir'} file(s)")
 
@@ -405,11 +500,50 @@ def run_eval(
 
     print("Making plots...")
     figs = make_plots(track_data, cluster_data)
+    figs.update(make_data_plots(loader.dataset))
     print(f"  Generated {len(figs)} plots: {list(figs.keys())}")
 
     return figs, track_data, cluster_data
 
 
+def make_data_plots(dataset_or_loader) -> dict[str, plt.Figure]:
+    from torch.utils.data import DataLoader
+    dataset = dataset_or_loader.dataset if isinstance(dataset_or_loader, DataLoader) else dataset_or_loader
+    """Plots that need only the raw dataset — no model inference required."""
+    import time
+    from hepattn.experiments.odd_pileup_maskformer.plots import PhysicsPlotter
+
+    figs = {}
+
+    def _plot(name, fn, *args, **kwargs):
+        t0 = time.perf_counter()
+        figs[name] = fn(*args, **kwargs)
+        print(f"  {name:<40s} {time.perf_counter() - t0:.2f}s")
+
+    stats = compute_deltaR_window_stats(dataset, window_sizes=[32, 64, 80, 128, 256], n_sample=200)
+    _plot("data/deltaR_window_analysis", PhysicsPlotter.plot_deltaR_window_analysis, stats)
+    _plot("data/eta_window_analysis",    PhysicsPlotter.plot_eta_window_analysis,    stats)
+    _plot("data/phi_window_analysis",    PhysicsPlotter.plot_phi_window_analysis,    stats)
+
+    return figs
+
+
+def run_data_plots(
+    config_path: str = CONFIG_PATH,
+    files: list[str | Path] | None = None,
+    data_dir: str | None = None,
+    num_events: int = -1,
+    num_workers: int = 1,
+) -> dict[str, plt.Figure]:
+    """Generate all data-only plots without loading a model.
+
+    Usage:
+        figs = run_data_plots(data_dir="/storage/.../ttbar_pu200")
+        figs = run_data_plots(files=["file1.parquet", "file2.parquet"])
+    """
+    cfg = load_config(config_path)
+    loader = build_dataloader(cfg, files=files, data_dir=data_dir, num_events=num_events, num_workers=num_workers)
+    return make_data_plots(loader.dataset)
 
 
 if __name__ == "__main__":

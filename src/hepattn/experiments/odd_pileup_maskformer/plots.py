@@ -1028,3 +1028,91 @@ class PhysicsPlotter:
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
         return fig
+
+    @staticmethod
+    def plot_deltaR_window_analysis(
+        stats: dict,
+        window_sizes: list | None = None,
+    ) -> Figure:
+        """Line plot of mean and max delta R within Morton-sorted window vs window size.
+
+        Parameters
+        ----------
+        stats : dict
+            Output of compute_deltaR_window_stats:
+            {window_size -> {"mean_dR": list[float], "max_dR": list[float]}}.
+        window_sizes : list of int, optional
+            Ordered window sizes to plot. Defaults to sorted keys of stats.
+        """
+        if window_sizes is None:
+            window_sizes = sorted(stats.keys())
+
+        mean_means = [np.mean(stats[w]["mean_dR"]) for w in window_sizes]
+        mean_maxs  = [np.mean(stats[w]["max_dR"])  for w in window_sizes]
+        q1_means   = [np.percentile(stats[w]["mean_dR"], 25) for w in window_sizes]
+        q3_means   = [np.percentile(stats[w]["mean_dR"], 75) for w in window_sizes]
+        q1_maxs    = [np.percentile(stats[w]["max_dR"],  25) for w in window_sizes]
+        q3_maxs    = [np.percentile(stats[w]["max_dR"],  75) for w in window_sizes]
+
+        xs = np.array(window_sizes)
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        ax.plot(xs, mean_means, "o-", color="steelblue", lw=2, ms=7, label="Mean δR (within window)")
+        ax.fill_between(xs, q1_means, q3_means, alpha=0.2, color="steelblue", label="Q1–Q3 (mean δR)")
+
+        ax.plot(xs, mean_maxs, "s--", color="tomato", lw=2, ms=7, label="Mean max δR (within window)")
+        ax.fill_between(xs, q1_maxs, q3_maxs, alpha=0.15, color="tomato", label="Q1–Q3 (max δR)")
+
+        ax.set_xlabel("Window Size (# nodes)")
+        ax.set_ylabel("δR  (η-φ space)")
+        ax.set_title("Delta R Coverage vs Window Size (Morton-sorted nodes)")
+        ax.set_xticks(window_sizes)
+        ax.legend(loc="upper left")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def _plot_component_window_analysis(
+        stats: dict,
+        key: str,
+        ylabel: str,
+        title: str,
+        color: str,
+        window_sizes: list | None = None,
+    ) -> Figure:
+        if window_sizes is None:
+            window_sizes = sorted(stats.keys())
+        means = [np.mean(stats[w][key]) for w in window_sizes]
+        q1    = [np.percentile(stats[w][key], 25) for w in window_sizes]
+        q3    = [np.percentile(stats[w][key], 75) for w in window_sizes]
+        xs = np.array(window_sizes)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(xs, means, "o-", color=color, lw=2, ms=7, label=f"Mean {ylabel}")
+        ax.fill_between(xs, q1, q3, alpha=0.2, color=color, label="Q1–Q3")
+        ax.set_xlabel("Window Size (# nodes)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xticks(window_sizes)
+        ax.legend(loc="upper left")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_eta_window_analysis(stats: dict, window_sizes: list | None = None) -> Figure:
+        """Mean |Δη| within Morton-sorted window vs window size."""
+        return PhysicsPlotter._plot_component_window_analysis(
+            stats, "mean_deta", "|Δη|",
+            "Eta Coverage vs Window Size (Morton-sorted nodes)",
+            "steelblue", window_sizes,
+        )
+
+    @staticmethod
+    def plot_phi_window_analysis(stats: dict, window_sizes: list | None = None) -> Figure:
+        """Mean |Δφ| within Morton-sorted window vs window size."""
+        return PhysicsPlotter._plot_component_window_analysis(
+            stats, "mean_dphi", "|Δφ|",
+            "Phi Coverage vs Window Size (Morton-sorted nodes)",
+            "darkorange", window_sizes,
+        )

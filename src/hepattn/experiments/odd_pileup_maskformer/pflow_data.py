@@ -698,61 +698,61 @@ class ODDDatasetPileup(Dataset):
         df_clusters = pl.read_parquet(file_dir / f"calo_clusters-{index:05d}.parquet")
         df_deps = pl.read_parquet(file_dir / f"target_particles_deps-{index:05d}.parquet")
         df_tracks = pl.read_parquet(file_dir / f"tracks-{index:05d}.parquet")
-        if self.is_inference:
-            return df_particles, df_clusters, df_deps, df_tracks
+
         cols_to_explode = [col for col in df_tracks.columns if col != 'event_id']
-        # We remove double matched tracks to the same particle, only in the non-test stages. 
-        df_tracks = (
-                    df_tracks.lazy()
-                    # 1. Explode everything once
-                    .explode(cols_to_explode)
-                    
-                    # 2. Calculate window stats needed for the logic
-                    #    We use .len() for count and .min() for min_pt over the groups
-                    .with_columns([
-                        pl.col('pt').len().over(['event_id', 'majority_particle_id']).alias('_count'),
-                        pl.col('pt').max().over(['event_id', 'majority_particle_id']).alias('_max_pt')
-                    ])
-                    
-                    # 3. Filter: Apply the logic immediately.
-                    #    Your original code identified rows to REMOVE.
-                    #    Here, we negate (~) that condition to select rows to KEEP.
-                    #    Condition to Drop: (idx != -1) AND (count > 1) AND (pt ~= min_pt)
-                    .filter(
-                        ~(
-                            (pl.col('majority_particle_id') != -1) &
-                            (pl.col('_count') > 1) &
-                            ((pl.col('pt') - pl.col('_max_pt')).abs() > 1e-3) # Remove pt that are not the max_pt
+        if not self.is_inference:
+            # We remove double matched tracks to the same particle, only in the non-test stages. 
+            df_tracks = (
+                        df_tracks.lazy()
+                        # 1. Explode everything once
+                        .explode(cols_to_explode)
+                        
+                        # 2. Calculate window stats needed for the logic
+                        #    We use .len() for count and .min() for min_pt over the groups
+                        .with_columns([
+                            pl.col('pt').len().over(['event_id', 'majority_particle_id']).alias('_count'),
+                            pl.col('pt').max().over(['event_id', 'majority_particle_id']).alias('_max_pt')
+                        ])
+                        
+                        # 3. Filter: Apply the logic immediately.
+                        #    Your original code identified rows to REMOVE.
+                        #    Here, we negate (~) that condition to select rows to KEEP.
+                        #    Condition to Drop: (idx != -1) AND (count > 1) AND (pt ~= min_pt)
+                        .filter(
+                            ~(
+                                (pl.col('majority_particle_id') != -1) &
+                                (pl.col('_count') > 1) &
+                                ((pl.col('pt') - pl.col('_max_pt')).abs() > 1e-3) # Remove pt that are not the max_pt
+                            )
                         )
-                    )
 
-                    # 4. Compute vertex z statistics per (event_id, majority_particle_vertex_primary)
-                    #    This gives each track its common collision vertex z position and spread
-                    .with_columns(
-                        [
-                            (
-                                (pl.col("majority_particle_vz") * pl.col("pt").pow(2)).sum().over(["event_id", "majority_particle_vertex_primary"]) /
-                                pl.col("pt").pow(2).sum().over(["event_id", "majority_particle_vertex_primary"])
-                            ).alias("truth_vz_pt2_weighted")]
-                    )
+                        # 4. Compute vertex z statistics per (event_id, majority_particle_vertex_primary)
+                        #    This gives each track its common collision vertex z position and spread
+                        .with_columns(
+                            [
+                                (
+                                    (pl.col("majority_particle_vz") * pl.col("pt").pow(2)).sum().over(["event_id", "majority_particle_vertex_primary"]) /
+                                    pl.col("pt").pow(2).sum().over(["event_id", "majority_particle_vertex_primary"])
+                                ).alias("truth_vz_pt2_weighted")]
+                        )
 
-                    # 5. Compute hard scatter vertex z per event (truth_vz_pt2_weighted where vertex_primary==1)
-                    .with_columns(
-                        pl.when(pl.col("majority_particle_vertex_primary") == 1)
-                        .then(pl.col("truth_vz_pt2_weighted"))
-                        .otherwise(None)
-                        .max()
-                        .over("event_id")
-                        .alias("hard_scatter_vz")
-                    )
+                        # 5. Compute hard scatter vertex z per event (truth_vz_pt2_weighted where vertex_primary==1)
+                        .with_columns(
+                            pl.when(pl.col("majority_particle_vertex_primary") == 1)
+                            .then(pl.col("truth_vz_pt2_weighted"))
+                            .otherwise(None)
+                            .max()
+                            .over("event_id")
+                            .alias("hard_scatter_vz")
+                        )
 
-                    # 6. Group back to lists
-                    #    maintain_order=True is faster than re-sorting and keeps track alignment
-                    .group_by('event_id', maintain_order=True)
-                    .agg(pl.col(cols_to_explode + ["truth_vz_pt2_weighted", "hard_scatter_vz"]))
-                    .sort('event_id') # Ensure final event order matches original expectations
-                    .collect()
-                )
+                        # 6. Group back to lists
+                        #    maintain_order=True is faster than re-sorting and keeps track alignment
+                        .group_by('event_id', maintain_order=True)
+                        .agg(pl.col(cols_to_explode + ["truth_vz_pt2_weighted", "hard_scatter_vz"]))
+                        .sort('event_id') # Ensure final event order matches original expectations
+                        .collect()
+                    )
 
         # Build per-particle has_track lookup for neutral/charged energy split
         _particles_exploded = (

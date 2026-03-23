@@ -1,4 +1,4 @@
-# Two-Stream Causally-Conditioned Hybrid Query MaskFormer
+# Two-Stream Causally-Conditioned Hybrid Query Transformer
 
 ## Motivation
 
@@ -17,7 +17,9 @@ Raw Nodes (tracks + clusters)
                 | Inference: predicted HS tracks from Stream A
                 v
         -> Stream B: CaloFlashCrossAttentionDecoder (4 layers, 206 hybrid queries, flash-varlen bidirectional CA)
-            -> Calo Tasks: CaloHitMaskTask (calo HS mask) + PileupCaloFractionTaskV2 (energy fraction)
+            -> Node-classification tasks on enriched node embeddings:
+               CaloNodeMaskTask: Dense(128→1, 3 hidden layers) — binary HS/pileup per node
+               CaloNodeFractionTask: Dense(128→1, 4 hidden layers, Sigmoid) — HS energy fraction per node
 ```
 
 ## Key Design Decisions
@@ -41,24 +43,34 @@ Raw Nodes (tracks + clusters)
 - Each layer: **query self-attention** → **bidirectional cross-attention** (queries ↔ calo nodes)
 - Uses `flash-varlen` (unpadded sequences) for both self-attention and cross-attention — avoids materialising padded positions
 - Calo isolation: only calo nodes (`~node_is_track & valid`) participate as keys/values
-- No intermediate task outputs — loss computed only at the final layer (`has_intermediate_loss: false`)
+- The decoder enriches node embeddings with query context; classification happens after via Dense heads
 
-### Multi-Query Calo Mask (CaloHitMaskTask)
-- Each of 206 queries produces its own mask over all nodes via dot-product: `(B, Q, N)`
-- **Per-query masks** drive the attention threshold (each query attends to its claimed calo nodes at `attn_threshold=0.1`)
-- **Master mask** = `max(dim=Q)` pools per-query masks to `(B, 1, N)` for BCE + Tversky loss against target
-- Target: `calo_hard_scatter_energy_frac > hs_frac_threshold` **AND** `calo_hard_scatter_energy > hs_energy_threshold` (configurable, defaults 0.05 / 0.15)
+### Node-Classification Tasks (Stream B)
+After the decoder enriches calo node embeddings via bidirectional cross-attention with the hybrid queries, two `Task` subclasses classify each node directly from enriched embeddings (no query dot-product):
+
+- **`CaloNodeMaskTask`**: configurable `Dense` MLP head (default: `[128, 64, 32], SiLU`) → per-node HS/pileup logit `(B, 1, N)`
+- **`CaloNodeFractionTask`**: configurable `Dense` MLP head (default: `[256, 128, 64, 32], SiLU, Sigmoid`) → per-node HS energy fraction `(B, N)`
+
+These are drop-in replacements for `CaloHitMaskTask` and `PileupCaloFractionTaskV2` — same output keys, same loss/predict interface. The model code (`model.py`) is unchanged.
+
+This reflects the physics: the hybrid queries are the "truth anchor" of the event (HS track context), but the final decision of whether a calo cluster is HS rests on the context gathered by the cluster itself through cross-attention.
+
+### Calo Mask Loss
+- Target: `calo_hard_scatter_energy_frac > hs_frac_threshold` **AND** `calo_hard_scatter_energy > hs_energy_threshold` (defaults 0.05 / 0.15)
+- BCE + Tversky loss (α=0.2, β=0.8 — FN penalised 4× more than FP)
 - Imbalance handled by `sample_weight`: HS nodes get weight 1.0, pileup nodes get `null_weight=0.05` (20× downweighting)
+- Loss computed inline in `model.loss()` using `loss_fns` from `hepattn.models.loss`
 
-### Calo Fraction Loss Isolation
-- `PileupCaloFractionTaskV2` computes L1 loss **only on true HS clusters** (both `calo_hard_scatter_energy_frac > 0.05` and `calo_hard_scatter_energy > 0.15`)
+### Calo Fraction Loss
+- L1 loss **only on true HS clusters** (both `calo_hard_scatter_energy_frac > 0.05` and `calo_hard_scatter_energy > 0.15`)
 - Pileup-only clusters are excluded from the regression loss entirely
 - Prediction: `E_HS_pred = frac * E_total`, loss: `|E_HS_pred - E_HS_true|`
+- Loss weight 0.01 (mask losses dominate ~700:1)
 
 ### Gated Inference
 - At inference, calo fraction is multiplied by the calo mask prediction: `calo_frac * (calo_hs_prob > 0.5)`
 - Clusters predicted as pileup-only get zero HS energy fraction
-- Note: `pred_threshold=0.2` controls the `calo_node_valid` binary prediction output; the fraction gate uses a hardcoded 0.5
+- Note: `calo_mask_pred_threshold=0.2` controls the `calo_node_valid` binary prediction output; the fraction gate uses a hardcoded 0.5
 
 ### Physics Priors
 - **Stream A:** `prior = node_is_track` — query attends only to tracks, never calo
@@ -73,11 +85,11 @@ odd_pileup_two_stream/
   __init__.py              # Exports
   model.py                 # TwoStreamMaskFormer (forward, loss, predict, bridge logic)
   decoder.py               # CaloMaskFormerDecoder (legacy) + CaloFlashCrossAttentionDecoder (active)
-  tasks.py                 # CaloHitMaskTask + PileupCaloFractionTaskV2
+  tasks.py                 # CaloNodeMaskTask + CaloNodeFractionTask (active); CaloHitMaskTask + PileupCaloFractionTaskV2 (legacy)
   lightning_module.py       # ODDPFlowTwoStream (metrics, epoch-end plots)
   main.py                  # CLI entry point
   configs/
-    base.yaml              # Full training config
+    base.yaml              # Full training config (node-classification heads)
 ```
 
 **One modification to existing code:**
@@ -169,7 +181,7 @@ query_valid (B, 206):
     slots N+16..:   False (masked in attention)
 ```
 
-### Stage 4: Stream B — Calo (CaloFlashCrossAttentionDecoder)
+### Stage 4: Stream B — Calo (CaloFlashCrossAttentionDecoder + Node Tasks)
 
 ```
 query_embed (B, 206, 128)  <-- hybrid_queries
@@ -180,11 +192,10 @@ key_embed   (B, 5500, 128) <-- from encoder (calo nodes only participate)
   2. Bidirectional cross-attention (flash-varlen, queries ↔ calo nodes only)
      - a->b: queries attend to calo
      - b->a: calo nodes attend back to queries
-  3. No mask attention, no intermediate task outputs
 
-Final tasks (applied once, outside decoder):
-  - CaloHitMaskTask -> calo_node_logit (B, 1, 5500)  [max-pooled over query dim]
-  - PileupCaloFractionTaskV2 -> calo_frac (B, 5500)
+Final tasks (applied once, on enriched node_embed):
+  - CaloNodeMaskTask: Dense(node_embed) -> calo_node_logit (B, 1, N)
+  - CaloNodeFractionTask: Dense(node_embed) -> calo_frac (B, N)
 ```
 
 ---
@@ -203,16 +214,17 @@ Final tasks (applied once, outside decoder):
 
 ### Stream B (Calo) Losses
 
-No intermediate losses (`has_intermediate_loss: false` for both calo tasks).
+No intermediate losses (`has_intermediate_loss: false` for both node tasks).
 
 | Loss key | Task | Computed at | Target |
 |---|---|---|---|
-| `calo_final_calo_mask_mask_bce` | CaloHitMaskTask | Final only | `calo_hs_frac > 0.05 & calo_hs_energy > 0.15` |
-| `calo_final_calo_mask_mask_tversky` | CaloHitMaskTask | Final only | `calo_hs_frac > 0.05 & calo_hs_energy > 0.15` |
-| `calo_final_calo_fraction_l1` | PileupCaloFractionTaskV2 | Final only | `calo_hard_scatter_energy` (HS clusters only) |
+| `calo_final_calo_mask_mask_bce` | CaloNodeMaskTask | Final only | `calo_hs_frac > 0.05 & calo_hs_energy > 0.15` |
+| `calo_final_calo_mask_mask_tversky` | CaloNodeMaskTask | Final only | `calo_hs_frac > 0.05 & calo_hs_energy > 0.15` |
+| `calo_final_calo_fraction_l1` | CaloNodeFractionTask | Final only | `calo_hard_scatter_energy` (HS clusters only) |
 
-Loss weights: `mask_bce=5.0`, `mask_tversky=2.0`, `calo_fraction l1=0.1`.
+Loss weights: `mask_bce=5.0`, `mask_tversky=2.0`, `calo_fraction l1=0.01`.
 Tversky parameters: `alpha=0.2, beta=0.8` (FN penalised 4× more than FP — HS-favouring).
+Mask losses dominate fraction loss by ~700:1.
 
 ---
 
@@ -230,7 +242,7 @@ preds = {
         "vz_regression": {"pflow_vz": (B, 1)},
     },
 
-    # Stream B — final only (no intermediate outputs from CaloFlashCrossAttentionDecoder)
+    # Stream B — final only
     "calo_final": {
         "calo_mask": {"calo_node_prob": (B,5500), "calo_node_valid": (B,5500)},
         "calo_fraction": {"calo_hs_fraction": (B,5500)},   # GATED by calo_hs_prob > 0.5
@@ -286,12 +298,13 @@ preds = {
 | `max_hs_tracks` | `model.init_args` | 190 | Max HS tracks in hybrid queries |
 | `num_latent_queries` | `model.init_args` | 16 | Learnable latent query slots (always valid) |
 | `teacher_forcing` | `model.init_args` | true | Use GT HS tracks during training bridge |
-| `hs_energy_threshold` | `CaloHitMaskTask`, `PileupCaloFractionTaskV2` | 0.15 | Min absolute HS energy to count as HS |
-| `hs_frac_threshold` | `CaloHitMaskTask`, `PileupCaloFractionTaskV2` | 0.05 | Min HS energy fraction to count as HS |
-| `null_weight` | `CaloHitMaskTask` | 0.05 | BCE sample weight for pileup nodes (1.0 for HS → 20:1 ratio) |
-| `pred_threshold` | `CaloHitMaskTask` | 0.2 | Threshold for `calo_node_valid` binary prediction |
-| `logit_scale` | `CaloHitMaskTask` | 4 | Dot-product logit scaling factor |
-| `signal_weight` | `PileupCaloFractionTaskV2` | 25.3 | Reserved weight parameter for fraction task |
+| `hs_energy_threshold` | `CaloNodeMaskTask`, `CaloNodeFractionTask` | 0.15 | Min absolute HS energy to count as HS |
+| `hs_frac_threshold` | `CaloNodeMaskTask`, `CaloNodeFractionTask` | 0.05 | Min HS energy fraction to count as HS |
+| `null_weight` | `CaloNodeMaskTask` | 0.05 | BCE sample weight for pileup nodes (1.0 for HS → 20:1 ratio) |
+| `pred_threshold` | `CaloNodeMaskTask` | 0.2 | Threshold for `calo_node_valid` binary prediction |
+| `loss_weight` | `CaloNodeFractionTask` | 0.01 | L1 fraction loss weight (mask losses dominate) |
+| `net` (mask) | `CaloNodeMaskTask` | `Dense(128,1,[128,64,32],SiLU)` | Per-node HS/pileup binary classifier |
+| `net` (frac) | `CaloNodeFractionTask` | `Dense(128,1,[256,128,64,32],SiLU,Sigmoid)` | Per-node HS energy fraction regressor |
 | `batch_size` | `data` | 64 | Training batch size |
 
 ---
@@ -311,10 +324,10 @@ python main.py fit --config configs/base.yaml
 |--------|---------------|------------|
 | Decoders | 1 (PileupMaskFormerDecoder, 4 layers) | 2 (Track: 4 layers + Calo: 4 layers) |
 | Queries | 1 learnable query | 16 latent queries + up to 190 HS track embeddings (206 total) |
-| Calo mask | None (implicit via fraction task) | Explicit CaloHitMaskTask (final layer only) |
+| Calo mask | None (implicit via fraction task) | CaloNodeMaskTask: per-node Dense classifier (final layer only) |
 | Calo mask loss | — | BCE (×5) + Tversky α=0.2,β=0.8 (×2) |
-| Calo fraction loss | All clusters (weighted) | HS clusters only (`hs_frac > 0.05 & hs_energy > 0.15`) |
+| Calo fraction loss | All clusters (weighted) | HS clusters only (`hs_frac > 0.05 & hs_energy > 0.15`), weight=0.01 |
 | Gradient flow | Single path (encoder ↔ decoder) | Isolated: calo loss detached from encoder/tracks |
 | Inference | Direct fraction output | Gated: `frac * (calo_mask > 0.5)` |
 | Calo decoder | — | CaloFlashCrossAttentionDecoder (flash-varlen, bidirectional q↔calo) |
-| Parameters | ~10.5M | ~20.7M |
+| Calo tasks | Query-hit dot-product tasks | Node-classification tasks (Dense head on enriched nodes) |

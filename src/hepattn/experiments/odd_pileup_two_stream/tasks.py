@@ -204,3 +204,144 @@ class PileupCaloFractionTaskV2(Task):
 
     def attn_mask(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
         return {}
+
+
+class CaloNodeMaskTask(Task):
+    """Node-classification calo mask. Classifies each node as HS/pileup
+    directly from enriched node embeddings via a Dense MLP head.
+
+    Drop-in replacement for CaloHitMaskTask: same loss/predict/output keys,
+    but forward() uses a single Dense head instead of query-hit dot-product.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        input_hit: str,
+        losses: dict[str, float],
+        dim: int,
+        net: nn.Module,
+        null_weight: float = 0.05,
+        pred_threshold: float = 0.2,
+        hs_energy_threshold: float = 0.15,
+        hs_frac_threshold: float = 0.05,
+        has_intermediate_loss: bool = False,
+    ):
+        super().__init__(has_intermediate_loss=has_intermediate_loss, permute_loss=False)
+        self.name = name
+        self.input_hit = input_hit
+        self.losses = losses
+        self.null_weight = null_weight
+        self.pred_threshold = pred_threshold
+        self.hs_energy_threshold = hs_energy_threshold
+        self.hs_frac_threshold = hs_frac_threshold
+        self.outputs = ["calo_node_logit"]
+
+        self.net = net
+
+    def forward(self, x: dict[str, Tensor]) -> dict[str, Tensor]:
+        logit = self.net(x[f"{self.input_hit}_embed"]).squeeze(-1)  # (B, N)
+
+        node_valid = x[f"{self.input_hit}_valid"]
+        if node_valid is not None:
+            logit = logit.masked_fill(~node_valid, torch.finfo(logit.dtype).min)
+
+        # (B, 1, N) for compatibility with mask loss functions
+        return {"calo_node_logit": logit.unsqueeze(1)}
+
+    def predict(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        prob = outputs["calo_node_logit"].detach().sigmoid()  # (B, 1, N)
+        return {
+            "calo_node_prob": prob.squeeze(1),  # (B, N)
+            "calo_node_valid": (prob >= self.pred_threshold).squeeze(1),  # (B, N)
+        }
+
+    def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        is_track = targets["node_is_track"].bool().squeeze(-1)
+        valid = targets["node_valid"].bool()
+
+        calo_hs_energy = targets["calo_hard_scatter_energy"]
+        calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
+        calo_is_hs = (calo_hs_frac > self.hs_frac_threshold) & (calo_hs_energy > self.hs_energy_threshold) & ~is_track & valid
+
+        target = calo_is_hs.unsqueeze(1).float()  # (B, 1, N)
+        output = outputs["calo_node_logit"]  # (B, 1, N)
+
+        input_pad_mask = valid & ~is_track
+        object_valid = torch.ones(output.shape[0], 1, dtype=torch.bool, device=output.device)
+        sample_weight = target + self.null_weight * (1 - target)
+
+        losses = {}
+        for loss_fn, loss_weight in self.losses.items():
+            losses[loss_fn] = loss_weight * loss_fns[loss_fn](
+                output, target, object_valid_mask=object_valid, input_pad_mask=input_pad_mask, sample_weight=sample_weight
+            )
+        return losses
+
+    def cost(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        return {}
+
+    def attn_mask(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        return {}
+
+
+class CaloNodeFractionTask(Task):
+    """Node-classification calo fraction. Regresses HS energy fraction
+    directly from enriched node embeddings via a Dense MLP head.
+
+    Drop-in replacement for PileupCaloFractionTaskV2: same loss/predict/output keys,
+    but forward() uses a single Dense head instead of query-conditioned MLP.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        input_hit: str,
+        dim: int,
+        net: nn.Module,
+        loss_weight: float = 0.01,
+        hs_energy_threshold: float = 0.15,
+        hs_frac_threshold: float = 0.05,
+        has_intermediate_loss: bool = False,
+    ):
+        super().__init__(has_intermediate_loss=has_intermediate_loss, permute_loss=False)
+        self.name = name
+        self.input_hit = input_hit
+        self.loss_weight = loss_weight
+        self.hs_energy_threshold = hs_energy_threshold
+        self.hs_frac_threshold = hs_frac_threshold
+        self.outputs = ["calo_frac"]
+
+        self.net = net
+
+    def forward(self, x: dict[str, Tensor]) -> dict[str, Tensor]:
+        frac = self.net(x[f"{self.input_hit}_embed"]).squeeze(-1)  # (B, N)
+        return {"calo_frac": frac}
+
+    def predict(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        return {"calo_hs_fraction": outputs["calo_frac"].detach()}
+
+    def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        is_track = targets["node_is_track"].bool().squeeze(-1)
+        valid = targets["node_valid"].bool()
+        calo_hs_energy = targets["calo_hard_scatter_energy"]
+        calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
+
+        mask = valid & ~is_track & (calo_hs_frac > self.hs_frac_threshold) & (calo_hs_energy > self.hs_energy_threshold)
+
+        if mask.any():
+            pred_frac = outputs["calo_frac"][mask]
+            E_total = targets["node_e"].squeeze(-1)[mask]
+            E_HS_true = calo_hs_energy[mask]
+            E_HS_pred = pred_frac * E_total
+            loss = torch.mean(torch.abs(E_HS_pred - E_HS_true))
+        else:
+            loss = torch.tensor(0.0, device=outputs["calo_frac"].device, requires_grad=True)
+
+        return {"l1": self.loss_weight * loss}
+
+    def cost(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        return {}
+
+    def attn_mask(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        return {}

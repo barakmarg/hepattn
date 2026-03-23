@@ -43,9 +43,9 @@ data:
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: 40000
-  num_test: 4000
-  num_val: 4000
+  num_train: -1
+  num_test: -1
+  num_val: -1
 
   batch_size: 64
   incidence_cutval: 0.01
@@ -231,32 +231,46 @@ model:
         class_path: torch.nn.ModuleList
         init_args:
           modules:
-            # Task 1: Calo HS mask with deep supervision (BCE + Dice)
-            - class_path: hepattn.experiments.odd_pileup_two_stream.tasks.CaloHitMaskTask
+            # Task 1: Node-classification calo HS mask (Dense head on enriched nodes)
+            - class_path: hepattn.experiments.odd_pileup_two_stream.tasks.CaloNodeMaskTask
               init_args:
                 name: calo_mask
                 input_hit: node
-                input_object: query
                 losses:
                   mask_bce: 5.0
                   mask_tversky: 2.0
                 dim: *dim
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    output_size: 1
+                    hidden_layers: [128, 64, 32]
+                    activation:
+                      class_path: torch.nn.SiLU
                 null_weight: 0.05
-                logit_scale: 4
                 pred_threshold: 0.2
                 hs_energy_threshold: 0.15
                 hs_frac_threshold: 0.05
                 has_intermediate_loss: false
 
-            # Task 2: Calo energy fraction regression (loss only on HS clusters)
-            - class_path: hepattn.experiments.odd_pileup_two_stream.tasks.PileupCaloFractionTaskV2
+            # Task 2: Node-classification calo energy fraction (Dense head on enriched nodes)
+            - class_path: hepattn.experiments.odd_pileup_two_stream.tasks.CaloNodeFractionTask
               init_args:
                 name: calo_fraction
                 input_hit: node
-                input_object: query
                 dim: *dim
-                loss_weight: 0.1
-                signal_weight: 25.3
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    output_size: 1
+                    hidden_layers: [256, 128, 64, 32]
+                    activation:
+                      class_path: torch.nn.SiLU
+                    final_activation:
+                      class_path: torch.nn.Sigmoid
+                loss_weight: 0.01
                 hs_energy_threshold: 0.15
                 hs_frac_threshold: 0.05
                 has_intermediate_loss: false
