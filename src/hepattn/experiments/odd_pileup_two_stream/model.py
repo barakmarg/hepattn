@@ -14,7 +14,7 @@ class TwoStreamMaskFormer(nn.Module):
     Bridge: Extracts physical HS tracks (teacher-forced during training, predicted
     during inference), detaches them, and constructs hybrid queries for calo.
 
-    Stream B (Calo MaskFormer): Hybrid queries (HS tracks + 1 global neutral query)
+    Stream B (Calo MaskFormer): Hybrid queries (learnable latent queries + HS tracks)
     execute a second MaskFormer loop over calo nodes using masked cross-attention.
     """
 
@@ -28,6 +28,7 @@ class TwoStreamMaskFormer(nn.Module):
         calo_tasks: nn.ModuleList,
         dim: int,
         max_hs_tracks: int = 200,
+        num_latent_queries: int = 1,
         teacher_forcing: bool = True,
         target_object: str = "particle",
         pooling: nn.Module | None = None,
@@ -50,6 +51,7 @@ class TwoStreamMaskFormer(nn.Module):
 
         self.dim = dim
         self.max_hs_tracks = max_hs_tracks
+        self.num_latent_queries = num_latent_queries
         self.teacher_forcing = teacher_forcing
         self.target_object = target_object
         self.pooling = pooling
@@ -58,7 +60,7 @@ class TwoStreamMaskFormer(nn.Module):
 
         # Learnable query parameters
         self.track_query_initial = nn.Parameter(torch.randn(1, dim))
-        self.calo_global_query = nn.Parameter(torch.randn(1, dim))
+        self.calo_latent_queries = nn.Parameter(torch.randn(num_latent_queries, dim))
 
         # Expose all tasks for ModelWrapper compatibility (parameter discovery, etc.)
         self.tasks = nn.ModuleList([*track_tasks, *calo_tasks])
@@ -199,29 +201,31 @@ class TwoStreamMaskFormer(nn.Module):
         Returns
         -------
         queries : Tensor
-            Hybrid queries (B, max_hs_tracks + 1, D).
-            Slot 0 = global calo query (learnable), slots 1.. = HS track embeddings.
+            Hybrid queries (B, max_hs_tracks + num_latent_queries, D).
+            Slots 0..num_latent_queries-1 = learnable latent queries,
+            slots num_latent_queries.. = HS track embeddings.
         valid : Tensor
-            Boolean validity mask (B, max_hs_tracks + 1).
+            Boolean validity mask (B, max_hs_tracks + num_latent_queries).
         """
         D = node_embed.shape[-1]
         device = node_embed.device
-        Q = self.max_hs_tracks + 1
+        NL = self.num_latent_queries
+        Q = self.max_hs_tracks + NL
 
         queries = torch.zeros(batch_size, Q, D, device=device, dtype=node_embed.dtype)
         valid = torch.zeros(batch_size, Q, device=device, dtype=torch.bool)
 
-        # Slot 0: global calo query (learnable, for isolated neutral energy)
-        queries[:, 0, :] = self.calo_global_query
-        valid[:, 0] = True
+        # Slots 0..NL-1: learnable latent queries
+        queries[:, :NL, :] = self.calo_latent_queries
+        valid[:, :NL] = True
 
-        # Slots 1..Q-1: HS track embeddings (padded)
+        # Slots NL..Q-1: HS track embeddings (padded)
         for b in range(batch_size):
             track_indices = hs_mask[b].nonzero(as_tuple=True)[0]
             n = min(len(track_indices), self.max_hs_tracks)
             if n > 0:
-                queries[b, 1 : 1 + n, :] = node_embed[b, track_indices[:n], :]
-                valid[b, 1 : 1 + n] = True
+                queries[b, NL : NL + n, :] = node_embed[b, track_indices[:n], :]
+                valid[b, NL : NL + n] = True
 
         return queries, valid
 

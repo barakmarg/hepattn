@@ -1,10 +1,14 @@
+from functools import partial
+
 import torch
 from torch import Tensor, nn
 
 from hepattn.experiments.odd_pileup_maskformer.decoder import PileupMaskFormerDecoder
-from hepattn.models.attention import repad_from_flash_varlen, unpad_for_flash_varlen
+from hepattn.models.attention import Attention, repad_from_flash_varlen, unpad_for_flash_varlen
 from hepattn.models.decoder import BiCrossAttentionLayer
+from hepattn.models.dense import Dense
 from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
+from hepattn.models.transformer import Residual
 
 
 class CaloMaskFormerDecoder(PileupMaskFormerDecoder):
@@ -87,13 +91,10 @@ class CaloMaskFormerDecoder(PileupMaskFormerDecoder):
 
 
 class CaloFlashCrossAttentionDecoder(nn.Module):
-    """Pure bidirectional cross-attention decoder using flash-varlen.
+    """Bidirectional cross-attention decoder with query self-attention, using flash-varlen.
 
-    Replaces MaskFormer decoder with bidirectional cross-attention between
-    hybrid track queries (learnable global calo token + HS track embeddings)
-    and calorimeter cluster embeddings.
-
-    No self-attention, no mask attention, no intermediate tasks.
+    Each decoder layer: query self-attention → bidirectional cross-attention (queries ↔ calo).
+    Hybrid queries = learnable latent queries + HS track embeddings.
     """
 
     def __init__(
@@ -101,6 +102,7 @@ class CaloFlashCrossAttentionDecoder(nn.Module):
         dim: int,
         num_decoder_layers: int,
         attn_kwargs: dict | None = None,
+        sa_attn_kwargs: dict | None = None,
         dense_kwargs: dict | None = None,
         norm: str = "LayerNorm",
         hybrid_norm: bool = False,
@@ -110,23 +112,45 @@ class CaloFlashCrossAttentionDecoder(nn.Module):
         attn_kwargs = attn_kwargs or {}
         dense_kwargs = dense_kwargs or {}
 
-        self.layers = nn.ModuleList([
-            BiCrossAttentionLayer(
+        # Self-attention kwargs: derive from cross-attention kwargs, strip window_size
+        _sa_attn_kwargs = {**attn_kwargs}
+        _sa_attn_kwargs.pop("window_size", None)
+        if sa_attn_kwargs:
+            _sa_attn_kwargs.update(sa_attn_kwargs)
+
+        # Build self-attention + cross-attention layers
+        self.sa_layers = nn.ModuleList()
+        self.layers = nn.ModuleList()
+
+        for i in range(num_decoder_layers):
+            qkv_norm = hybrid_norm
+            hn = hybrid_norm if i > 0 else False
+            attn_norm = norm if not hn else None
+            dense_post_norm = not hn
+
+            res = partial(Residual, dim=dim, norm=norm)
+
+            # Query self-attention block (Attention + Dense)
+            self.sa_layers.append(nn.ModuleList([
+                res(Attention(dim, qkv_norm=qkv_norm, **_sa_attn_kwargs), norm=attn_norm),
+                res(Dense(dim, **dense_kwargs), norm=norm, post_norm=dense_post_norm),
+            ]))
+
+            # Bidirectional cross-attention layer
+            self.layers.append(BiCrossAttentionLayer(
                 dim=dim,
                 norm=norm,
                 depth=i,
                 dense_kwargs=dense_kwargs,
                 attn_kwargs=attn_kwargs,
                 hybrid_norm=hybrid_norm,
-            )
-            for i in range(num_decoder_layers)
-        ])
+            ))
 
         # Not used internally, but set for interface compatibility with model.py
         self.preserve_posenc = False
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
-        query_embed = x["query_embed"]  # (B, Q, D) — learnable calo token + HS tracks
+        query_embed = x["query_embed"]  # (B, Q, D) — latent queries + HS tracks
         query_valid = x["query_valid"]  # (B, Q)
         key_embed = x["key_embed"]  # (B, N, D) — all nodes (tracks + calo)
         key_valid = x["key_valid"]  # (B, N)
@@ -143,7 +167,13 @@ class CaloFlashCrossAttentionDecoder(nn.Module):
         q_flat, q_indices, q_varlen = unpad_for_flash_varlen(query_embed, query_valid)
         kv_flat, kv_indices, kv_varlen = unpad_for_flash_varlen(key_embed, calo_mask)
 
-        # Build cross-attention varlen kwargs
+        # Self-attention varlen kwargs (same cu_seqlens for Q and K)
+        sa_kwargs = {"varlen_kwargs": {
+            "cu_seqlens": q_varlen["cu_seqlens"],
+            "max_seqlen": q_varlen["max_seqlen"],
+        }}
+
+        # Cross-attention varlen kwargs
         ab_kwargs = {"varlen_kwargs": {
             "cu_seqlens_q": q_varlen["cu_seqlens"],
             "cu_seqlens_k": kv_varlen["cu_seqlens"],
@@ -157,9 +187,11 @@ class CaloFlashCrossAttentionDecoder(nn.Module):
             "max_seqlen_k": q_varlen["max_seqlen"],
         }}
 
-        # Run through layers (no intermediate tasks)
-        for layer in self.layers:
-            q_flat, kv_flat = layer(q_flat, kv_flat, ab_kwargs=ab_kwargs, ba_kwargs=ba_kwargs)
+        # Run through layers: self-attention on queries, then bidirectional cross-attention
+        for sa_layer, ca_layer in zip(self.sa_layers, self.layers):
+            sa_attn, sa_dense = sa_layer
+            q_flat = sa_dense(sa_attn(q_flat, **sa_kwargs))
+            q_flat, kv_flat = ca_layer(q_flat, kv_flat, ab_kwargs=ab_kwargs, ba_kwargs=ba_kwargs)
 
         # Repad both sequences
         x["query_embed"] = repad_from_flash_varlen(q_flat, batch_size, num_queries, q_indices)

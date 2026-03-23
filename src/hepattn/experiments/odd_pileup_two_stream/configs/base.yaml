@@ -47,7 +47,7 @@ data:
   num_test: -1
   num_val: -1
 
-  batch_size: 48
+  batch_size: 64
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
@@ -96,7 +96,7 @@ model:
 
   lrs_config:
     initial: 1.25e-6
-    max: 1e-4
+    max: 1.25e-4
     end: 1.25e-6
     pct_start: 0.05
     weight_decay: 0.01
@@ -110,6 +110,7 @@ model:
       dim: &dim 128
       target_object: particle
       max_hs_tracks: 190
+      num_latent_queries: 16
       teacher_forcing: true
 
       # Raw variables forwarded through x dict

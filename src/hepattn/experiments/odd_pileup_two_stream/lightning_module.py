@@ -297,7 +297,7 @@ class ODDPFlowTwoStream(ModelWrapper):
                     calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
                     calo_hs_frac_flat = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
                     calo_mask_task = self.model.calo_tasks[0]
-                    self._val_cluster_data["mask_pred"].append((calo_prob_flat > 0.5).detach().cpu().numpy())
+                    self._val_cluster_data["mask_pred"].append((calo_prob_flat > calo_mask_task.pred_threshold).detach().cpu().numpy())
                     self._val_cluster_data["calo_mask_probs"].append(calo_prob_flat.detach().float().cpu().numpy())
                     self._val_cluster_data["mask_truth"].append(
                         ((calo_hs_frac_flat > calo_mask_task.hs_frac_threshold) & (calo_hs_e_flat > calo_mask_task.hs_energy_threshold)).detach().cpu().numpy()
@@ -314,8 +314,8 @@ class ODDPFlowTwoStream(ModelWrapper):
 
                 # Per-event neutral/charged HS energy (mask-weighted sums)
                 if "calo_mask" in calo_final:
-                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > 0.5).float()  # (B, N)
                     calo_mask_task = self.model.calo_tasks[0]
+                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > calo_mask_task.pred_threshold).float()  # (B, N)
                     truth_mask_b = (
                         (labels["calo_hard_scatter_energy_frac"] > calo_mask_task.hs_frac_threshold)
                         & (labels["calo_hard_scatter_energy"] > calo_mask_task.hs_energy_threshold)
