@@ -381,6 +381,84 @@ class PhysicsPlotter:
         return fig
 
     @staticmethod
+    def plot_calo_mask_energy_ratio(
+        mask_pred: np.ndarray,
+        mask_truth: np.ndarray,
+        total_e: np.ndarray,
+        true_hs_e: np.ndarray,
+        event_idx: np.ndarray,
+    ) -> Figure:
+        """Histogram of per-event (Σ pred-mask total_e / Σ truth HS energy).
+
+        Numerator: total cluster energy of predicted-HS clusters (binary mask, no fraction regression).
+        Denominator: true HS energy of truth-masked clusters (avoids inflation by dilute HS clusters).
+        A perfect model gives a distribution centred at 1.
+        """
+        _, inv = np.unique(event_idx, return_inverse=True)
+        pred_e  = np.bincount(inv, weights=total_e   * mask_pred.astype(float))
+        truth_e = np.bincount(inv, weights=true_hs_e * mask_truth.astype(float))
+
+        valid = truth_e > 0
+        ratios = pred_e[valid] / truth_e[valid]
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        if len(ratios) == 0:
+            ax.text(0.5, 0.5, "No events with truth mask HS energy > 0", ha="center", va="center")
+            plt.tight_layout()
+            return fig
+
+        clipped = np.clip(ratios, 0, 3)
+        ax.hist(clipped, bins=60, color="steelblue", alpha=0.8, edgecolor="none")
+        ax.axvline(1.0, color="red", lw=1.5, ls="--", label="Ideal (1.0)")
+        ax.set_xlabel("Σ Pred Mask total_e / Σ Truth Mask HS energy  (per event)")
+        ax.set_ylabel("Events")
+        ax.set_yscale("log")
+        ax.set_title("Per-Event Calo Mask Energy Ratio (binary mask, no fraction regression)")
+        ax.legend(title=f"mean={ratios.mean():.3f}, std={ratios.std():.3f}\nN events={len(ratios)}")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_mask_hs_energy_efficiency(
+        true_hs_e: np.ndarray,
+        true_frac: np.ndarray,
+        energy_thresholds: list[float] = (0.02, 0.05, 0.1, 0.15),
+        frac_thresholds: list[float] = (0.01, 0.03, 0.05, 0.1),
+    ) -> Figure:
+        """HS mask energy / total HS energy for varying threshold combinations.
+
+        For each hs_frac_threshold (one line), sweeps hs_energy_threshold on the x-axis
+        and plots the fraction of total HS energy captured by the truth mask.
+        Inputs are per-hit arrays.
+        """
+        total_hs_e = true_hs_e.sum()
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        if total_hs_e == 0:
+            ax.text(0.5, 0.5, "No HS energy", ha="center", va="center")
+            plt.tight_layout()
+            return fig
+
+        colors = cm.viridis(np.linspace(0.1, 0.9, len(frac_thresholds)))
+        for frac_thresh, color in zip(frac_thresholds, colors):
+            ratios = []
+            for energy_thresh in energy_thresholds:
+                mask = (true_hs_e > energy_thresh) & (true_frac > frac_thresh)
+                ratios.append(true_hs_e[mask].sum() / total_hs_e)
+            ax.plot(energy_thresholds, ratios, marker="o", color=color,
+                    label=f"frac > {frac_thresh}")
+
+        ax.set_xlabel("HS Energy Threshold [GeV]")
+        ax.set_ylabel("Mask HS Energy / Total HS Energy")
+        ax.set_title("HS Energy Captured by Truth Mask vs Threshold")
+        ax.legend(title="HS Frac Threshold")
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
     def plot_track_score_distribution(probs: np.ndarray, truth: np.ndarray) -> Figure:
         """1D score histogram: HS tracks vs PU tracks overlaid."""
         fig, ax = plt.subplots(figsize=(7, 5))

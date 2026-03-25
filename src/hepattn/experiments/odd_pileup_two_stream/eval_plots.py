@@ -278,6 +278,20 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
                 cluster_data["event_idx"].append(event_indices)
                 event_counter += len(counts)
 
+                # Per-event mask energy sums (binary mask, no fraction regression)
+                if "calo_mask" in calo_final:
+                    pred_mask_b  = (calo_final["calo_mask"]["calo_node_prob"] > 0.5).float()
+                    truth_mask_b = (
+                        (labels["calo_hard_scatter_energy_frac"] > 0.05)
+                        & (labels["calo_hard_scatter_energy"] > 0.15)
+                    ).float()
+                    node_e_b = labels["node_e"]
+                    cluster_valid = cluster_node_mask.float()
+                    cluster_data["evt_pred_mask_e"].append(
+                        (pred_mask_b  * cluster_valid * node_e_b).sum(dim=-1).cpu().numpy())
+                    cluster_data["evt_truth_mask_e"].append(
+                        (truth_mask_b * cluster_valid * node_e_b).sum(dim=-1).cpu().numpy())
+
                 # Per-event neutral/charged HS energy (mask-weighted sums)
                 if "calo_mask" in calo_final and "calo_hs_neutral_energy" in labels:
                     pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > 0.5).float()  # (B, N)
@@ -345,6 +359,12 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
             _plot("calo/event_hs_energy_ratio", PhysicsPlotter.plot_calo_event_hs_energy_ratio,
                   cluster_data["pred_frac"], cluster_data["total_e"],
                   cluster_data["true_hs_e"], cluster_data["event_idx"])
+
+    # ── Per-event mask energy ratio (binary mask, no fraction regression) ──
+    if cluster_data.get("evt_pred_mask_e") is not None and len(cluster_data.get("evt_pred_mask_e", [])) > 0:
+        _plot("calo/mask_energy_ratio", PhysicsPlotter.plot_calo_mask_energy_ratio,
+              cluster_data["mask_pred"], cluster_data["mask_truth"],
+              cluster_data["total_e"], cluster_data["true_hs_e"], cluster_data["event_idx"])
 
     # ── Per-event neutral/charged HS energy histograms ──
     if cluster_data.get("evt_pred_neutral_e") is not None and len(cluster_data.get("evt_pred_neutral_e", [])) > 0:
@@ -524,6 +544,27 @@ def make_data_plots(dataset_or_loader) -> dict[str, plt.Figure]:
     _plot("data/deltaR_window_analysis", PhysicsPlotter.plot_deltaR_window_analysis, stats)
     _plot("data/eta_window_analysis",    PhysicsPlotter.plot_eta_window_analysis,    stats)
     _plot("data/phi_window_analysis",    PhysicsPlotter.plot_phi_window_analysis,    stats)
+
+    # ── HS mask energy efficiency vs threshold ──
+    if ("deps_hard_scatter_energy_deps_in_cluster" in dataset.full_data_array
+            and "deps_cluster_idx" in dataset.full_data_array
+            and "total_cluster_energy" in dataset.full_data_array
+            and hasattr(dataset, "deps_cumsum")):
+        n_clusters_total = int(dataset.cluster_cumsum[-1])
+        true_hs_e = np.zeros(n_clusters_total, dtype=np.float32)
+        d_energy = dataset.full_data_array["deps_hard_scatter_energy_deps_in_cluster"].numpy()
+        d_cluster_idx_local = dataset.full_data_array["deps_cluster_idx"].numpy().astype(int)
+        for evt_idx in range(dataset.num_events):
+            d_start = int(dataset.deps_cumsum[evt_idx])
+            d_end = int(dataset.deps_cumsum[evt_idx + 1])
+            c_start = int(dataset.cluster_cumsum[evt_idx])
+            if d_end > d_start:
+                global_idx = d_cluster_idx_local[d_start:d_end] + c_start
+                np.add.at(true_hs_e, global_idx, d_energy[d_start:d_end])
+        total_cluster_e = dataset.full_data_array["total_cluster_energy"].numpy()
+        true_frac = true_hs_e / (total_cluster_e + 1e-6)
+        _plot("data/mask_hs_energy_efficiency", PhysicsPlotter.plot_mask_hs_energy_efficiency,
+              true_hs_e, true_frac)
 
     return figs
 

@@ -113,7 +113,7 @@ def mask_dice_cost(pred_logits, targets, input_pad_mask=None, sample_weight=None
     return 1 - (numerator + 1) / (denominator + 1)
 
 
-def mask_tversky_loss(pred_logits, targets, alpha=0.2, beta=0.8, object_valid_mask=None, input_pad_mask=None, sample_weight=None):  # noqa: ARG001
+def mask_tversky_loss(pred_logits, targets, alpha=0.1, beta=0.9, object_valid_mask=None, input_pad_mask=None, sample_weight=None):  # noqa: ARG001
     """Tversky loss for asymmetric FP/FN penalization in mask prediction.
 
     Generalizes Dice with separate weights for FP (alpha) and FN (beta).
@@ -123,8 +123,8 @@ def mask_tversky_loss(pred_logits, targets, alpha=0.2, beta=0.8, object_valid_ma
     Args:
         pred_logits: [batch_size, num_objects, num_inputs] - predicted logits for binary masks
         targets: [batch_size, num_objects, num_inputs] - ground truth binary masks
-        alpha: FP penalty weight (default 0.2)
-        beta: FN penalty weight (default 0.8)
+        alpha: FP penalty weight (default 0.1)
+        beta: FN penalty weight (default 0.9)
         object_valid_mask: [batch_size, num_objects] - mask indicating valid target objects
         input_pad_mask: [batch_size, num_inputs] - mask indicating valid inputs
         sample_weight: Not used by Tversky.

@@ -238,7 +238,7 @@ model:
                 input_hit: node
                 losses:
                   mask_bce: 5.0
-                  mask_tversky: 2.0
+                  mask_tversky: 5.0
                 dim: *dim
                 net:
                   class_path: hepattn.models.Dense
