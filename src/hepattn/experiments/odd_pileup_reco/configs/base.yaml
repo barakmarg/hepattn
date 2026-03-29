@@ -1,12 +1,13 @@
-# ODD Two-Stream Causally-Conditioned Hybrid Query MaskFormer
+# ODD Three-Stream MaskFormer: Pileup Removal + Reconstruction
 # Stream A: Track MaskFormer (isolated, protects Track F1)
-# Stream B: Calo MaskFormer (hybrid queries from HS tracks + global neutral query)
+# Stream B: Calo MaskFormer (hybrid queries from HS tracks + latent queries)
+# Stream C: Reconstruction (standard MaskFormerDecoder with Hungarian matching)
 
 name: odd_pflow_reco
 seed_everything: 42
 
 # =============================================================================
-# Data Configuration (same as single-stream baseline)
+# Data Configuration
 # =============================================================================
 data:
   inputs:
@@ -27,6 +28,9 @@ data:
       - eta
       - sinphi
       - cosphi
+
+  # Maximum number of reconstructed particles (for incidence matrix / queries)
+  num_objects: &num_reco_particles 400
 
   train_path: /storage/agrp/barakma/PileupODD/data/fervefvef
   valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
@@ -51,7 +55,7 @@ data:
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
-  scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_maskformer/configs/odd_var_transform.yaml
+  scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/configs/odd_var_transform.yaml
   max_nodes: 5500
   window_size: 256
 
@@ -71,7 +75,7 @@ trainer:
   logger:
     class_path: hepattn.experiments.odd_pileup_maskformer.logger_utils.FixedCometLogger
     init_args:
-      project: odd-pflow-two-stream
+      project: odd-pflow-reco
 
   callbacks:
     - class_path: hepattn.callbacks.Compile
@@ -81,7 +85,6 @@ trainer:
       init_args:
         monitor: val/loss
         save_last: true
-    - class_path: hepattn.experiments.odd_pileup_maskformer.PflowPredictionWriter
     - class_path: lightning.pytorch.callbacks.ModelSummary
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
     - class_path: lightning.pytorch.callbacks.TQDMProgressBar
@@ -89,7 +92,7 @@ trainer:
         refresh_rate: 50
 
 # =============================================================================
-# Model Configuration — Two-Stream MaskFormer
+# Model Configuration — Three-Stream MaskFormer
 # =============================================================================
 model:
   optimizer: AdamW
@@ -105,7 +108,7 @@ model:
   mtl: false
 
   model:
-    class_path: hepattn.experiments.odd_pileup_two_stream.model.TwoStreamMaskFormer
+    class_path: hepattn.experiments.odd_pileup_reco.model.TwoStreamMaskFormer
     init_args:
       dim: &dim 128
       target_object: particle
@@ -116,6 +119,10 @@ model:
       # Raw variables forwarded through x dict
       raw_variables:
         - "node_e"
+        - "node_pt"
+        - "node_eta"
+        - "node_sinphi"
+        - "node_cosphi"
         - "node_is_track"
         - "tracks_mask"
 
@@ -181,8 +188,6 @@ model:
         class_path: torch.nn.ModuleList
         init_args:
           modules:
-            # Task 1: Iterative learnable attention mask (MaskFormer core)
-            # Target: particle_node_valid (True for HS tracks only)
             - class_path: hepattn.models.task.ObjectHitMaskTask
               init_args:
                 name: mask
@@ -200,7 +205,6 @@ model:
                 null_weight: 0.06
                 has_intermediate_loss: true
 
-            # Task 2: Vertex z regression from query embedding
             - class_path: hepattn.models.task.ObjectRegressionTask
               init_args:
                 name: vz_regression
@@ -218,7 +222,7 @@ model:
       # Stream B: Calo Decoder + Tasks
       # =====================================================================
       calo_decoder:
-        class_path: hepattn.experiments.odd_pileup_two_stream.decoder.CaloFlashCrossAttentionDecoder
+        class_path: hepattn.experiments.odd_pileup_reco.decoder.CaloFlashCrossAttentionDecoder
         init_args:
           dim: *dim
           num_decoder_layers: 4
@@ -231,8 +235,7 @@ model:
         class_path: torch.nn.ModuleList
         init_args:
           modules:
-            # Task 1: Node-classification calo HS mask (Dense head on enriched nodes)
-            - class_path: hepattn.experiments.odd_pileup_two_stream.tasks.CaloNodeMaskTask
+            - class_path: hepattn.experiments.odd_pileup_reco.tasks.CaloNodeMaskTask
               init_args:
                 name: calo_mask
                 input_hit: node
@@ -254,23 +257,138 @@ model:
                 hs_frac_threshold: 0.05
                 has_intermediate_loss: false
 
-            # Task 2: Node-classification calo energy fraction (Dense head on enriched nodes)
-            - class_path: hepattn.experiments.odd_pileup_two_stream.tasks.CaloNodeFractionTask
+      # =====================================================================
+      # Stream C: Reconstruction Decoder + Tasks
+      # =====================================================================
+      max_reco_calo_nodes: 1200
+      max_reco_nodes: 1400
+      num_reco_queries: *num_reco_particles
+      reco_target_object: reco_particle
+      calo_hs_frac_threshold: 0.05
+      calo_hs_energy_threshold: 0.15
+      calo_pred_threshold: 0.2
+      reco_calo_noise_mean: 300
+      reco_calo_noise_std: 50.0
+
+      reco_decoder:
+        class_path: hepattn.models.decoder.MaskFormerDecoder
+        init_args:
+          num_decoder_layers: 4
+          num_queries: *num_reco_particles
+          mask_attention: true
+          use_query_masks: false
+          decoder_layer_config:
+            dim: *dim
+            hybrid_norm: true
+            bidirectional_ca: true
+            attn_kwargs:
+              num_heads: 16
+
+      reco_matcher:
+        class_path: hepattn.models.matcher.Matcher
+        init_args:
+          default_solver: scipy
+          adaptive_solver: false
+          parallel_solver: true
+          n_jobs: 16
+
+      reco_tasks:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            # 1. Classification task (6 classes: 0-4 real + 5 null)
+            - class_path: hepattn.models.task.ObjectClassificationTask
               init_args:
-                name: calo_fraction
-                input_hit: node
-                dim: *dim
+                name: classification
+                input_object: query
+                output_object: reco_pflow
+                target_object: reco_particle
+                num_classes: 5
+                losses:
+                  object_ce: 2
+                costs:
+                  object_ce: 2
                 net:
                   class_path: hepattn.models.Dense
                   init_args:
                     input_size: *dim
-                    output_size: 1
+                    activation: torch.nn.SiLU
+                    output_size: 6
+                    hidden_layers: [128, 64, 32]
+                null_weight: 0.5
+                loss_class_weights: [1.0, 3.0, 8.0, 1.5, 1.0]
+                mask_queries: false
+                has_intermediate_loss: true
+
+            # 2. Mask task (object-hit association)
+            - class_path: hepattn.models.task.ObjectHitMaskTask
+              init_args:
+                name: mask
+                input_hit: node
+                input_object: query
+                output_object: reco_pflow
+                target_object: reco_particle
+                pred_threshold: 0.1
+                logit_scale: 4
+                losses:
+                  mask_bce: 5.0
+                  mask_dice: 1.0
+                costs:
+                  mask_dice: 1.0
+                dim: *dim
+                null_weight: 1.0
+                has_intermediate_loss: true
+
+            # 3. Incidence regression (energy-weighted particle-node assignment)
+            - class_path: hepattn.models.task.IncidenceRegressionTask
+              init_args:
+                name: incidence
+                input_hit: node
+                input_object: query
+                output_object: reco_pflow
+                target_object: reco_particle
+                losses:
+                  kl_div: 1.0
+                costs:
+                  kl_div: 1.0
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    activation: torch.nn.SiLU
+                    output_size: *dim
+                    hidden_layers: [*dim, *dim]
+                node_net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    output_size: *dim
+                    hidden_layers: [*dim]
+                has_intermediate_loss: false
+
+            # 4. Incidence-based regression (particle kinematics)
+            - class_path: hepattn.models.task.IncidenceBasedRegressionTask
+              init_args:
+                name: regression
+                fields: ["e", "pt", "eta", "sinphi", "cosphi"]
+                input_hit: node
+                input_object: query
+                output_object: reco_pflow
+                target_object: reco_particle
+                loss: l1
+                loss_weight: 10.0
+                cost_weight: 10.0
+                use_incidence: true
+                use_nodes: true
+                cost: new
+                mode: scale
+                scale_dict_path: *scale_dict_path
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    # Input: 2*dim + num_raw_vars = 2*128 + 6 = 262
+                    input_size: 262
+                    activation: torch.nn.SiLU
+                    output_size: 5
                     hidden_layers: [256, 128, 64, 32]
-                    activation:
-                      class_path: torch.nn.SiLU
-                    final_activation:
-                      class_path: torch.nn.Sigmoid
-                loss_weight: 0.01
-                hs_energy_threshold: 0.15
-                hs_frac_threshold: 0.05
                 has_intermediate_loss: false

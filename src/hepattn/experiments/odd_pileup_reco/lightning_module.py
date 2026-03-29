@@ -11,11 +11,29 @@ from hepattn.experiments.odd_pileup_maskformer.plots import PhysicsPlotter
 from hepattn.models.wrapper import ModelWrapper
 
 
-class ODDPFlowTwoStream(ModelWrapper):
-    """Lightning module for the Two-Stream MaskFormer.
+class MaskInference:
+    """Mask evaluation utilities for reconstruction metrics."""
 
-    Handles the two-stream output format where predictions are keyed as
-    track_final/calo_final instead of just final.
+    @staticmethod
+    def exact_match(pred, tgt):
+        if len(tgt) == 0:
+            return torch.tensor(torch.nan)
+        return (pred == tgt).all(-1).float().mean()
+
+    @staticmethod
+    def eff(pred, tgt):
+        return ((pred & tgt).sum(-1) / tgt.sum(-1)).mean()
+
+    @staticmethod
+    def pur(pred, tgt):
+        return ((pred & tgt).sum(-1) / pred.sum(-1)).mean()
+
+
+class ODDPFlowTwoStream(ModelWrapper):
+    """Lightning module for the Two-Stream MaskFormer with Reconstruction.
+
+    Handles the two/three-stream output format where predictions are keyed as
+    track_final/calo_final/reco_final instead of just final.
     """
 
     def __init__(
@@ -28,6 +46,8 @@ class ODDPFlowTwoStream(ModelWrapper):
     ):
         super().__init__(name, model, lrs_config, optimizer, mtl)
 
+        self.MI = MaskInference
+
         # Track classification metrics (from Stream A)
         self.track_f1 = tm.classification.BinaryF1Score()
         self.track_precision = tm.classification.BinaryPrecision()
@@ -38,16 +58,74 @@ class ODDPFlowTwoStream(ModelWrapper):
         self.calo_mask_precision = tm.classification.BinaryPrecision()
         self.calo_mask_recall = tm.classification.BinaryRecall()
 
+        # Reconstruction metrics (from Stream C)
+        self.obj_accuracy_micro = tm.classification.MulticlassAccuracy(num_classes=6, average="micro")
+        self.obj_accuracy_macro = tm.classification.MulticlassAccuracy(num_classes=6, average="macro")
+        self.reco_eff = tm.classification.BinaryRecall()
+        self.reco_pur = tm.classification.BinaryPrecision()
+
         # Accumulation buffers for end-of-epoch physics plots
         self._val_track_data: dict[str, list] = defaultdict(list)
         self._val_cluster_data: dict[str, list] = defaultdict(list)
 
     # ------------------------------------------------------------------
-    # Override log_task_metrics to handle two-stream output format
+    # Override training/validation steps to pass targets to forward
+    # (needed for teacher forcing in Stream C)
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx):
+        inputs, targets = batch
+        outputs = self.model(inputs, targets=targets)
+
+        losses = self.model.loss(outputs, targets)
+        total_loss = self.log_losses(losses, "train")
+
+        for layer_name, layer_losses in losses.items():
+            for task_name, task_losses in layer_losses.items():
+                for loss_name, loss_value in task_losses.items():
+                    if isinstance(loss_value, torch.Tensor):
+                        if torch.isnan(loss_value).any():
+                            print(f"NaN in loss: {layer_name}_{task_name}_{loss_name} at batch {batch_idx}")
+                        if torch.isinf(loss_value).any():
+                            print(f"Inf in loss: {layer_name}_{task_name}_{loss_name} at batch {batch_idx}")
+
+        if batch_idx % self.trainer.log_every_n_steps == 0:
+            preds = self.predict(outputs)
+            self.log_metrics(preds, targets, "train")
+
+        if self.mtl:
+            self.mlt_opt(losses, outputs)
+            return None
+
+        return total_loss
+
+    def validation_step(self, batch):
+        inputs, targets = batch
+        outputs = self.model(inputs, targets=targets)
+
+        losses = self.model.loss(outputs, targets)
+        self.log_losses(losses, "val")
+
+        preds = self.predict(outputs)
+        self.log_metrics(preds, targets, "val")
+        return outputs, preds, losses
+
+    def test_step(self, batch, batch_idx):
+        inputs, targets = batch
+        outputs = self.model(inputs, targets=targets)
+
+        losses = self.model.loss(outputs, targets)
+        self.log_losses(losses, "test")
+
+        preds = self.predict(outputs)
+        self.log_metrics(preds, targets, "test")
+        return outputs, preds, losses
+
+    # ------------------------------------------------------------------
+    # Override log_task_metrics to handle multi-stream output format
     # ------------------------------------------------------------------
 
     def log_task_metrics(self, preds, targets, stage):
-        # Task metrics are handled by log_custom_metrics for the two-stream model
         pass
 
     # ------------------------------------------------------------------
@@ -67,28 +145,6 @@ class ODDPFlowTwoStream(ModelWrapper):
         cluster = {k: np.concatenate(v) for k, v in self._val_cluster_data.items()}
 
         figs = {}
-        if cluster.get("pred_frac") is not None and len(cluster["pred_frac"]) > 0:
-            figs["calo/energy_corr"] = PhysicsPlotter.plot_energy_correlation(
-                cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
-            )
-            figs["calo/frac_corr"] = PhysicsPlotter.plot_calo_frac_correlation(
-                cluster["pred_frac"], cluster["true_frac"]
-            )
-            figs["calo/frac_dist"] = PhysicsPlotter.plot_calo_frac_distribution(
-                cluster["pred_frac"], cluster["true_frac"]
-            )
-            figs["calo/energy_resid"] = PhysicsPlotter.plot_energy_residual(
-                cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
-            )
-            figs["calo/hs_energy_dist"] = PhysicsPlotter.plot_hs_energy_distribution(
-                cluster["pred_frac"], cluster["total_e"], cluster["true_hs_e"]
-            )
-            if cluster.get("event_idx") is not None:
-                figs["calo/event_hs_energy_ratio"] = PhysicsPlotter.plot_calo_event_hs_energy_ratio(
-                    cluster["pred_frac"], cluster["total_e"],
-                    cluster["true_hs_e"], cluster["event_idx"],
-                )
-
         if cluster.get("evt_pred_neutral_e") is not None and len(cluster.get("evt_pred_neutral_e", [])) > 0:
             figs["calo/hs_energy_residual_by_type"] = PhysicsPlotter.plot_hs_energy_residual_by_type(
                 cluster["evt_pred_neutral_e"], cluster["evt_truth_neutral_e"],
@@ -98,40 +154,6 @@ class ODDPFlowTwoStream(ModelWrapper):
                 cluster["evt_pred_neutral_e"], cluster["evt_truth_neutral_e"],
                 cluster["evt_pred_charged_e"], cluster["evt_truth_charged_e"],
             )
-
-        # if cluster.get("calo_mask_probs") is not None and len(cluster.get("calo_mask_probs", [])) > 0:
-        #     figs["calo/mask_f1_vs_threshold"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold(
-        #         cluster["calo_mask_probs"], cluster["mask_truth"], cluster["total_e"],
-        #     )
-        #     if cluster.get("true_frac") is not None:
-        #         figs["calo/mask_f1_vs_threshold_by_hs_frac"] = PhysicsPlotter.plot_calo_mask_f1_vs_threshold_by_hs_frac(
-        #             cluster["calo_mask_probs"], cluster["mask_truth"], cluster["true_frac"],
-        #         )
-
-        if cluster.get("mask_pred") is not None and len(cluster.get("mask_pred", [])) > 0:
-            # for bin_key, bin_fig in PhysicsPlotter.plot_calo_mask_errors_by_energy(
-            #     cluster["mask_pred"], cluster["mask_truth"],
-            #     cluster["total_e"], cluster["true_hs_e"], cluster["pred_frac"],
-            # ).items():
-            #     figs[f"calo/mask_errors_by_energy/{bin_key}"] = bin_fig
-            # figs["calo/mistag_eta"] = PhysicsPlotter.plot_calo_mistag_vs_eta(
-            #     cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
-            # )
-            # figs["calo/mask_metrics_vs_eta"] = PhysicsPlotter.plot_calo_mask_metrics_vs_eta(
-            #     cluster["mask_pred"], cluster["mask_truth"], cluster["eta"],
-            # )
-            # if cluster.get("phi") is not None:
-            #     figs["calo/mask_metrics_vs_phi"] = PhysicsPlotter.plot_calo_mask_metrics_vs_phi(
-            #         cluster["mask_pred"], cluster["mask_truth"], cluster["phi"],
-            #     )
-            # if cluster.get("total_e") is not None:
-            #     figs["calo/mask_metrics_vs_energy"] = PhysicsPlotter.plot_calo_mask_metrics_vs_cluster_energy(
-            #         cluster["mask_pred"], cluster["mask_truth"], cluster["total_e"],
-            #     )
-            if cluster.get("true_frac") is not None:
-                figs["calo/mask_metrics_vs_hs_frac"] = PhysicsPlotter.plot_calo_mask_metrics_vs_hs_frac(
-                    cluster["mask_pred"], cluster["mask_truth"], cluster["true_frac"],
-                )
 
         if track.get("probs") is not None and len(track["probs"]) > 0:
             figs["track/score_dist"] = PhysicsPlotter.plot_track_score_distribution(
@@ -152,12 +174,6 @@ class ODDPFlowTwoStream(ModelWrapper):
             figs["track/score_by_pt"] = PhysicsPlotter.plot_track_score_by_pt(
                 track["probs"], track["truth"], track["pt"]
             )
-            # figs["track/f1_vs_threshold"] = PhysicsPlotter.plot_track_f1_vs_threshold(
-            #     track["probs"], track["truth"], track["pt"]
-            # )
-            # figs["track/roc"] = PhysicsPlotter.plot_roc_curve(
-            #     track["probs"], track["truth"]
-            # )
             if track.get("z0") is not None and len(track["z0"]) > 0:
                 figs["track/z0_dist"] = PhysicsPlotter.plot_track_z0_distribution(
                     track["probs"], track["truth"], track["z0"]
@@ -174,7 +190,6 @@ class ODDPFlowTwoStream(ModelWrapper):
                     exp.log_figure(figure_name=name, figure=fig, step=self.current_epoch)
                     plt.close(fig)
                 return
-        # Fallback: just close figures without logging
         for fig in figs.values():
             plt.close(fig)
 
@@ -185,7 +200,6 @@ class ODDPFlowTwoStream(ModelWrapper):
     def log_custom_metrics(self, preds, labels, stage):
         kwargs = {"sync_dist": True, "batch_size": 1}
 
-        # Skip detailed metrics during training for speed
         if stage == "train":
             return
 
@@ -197,7 +211,6 @@ class ODDPFlowTwoStream(ModelWrapper):
         track_node_mask = node_valid & is_track
 
         if track_node_mask.any() and "mask" in track_final:
-            # Mask task output shape: (B, 1, N) → squeeze query dim → (B, N)
             track_prob = track_final["mask"]["pflow_node_prob"].squeeze(-2)[track_node_mask]
             track_truth = labels["tracks_mask"][track_node_mask].int()
 
@@ -210,7 +223,6 @@ class ODDPFlowTwoStream(ModelWrapper):
             self.track_recall(track_prob, track_truth)
             self.log(f"{stage}/track_recall", self.track_recall, **kwargs)
 
-            # Accumulate for epoch-end plots
             if stage == "val":
                 self._val_track_data["probs"].append(track_prob.detach().float().cpu().numpy())
                 self._val_track_data["truth"].append(track_truth.detach().cpu().numpy())
@@ -220,8 +232,8 @@ class ODDPFlowTwoStream(ModelWrapper):
 
         # === Vz Regression Metrics (Stream A) ===
         if "vz_regression" in track_final:
-            pred_vz = track_final["vz_regression"]["pflow_vz"]  # (B, 1)
-            true_vz = labels["particle_vz"]  # (B, 1)
+            pred_vz = track_final["vz_regression"]["pflow_vz"]
+            true_vz = labels["particle_vz"]
             vz_mae = F.l1_loss(pred_vz, true_vz)
             self.log(f"{stage}/vz_mae", vz_mae, **kwargs)
 
@@ -233,7 +245,6 @@ class ODDPFlowTwoStream(ModelWrapper):
             calo_mask_prob = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
             calo_hs_energy = labels["calo_hard_scatter_energy"]
             calo_hs_frac = labels["calo_hard_scatter_energy_frac"]
-            # Derive thresholds from the CaloHitMaskTask config
             calo_mask_task = self.model.calo_tasks[0]
             calo_mask_truth = (
                 (calo_hs_frac[cluster_node_mask] > calo_mask_task.hs_frac_threshold)
@@ -249,50 +260,9 @@ class ODDPFlowTwoStream(ModelWrapper):
             self.calo_mask_recall(calo_mask_prob, calo_mask_truth)
             self.log(f"{stage}/calo_mask_recall", self.calo_mask_recall, **kwargs)
 
-        # === Cluster Fraction Metrics (Stream B) ===
-        if cluster_node_mask.any() and "calo_fraction" in calo_final:
-            calo_frac_pred = calo_final["calo_fraction"]["calo_hs_fraction"].squeeze(-1)[cluster_node_mask]
-            calo_frac_true = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
-
-            # Overall MAE
-            mae = F.l1_loss(calo_frac_pred, calo_frac_true)
-            self.log(f"{stage}/calo_frac_mae", mae, **kwargs)
-
-            # Per-type MAE based on true HS energy fraction
-            type_masks = {
-                "pu_only": calo_frac_true < 0.02,
-                "mix_pu": (calo_frac_true >= 0.03) & (calo_frac_true <= 0.30),
-                "balanced": (calo_frac_true > 0.30) & (calo_frac_true < 0.70),
-                "mix_hs": (calo_frac_true >= 0.70) & (calo_frac_true <= 0.97),
-                "hs_only": calo_frac_true > 0.98,
-            }
-            for type_name, type_mask in type_masks.items():
-                if type_mask.any():
-                    mae = F.l1_loss(calo_frac_pred[type_mask], calo_frac_true[type_mask])
-                    self.log(f"{stage}/calo_frac_mae_{type_name}", mae, **kwargs)
-
-            # Hard scatter energy ratio
-            node_e = labels["node_e"][cluster_node_mask]
-            true_hs_energy = labels["calo_hard_scatter_energy"][cluster_node_mask]
-            sum_true = true_hs_energy.sum()
-            if sum_true > 0:
-                pred_hs_energy = calo_frac_pred * node_e
-                hs_energy_ratio = pred_hs_energy.sum() / sum_true
-                self.log(f"{stage}/calo_hs_energy_ratio", hs_energy_ratio, **kwargs)
-
-            # Accumulate for epoch-end plots
-            if stage == "val":
-                self._val_cluster_data["pred_frac"].append(calo_frac_pred.detach().float().cpu().numpy())
-                self._val_cluster_data["true_frac"].append(calo_frac_true.detach().float().cpu().numpy())
-                self._val_cluster_data["total_e"].append(node_e.detach().float().cpu().numpy())
-                self._val_cluster_data["true_hs_e"].append(true_hs_energy.detach().float().cpu().numpy())
-
-                # Accumulate for diagnostic plots (regional energy + cluster swap)
-                self._val_cluster_data["eta"].append(labels["node_eta"][cluster_node_mask].detach().float().cpu().numpy())
-                self._val_cluster_data["phi"].append(labels["node_phi"][cluster_node_mask].detach().float().cpu().numpy())
-
-                # Calo mask predictions for cluster swap plot
-                if "calo_mask" in calo_final:
+        # === Calo Mask Validation Accumulation (Stream B) ===
+        if cluster_node_mask.any() and stage == "val":
+            if "calo_mask" in calo_final:
                     calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
                     calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
                     calo_hs_frac_flat = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
@@ -303,8 +273,7 @@ class ODDPFlowTwoStream(ModelWrapper):
                         ((calo_hs_frac_flat > calo_mask_task.hs_frac_threshold) & (calo_hs_e_flat > calo_mask_task.hs_energy_threshold)).detach().cpu().numpy()
                     )
 
-                # Per-event indices for grouping clusters by event
-                counts = cluster_node_mask.sum(dim=-1).cpu().numpy()  # (B,)
+                counts = cluster_node_mask.sum(dim=-1).cpu().numpy()
                 event_indices = np.repeat(
                     np.arange(self._val_event_counter, self._val_event_counter + len(counts)),
                     counts,
@@ -312,18 +281,17 @@ class ODDPFlowTwoStream(ModelWrapper):
                 self._val_cluster_data["event_idx"].append(event_indices)
                 self._val_event_counter += len(counts)
 
-                # Per-event neutral/charged HS energy (mask-weighted sums)
                 if "calo_mask" in calo_final:
                     calo_mask_task = self.model.calo_tasks[0]
-                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > calo_mask_task.pred_threshold).float()  # (B, N)
+                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > calo_mask_task.pred_threshold).float()
                     truth_mask_b = (
                         (labels["calo_hard_scatter_energy_frac"] > calo_mask_task.hs_frac_threshold)
                         & (labels["calo_hard_scatter_energy"] > calo_mask_task.hs_energy_threshold)
-                    ).float()  # (B, N)
+                    ).float()
 
-                    cluster_valid = cluster_node_mask.float()  # (B, N)
-                    neutral_e = labels["calo_hs_neutral_energy"]  # (B, N)
-                    charged_e = labels["calo_hs_charged_energy"]  # (B, N)
+                    cluster_valid = cluster_node_mask.float()
+                    neutral_e = labels["calo_hs_neutral_energy"]
+                    charged_e = labels["calo_hs_charged_energy"]
 
                     self._val_cluster_data["evt_pred_neutral_e"].append(
                         (pred_mask_b * cluster_valid * neutral_e).sum(dim=-1).detach().cpu().numpy())
@@ -333,3 +301,48 @@ class ODDPFlowTwoStream(ModelWrapper):
                         (pred_mask_b * cluster_valid * charged_e).sum(dim=-1).detach().cpu().numpy())
                     self._val_cluster_data["evt_truth_charged_e"].append(
                         (truth_mask_b * cluster_valid * charged_e).sum(dim=-1).detach().cpu().numpy())
+
+        # === Reconstruction Metrics (Stream C) ===
+        reco_final = preds.get("reco_final", {})
+
+        if "classification" in reco_final:
+            reco_target_obj = self.model.reco_target_object
+            class_key = f"{reco_target_obj}_class"
+            if class_key in labels:
+                particle_class_preds = reco_final["classification"][f"{self.model.reco_target_object.replace('reco_', 'reco_pflow_')}class"]
+                particle_class_labels = labels[class_key]
+
+                self.obj_accuracy_micro(particle_class_preds.view(-1), particle_class_labels.view(-1))
+                self.log(f"{stage}/reco_obj_class_accuracy_micro", self.obj_accuracy_micro, **kwargs)
+                self.obj_accuracy_macro(particle_class_preds.view(-1), particle_class_labels.view(-1))
+                self.log(f"{stage}/reco_obj_class_accuracy_macro", self.obj_accuracy_macro, **kwargs)
+
+                truth_valid = particle_class_labels < 5
+                pred_valid = particle_class_preds < 5
+                self.reco_eff(pred_valid, truth_valid)
+                self.reco_pur(pred_valid, truth_valid)
+                self.log(f"{stage}/reco_eff", self.reco_eff, **kwargs)
+                self.log(f"{stage}/reco_pur", self.reco_pur, **kwargs)
+
+        if "mask" in reco_final:
+            reco_target_obj = self.model.reco_target_object
+            valid_key = f"{reco_target_obj}_valid"
+            mask_key = f"{reco_target_obj}_node_valid"
+            if valid_key in labels and mask_key in labels:
+                truth_valid = labels[valid_key]
+                pred_masks = list(reco_final["mask"].values())[0].squeeze()  # pred node_valid
+                truth_masks = labels[mask_key].squeeze()
+
+                if truth_valid.any():
+                    # Only evaluate on valid particles
+                    tv = truth_valid.squeeze()
+                    if pred_masks.dim() > 1 and tv.dim() > 0:
+                        pm = pred_masks[tv]
+                        tm_v = truth_masks[tv]
+                        if len(pm) > 0 and pm.sum(-1).gt(0).any():
+                            recall_idx = tm_v.sum(-1) > 0
+                            if recall_idx.any():
+                                self.log(f"{stage}/reco_mask_recall", self.MI.eff(pm[recall_idx], tm_v[recall_idx]), **kwargs)
+                            pur_idx = pm.sum(-1) > 0
+                            if pur_idx.any():
+                                self.log(f"{stage}/reco_mask_purity", self.MI.pur(pm[pur_idx], tm_v[pur_idx]), **kwargs)

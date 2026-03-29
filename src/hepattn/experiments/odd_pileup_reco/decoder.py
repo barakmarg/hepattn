@@ -3,7 +3,7 @@ from functools import partial
 import torch
 from torch import Tensor, nn
 
-from hepattn.experiments.odd_pileup_reco.decoder import PileupMaskFormerDecoder
+from hepattn.experiments.odd_pileup_maskformer.decoder import PileupMaskFormerDecoder
 from hepattn.models.attention import Attention, repad_from_flash_varlen, unpad_for_flash_varlen
 from hepattn.models.decoder import BiCrossAttentionLayer
 from hepattn.models.dense import Dense
