@@ -132,7 +132,7 @@ model:
                 net:
                   class_path: hepattn.models.Dense
                   init_args:
-                    input_size: 21
+                    input_size: 25
                     output_size: *dim
                 posenc:
                   class_path: hepattn.models.posenc.FourierPositionEncoder

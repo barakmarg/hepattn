@@ -82,6 +82,32 @@ truth_vz_pt2_weighted:
   std: 84.891
   min: -3258.8792
   max: 3710.9431
+cluster_time:
+  type: std
+  mean: 0.0413
+  std: 3.3287
+  min: -44.6871
+  max: 45.861
+number_of_hits:
+  type: min_max_sym
+  mean: 187.3859
+  std: 1322.466
+  min: 1.0
+  max: 76064
+energy_hits_std:
+  type: std
+  fn: sqrt
+  mean: 0.2317
+  std: 0.1599
+  min: 0.0
+  max: 3.1407
+max_hit_energy:
+  type: min_max_sym
+  fn: sqrt
+  mean: 0.5516
+  std: 0.3184
+  min: 0.0879
+  max: 10.6855
 #truth_vz_pt2_weighted	truth_vz_mean	truth_vz_std	truth_vz_min	truth_vz_max
 #f32	f32	f32	f32	f32
 #-23.240768	-0.436598	84.890968	-3258.87915	3710.943115

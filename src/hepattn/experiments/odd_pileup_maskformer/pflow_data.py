@@ -192,10 +192,11 @@ class ODDDatasetPileup(Dataset):
         
         # List of variables to extract (keeping consistent with original code)
         track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "phi_int", "eta_int",
-                      "track_tanlambda", "track_omega", "particle_idx", "vertex_primary"]
+                      "track_tanlambda", "track_omega", "particle_idx", "majority_particle_vertex_primary"]
         cluster_vars = ["total_cluster_energy", "cluster_rho",
                         "cluster_eta", "cluster_phi",
-                        "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho"]
+                        "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho",
+                        "cluster_time", "number_of_hits", "energy_hits_std", "max_hit_energy"]
         deps_vars = ["hard_scatter_energy_deps_in_cluster", "cluster_idx",
                      "hs_neutral_energy_in_cluster", "hs_charged_energy_in_cluster"]
 
@@ -372,7 +373,7 @@ class ODDDatasetPileup(Dataset):
         print(f"Number of events after filtering: {self.num_events}")
 
         # Print pileup vs hard scatter track statistics
-        vertex_primary = self.full_data_array["track_vertex_primary"]
+        vertex_primary = self.full_data_array["track_majority_particle_vertex_primary"]
         n_hard_scatter = (vertex_primary == 1).sum().item()
         n_pileup = (vertex_primary != 1).sum().item()
         n_total_tracks = len(vertex_primary)
@@ -506,7 +507,7 @@ class ODDDatasetPileup(Dataset):
         t_sinphi_int = get_t("track_sinphi_int", t_start, t_end)
         t_tanlambda = get_t("track_tanlambda", t_start, t_end)
         t_omega = get_t("track_omega", t_start, t_end)
-        t_vertex_primary = get_t("track_vertex_primary", t_start, t_end)
+        t_vertex_primary = get_t("track_majority_particle_vertex_primary", t_start, t_end)
         t_vertex_primary_mask = (t_vertex_primary == 1).float() # New mask for primary vertex tracks
         
         # --- Clusters ---
@@ -520,6 +521,10 @@ class ODDDatasetPileup(Dataset):
         c_sigma_phi = get_t("sigma_phi", c_start, c_end)
         c_sigma_rho = get_t("sigma_rho", c_start, c_end)
         c_hcal_fraction = get_t("hcal_fraction", c_start, c_end)
+        c_cluster_time = get_t("cluster_time", c_start, c_end)
+        c_number_of_hits = get_t("number_of_hits", c_start, c_end)
+        c_energy_hits_std = get_t("energy_hits_std", c_start, c_end)
+        c_max_hit_energy = get_t("max_hit_energy", c_start, c_end)
 
         # --- Energy Deposits ---
         d_cluster_idx = get_t("deps_cluster_idx", d_start, d_end).long()
@@ -565,6 +570,10 @@ class ODDDatasetPileup(Dataset):
             "sigma_phi": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["sigma_phi"].transform(c_sigma_phi)], -1),
             "sigma_rho": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["sigma_rho"].transform(c_sigma_rho)], -1),
             "hcal_fraction": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), c_hcal_fraction], -1),
+            "cluster_time": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["cluster_time"].transform(c_cluster_time)], -1),
+            "number_of_hits": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["number_of_hits"].transform(c_number_of_hits)], -1),
+            "energy_hits_std": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["energy_hits_std"].transform(c_energy_hits_std)], -1),
+            "max_hit_energy": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["max_hit_energy"].transform(c_max_hit_energy)], -1),
 
             # flags
             "is_track": torch.cat([torch.ones(n_tracks, dtype=torch.float32), torch.zeros(n_clusters, dtype=torch.float32),],-1,),
@@ -699,6 +708,19 @@ class ODDDatasetPileup(Dataset):
         df_deps = pl.read_parquet(file_dir / f"target_particles_deps-{index:05d}.parquet")
         df_tracks = pl.read_parquet(file_dir / f"tracks-{index:05d}.parquet")
 
+        # Align column names to match expected schema
+        rename_map = {}
+        if "vx" in df_tracks.columns:
+            rename_map["vx"] = "majority_particle_vx"
+        if "vy" in df_tracks.columns:
+            rename_map["vy"] = "majority_particle_vy"
+        if "vz" in df_tracks.columns:
+            rename_map["vz"] = "majority_particle_vz"
+        if "vertex_primary" in df_tracks.columns:
+            rename_map["vertex_primary"] = "majority_particle_vertex_primary"
+        if rename_map:
+            df_tracks = df_tracks.rename(rename_map)
+
         cols_to_explode = [col for col in df_tracks.columns if col != 'event_id']
         if not self.is_inference:
             # We remove double matched tracks to the same particle, only in the non-test stages. 
@@ -710,8 +732,8 @@ class ODDDatasetPileup(Dataset):
                         # 2. Calculate window stats needed for the logic
                         #    We use .len() for count and .min() for min_pt over the groups
                         .with_columns([
-                            pl.col('pt').len().over(['event_id', 'majority_particle_id']).alias('_count'),
-                            pl.col('pt').max().over(['event_id', 'majority_particle_id']).alias('_max_pt')
+                            pl.col('pt').len().over(['event_id', 'particle_id']).alias('_count'),
+                            pl.col('pt').max().over(['event_id', 'particle_id']).alias('_max_pt')
                         ])
                         
                         # 3. Filter: Apply the logic immediately.
@@ -720,7 +742,7 @@ class ODDDatasetPileup(Dataset):
                         #    Condition to Drop: (idx != -1) AND (count > 1) AND (pt ~= min_pt)
                         .filter(
                             ~(
-                                (pl.col('majority_particle_id') != -1) &
+                                (pl.col('particle_id') != -1) &
                                 (pl.col('_count') > 1) &
                                 ((pl.col('pt') - pl.col('_max_pt')).abs() > 1e-3) # Remove pt that are not the max_pt
                             )
@@ -943,7 +965,7 @@ class ODDDatasetPileup(Dataset):
 
         # Auxiliary variables for track-particle and cluster-particle associations
         self.aux_vars = [
-            "majority_particle_id",   # track -> particle
+            "particle_id",   # track -> particle
             # TODO: Add cluster-particle association variable if available
         ]
 
