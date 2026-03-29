@@ -397,6 +397,70 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
         _plot("calo/hs_frac_category_counts", PhysicsPlotter.plot_calo_hs_frac_category_counts,
               cluster_data["true_frac"])
 
+    # ── Per-event calo mask count histogram ──
+    if (cluster_data.get("mask_pred") is not None
+            and cluster_data.get("mask_truth") is not None
+            and cluster_data.get("event_idx") is not None
+            and len(cluster_data["mask_pred"]) > 0):
+        evt_idx = cluster_data["event_idx"].astype(int)
+        n_events = evt_idx.max() + 1
+        truth_counts = np.bincount(evt_idx[cluster_data["mask_truth"].astype(bool)], minlength=n_events)
+        pred_counts  = np.bincount(evt_idx[cluster_data["mask_pred"].astype(bool)],  minlength=n_events)
+        fig_cnt, ax_cnt = plt.subplots(figsize=(7, 5))
+        bins = np.linspace(0, max(truth_counts.max(), pred_counts.max()) + 1, 40)
+        ax_cnt.hist(truth_counts, bins=bins, histtype="step", linewidth=1.5, label="Truth", color="steelblue")
+        ax_cnt.hist(pred_counts,  bins=bins, histtype="step", linewidth=1.5, label="Predicted", color="tomato")
+        ax_cnt.set_xlabel("Calo mask cluster count per event")
+        ax_cnt.set_ylabel("Events")
+        ax_cnt.set_title("Truth vs Predicted calo mask count per event")
+        ax_cnt.legend()
+        fig_cnt.tight_layout()
+        figs["calo/mask_count_per_event"] = fig_cnt
+
+    # ── Top-K predicted clusters by total energy: HS energy ratio ──
+    if (cluster_data.get("mask_pred") is not None
+            and cluster_data.get("mask_truth") is not None
+            and cluster_data.get("event_idx") is not None
+            and cluster_data.get("total_e") is not None
+            and cluster_data.get("true_frac") is not None
+            and len(cluster_data["mask_pred"]) > 0):
+        evt_idx    = cluster_data["event_idx"].astype(int)
+        n_events   = evt_idx.max() + 1
+        total_e    = cluster_data["total_e"]
+        true_frac  = cluster_data["true_frac"]
+        pred_mask  = cluster_data["mask_pred"].astype(bool)
+        truth_mask = cluster_data["mask_truth"].astype(bool)
+
+        # HS energy per cluster = mask * true_frac * total_e
+        hs_e = true_frac * total_e
+
+        # Truth denominator: sum(truth_mask * hs_e) per event
+        truth_e_per_event = np.bincount(evt_idx[truth_mask], weights=hs_e[truth_mask], minlength=n_events)
+
+        # Sort predicted clusters by (event asc, total_e desc) once, then use rank < K
+        order         = np.lexsort((-total_e[pred_mask], evt_idx[pred_mask]))
+        pred_evt_s    = evt_idx[pred_mask][order]
+        pred_hs_s     = hs_e[pred_mask][order]
+        event_starts  = np.searchsorted(pred_evt_s, np.arange(n_events))
+        rank_in_event = np.arange(len(pred_evt_s)) - event_starts[pred_evt_s]
+
+        top_k_values = [900, 1200, 1300, 1500, 1800, 2500]
+        fig_topk, ax_topk = plt.subplots(figsize=(8, 5))
+        colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(top_k_values)))
+
+        for k, color in zip(top_k_values, colors):
+            keep   = rank_in_event < k
+            hs_sum = np.bincount(pred_evt_s[keep], weights=pred_hs_s[keep], minlength=n_events)
+            ratios = np.where(truth_e_per_event > 0, hs_sum / truth_e_per_event, 0.0)
+            ax_topk.hist(ratios, bins=40, histtype="step", linewidth=1.5, label=f"Top-{k}", color=color)
+
+        ax_topk.set_xlabel("Predicted HS energy / Truth HS energy")
+        ax_topk.set_ylabel("Events")
+        ax_topk.set_title("HS energy ratio: top-K predicted clusters by total energy")
+        ax_topk.legend()
+        fig_topk.tight_layout()
+        figs["calo/mask_topk_energy_ratio"] = fig_topk
+
     # ── Cluster swap ΔR ──
     if cluster_data.get("mask_pred") is not None and len(cluster_data.get("mask_pred", [])) > 0:
         is_fn = cluster_data["mask_truth"].astype(bool) & ~cluster_data["mask_pred"].astype(bool)
