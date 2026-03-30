@@ -449,7 +449,7 @@ class TwoStreamMaskFormer(nn.Module):
                 reco_targets[f"{self.reco_target_object}_{suffix}"] = val
 
         # Reindex node-level targets: (B, num_objects, max_nodes) -> (B, num_objects, max_reco_nodes)
-        for key in ["node_valid", "node_incidence"]:
+        for key in ["node_valid", "incidence"]:
             src_key = f"{self.reco_target_object}_{key}"
             if src_key in reco_targets and reco_targets[src_key].dim() == 3:
                 # (B, num_objects, max_nodes) -> gather along node dim

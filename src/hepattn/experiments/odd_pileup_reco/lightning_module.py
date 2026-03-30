@@ -309,7 +309,7 @@ class ODDPFlowTwoStream(ModelWrapper):
             reco_target_obj = self.model.reco_target_object
             class_key = f"{reco_target_obj}_class"
             if class_key in labels:
-                particle_class_preds = reco_final["classification"][f"{self.model.reco_target_object.replace('reco_', 'reco_pflow_')}class"]
+                particle_class_preds = reco_final["classification"]["reco_pflow_class"]
                 particle_class_labels = labels[class_key]
 
                 self.obj_accuracy_micro(particle_class_preds.view(-1), particle_class_labels.view(-1))
