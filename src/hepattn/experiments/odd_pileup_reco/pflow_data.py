@@ -703,37 +703,39 @@ class ODDDatasetPileup(Dataset):
         incidence_matrix = np.zeros((self.num_objects, n_nodes))
         indicator = torch.zeros(self.num_objects)
 
-        # Track -> particle: binary 1.0
-        track_idx_arr = np.arange(len(t_particle_idx))
-        t_pidx_np = t_particle_idx.numpy()
-        valid_track_mask = (t_pidx_np >= 0) & (t_pidx_np < n_particles)
-        incidence_matrix[t_pidx_np[valid_track_mask], track_idx_arr[valid_track_mask]] = 1.0
+        track_idx = np.arange(len(t_particle_idx))
+        if self.is_inference:
+            t_particle_idx[t_particle_idx < 0] = 0
 
-        # Cluster -> particle: energy-weighted
-        rd_particle_idx = get_t("raw_deps_particle_idx", rd_start, rd_end).numpy()
-        rd_cluster_idx = get_t("raw_deps_cluster_idx", rd_start, rd_end).numpy()
-        rd_energy = get_t("raw_deps_total_energy_deps_in_cluster", rd_start, rd_end).numpy()
+        t_particle_idx_np = t_particle_idx.numpy() if isinstance(t_particle_idx, torch.Tensor) else t_particle_idx
+        incidence_matrix[t_particle_idx_np, track_idx] = 1.0
 
-        valid_rd = (rd_particle_idx >= 0) & (rd_particle_idx < n_particles) & (rd_cluster_idx >= 0) & (rd_cluster_idx < n_clusters)
-        incidence_matrix[rd_particle_idx[valid_rd], rd_cluster_idx[valid_rd] + n_tracks] = rd_energy[valid_rd]
+        # Cluster -> particle: energy-weighted (using raw_deps)
+        d_particle_idx_np = get_t("raw_deps_particle_idx", rd_start, rd_end).numpy()
+        d_cluster_idx_np = get_t("raw_deps_cluster_idx", rd_start, rd_end).numpy()
+        d_energy_np = get_t("raw_deps_total_energy_deps_in_cluster", rd_start, rd_end).numpy()
 
-        # Orphan nodes: assign to fake particles
-        orphan_cols = np.where(incidence_matrix.sum(axis=0) == 0)[0]
-        if len(orphan_cols) > 0:
-            fake_rows = np.arange(len(orphan_cols)) + n_particles
-            keep = fake_rows < self.num_objects
-            incidence_matrix[fake_rows[keep], orphan_cols[keep]] = 1.0
+        incidence_matrix[d_particle_idx_np, d_cluster_idx_np + n_tracks] = d_energy_np
 
-        # Column-normalize
-        col_sums = incidence_matrix.sum(axis=0, keepdims=True)
-        incidence_matrix /= np.clip(col_sums, a_min=1e-6, a_max=None)
+        # Zero out entries for non-existing target particles
+        if (incidence_matrix.sum(axis=0) == 0).any():
+            noisy_cols = np.where(incidence_matrix.sum(axis=0) == 0)[0]
+            fake_rows = np.arange(len(noisy_cols)) + n_particles
+            if not (fake_rows < self.num_objects).all():
+                print(f"Warning: fake_rows go beyond maximum ({self.num_objects})(event_id {idx})({np.max(fake_rows)}) particles. Dropping them!")
+                noisy_cols = noisy_cols[fake_rows < self.num_objects]
+                fake_rows = fake_rows[fake_rows < self.num_objects]
+            incidence_matrix[fake_rows, noisy_cols] = 1.0
+
+        # normalize
+        incidence_matrix /= np.clip(incidence_matrix.sum(axis=0, keepdims=True), a_min=1e-6, a_max=None)
 
         incidence = torch.tensor(incidence_matrix, dtype=torch.float32)
         incidence = torch.nn.functional.pad(incidence, (0, self.max_nodes - n_nodes, 0, 0))
 
-        # Indicator: particle is valid if class < 5 (not residual)
-        is_not_res = particle_class < 5
-        indicator[:n_particles][is_not_res] = 1.0
+        # update the indicator
+        is_not_res_mask = particle_class < 5
+        indicator[:n_particles][is_not_res_mask] = 1.0
 
         return {
             "node_inp_features": node_inp_features,
@@ -742,7 +744,6 @@ class ODDDatasetPileup(Dataset):
             "node_eta": node_features["eta"],
             "node_phi": node_features["phi"],
             "node_deltaR_idx": node_deltaR_idx,
-            "node_deltaR_idx_shifted": node_deltaR_idx_shifted,
             "vertex_token_features": vertex_token_features,
             # Reconstruction data
             "particle_data": particle_data,
@@ -771,7 +772,6 @@ class ODDDatasetPileup(Dataset):
             "node_eta": data_dict["node_eta"],
             "node_phi": data_dict["node_phi"],
             "node_deltaR_idx": data_dict["node_deltaR_idx"],
-            "node_deltaR_idx_shifted": data_dict["node_deltaR_idx_shifted"],
             "node_e": data_dict["node_raw_features"]["total_e"],
             "node_is_track": data_dict["node_raw_features"]["is_track"],
             "vertex_token_features": data_dict["vertex_token_features"],

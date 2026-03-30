@@ -263,44 +263,44 @@ class ODDPFlowTwoStream(ModelWrapper):
         # === Calo Mask Validation Accumulation (Stream B) ===
         if cluster_node_mask.any() and stage == "val":
             if "calo_mask" in calo_final:
-                    calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
-                    calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
-                    calo_hs_frac_flat = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
-                    calo_mask_task = self.model.calo_tasks[0]
-                    self._val_cluster_data["mask_pred"].append((calo_prob_flat > calo_mask_task.pred_threshold).detach().cpu().numpy())
-                    self._val_cluster_data["calo_mask_probs"].append(calo_prob_flat.detach().float().cpu().numpy())
-                    self._val_cluster_data["mask_truth"].append(
-                        ((calo_hs_frac_flat > calo_mask_task.hs_frac_threshold) & (calo_hs_e_flat > calo_mask_task.hs_energy_threshold)).detach().cpu().numpy()
-                    )
-
-                counts = cluster_node_mask.sum(dim=-1).cpu().numpy()
-                event_indices = np.repeat(
-                    np.arange(self._val_event_counter, self._val_event_counter + len(counts)),
-                    counts,
+                calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
+                calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
+                calo_hs_frac_flat = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
+                calo_mask_task = self.model.calo_tasks[0]
+                self._val_cluster_data["mask_pred"].append((calo_prob_flat > calo_mask_task.pred_threshold).detach().cpu().numpy())
+                self._val_cluster_data["calo_mask_probs"].append(calo_prob_flat.detach().float().cpu().numpy())
+                self._val_cluster_data["mask_truth"].append(
+                    ((calo_hs_frac_flat > calo_mask_task.hs_frac_threshold) & (calo_hs_e_flat > calo_mask_task.hs_energy_threshold)).detach().cpu().numpy()
                 )
-                self._val_cluster_data["event_idx"].append(event_indices)
-                self._val_event_counter += len(counts)
 
-                if "calo_mask" in calo_final:
-                    calo_mask_task = self.model.calo_tasks[0]
-                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > calo_mask_task.pred_threshold).float()
-                    truth_mask_b = (
-                        (labels["calo_hard_scatter_energy_frac"] > calo_mask_task.hs_frac_threshold)
-                        & (labels["calo_hard_scatter_energy"] > calo_mask_task.hs_energy_threshold)
-                    ).float()
+            counts = cluster_node_mask.sum(dim=-1).cpu().numpy()
+            event_indices = np.repeat(
+                np.arange(self._val_event_counter, self._val_event_counter + len(counts)),
+                counts,
+            )
+            self._val_cluster_data["event_idx"].append(event_indices)
+            self._val_event_counter += len(counts)
 
-                    cluster_valid = cluster_node_mask.float()
-                    neutral_e = labels["calo_hs_neutral_energy"]
-                    charged_e = labels["calo_hs_charged_energy"]
+            if "calo_mask" in calo_final:
+                calo_mask_task = self.model.calo_tasks[0]
+                pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > calo_mask_task.pred_threshold).float()
+                truth_mask_b = (
+                    (labels["calo_hard_scatter_energy_frac"] > calo_mask_task.hs_frac_threshold)
+                    & (labels["calo_hard_scatter_energy"] > calo_mask_task.hs_energy_threshold)
+                ).float()
 
-                    self._val_cluster_data["evt_pred_neutral_e"].append(
-                        (pred_mask_b * cluster_valid * neutral_e).sum(dim=-1).detach().cpu().numpy())
-                    self._val_cluster_data["evt_truth_neutral_e"].append(
-                        (truth_mask_b * cluster_valid * neutral_e).sum(dim=-1).detach().cpu().numpy())
-                    self._val_cluster_data["evt_pred_charged_e"].append(
-                        (pred_mask_b * cluster_valid * charged_e).sum(dim=-1).detach().cpu().numpy())
-                    self._val_cluster_data["evt_truth_charged_e"].append(
-                        (truth_mask_b * cluster_valid * charged_e).sum(dim=-1).detach().cpu().numpy())
+                cluster_valid = cluster_node_mask.float()
+                neutral_e = labels["calo_hs_neutral_energy"]
+                charged_e = labels["calo_hs_charged_energy"]
+
+                self._val_cluster_data["evt_pred_neutral_e"].append(
+                    (pred_mask_b * cluster_valid * neutral_e).sum(dim=-1).detach().cpu().numpy())
+                self._val_cluster_data["evt_truth_neutral_e"].append(
+                    (truth_mask_b * cluster_valid * neutral_e).sum(dim=-1).detach().cpu().numpy())
+                self._val_cluster_data["evt_pred_charged_e"].append(
+                    (pred_mask_b * cluster_valid * charged_e).sum(dim=-1).detach().cpu().numpy())
+                self._val_cluster_data["evt_truth_charged_e"].append(
+                    (truth_mask_b * cluster_valid * charged_e).sum(dim=-1).detach().cpu().numpy())
 
         # === Reconstruction Metrics (Stream C) ===
         reco_final = preds.get("reco_final", {})
@@ -328,13 +328,16 @@ class ODDPFlowTwoStream(ModelWrapper):
             reco_target_obj = self.model.reco_target_object
             valid_key = f"{reco_target_obj}_valid"
             mask_key = f"{reco_target_obj}_node_valid"
-            if valid_key in labels and mask_key in labels:
+            if valid_key in labels and mask_key in labels and hasattr(self.model, "_reco_node_indices"):
                 truth_valid = labels[valid_key]
-                pred_masks = list(reco_final["mask"].values())[0].squeeze()  # pred node_valid
-                truth_masks = labels[mask_key].squeeze()
+                pred_masks = list(reco_final["mask"].values())[0].squeeze()  # (B, num_objects, max_reco_nodes)
+
+                # Reindex truth masks from full node space (5500) to reco node space (1400)
+                reco_idx = self.model._reco_node_indices  # (B, max_reco_nodes)
+                full_truth = labels[mask_key]  # (B, num_objects, max_nodes)
+                truth_masks = full_truth.gather(2, reco_idx.unsqueeze(1).expand(-1, full_truth.shape[1], -1)).squeeze()
 
                 if truth_valid.any():
-                    # Only evaluate on valid particles
                     tv = truth_valid.squeeze()
                     if pred_masks.dim() > 1 and tv.dim() > 0:
                         pm = pred_masks[tv]
