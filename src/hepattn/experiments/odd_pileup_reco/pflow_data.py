@@ -696,46 +696,50 @@ class ODDDatasetPileup(Dataset):
             "is_charged": is_charged,
         }
         particle_data = self.scaler.transform(particle_data)
+
+        # Shift particle data by 1 to make room for pileup token at position 0
         for key, val in particle_data.items():
-            particle_data[key] = do_padding(val, self.num_objects)
+            padded = torch.zeros(self.num_objects, *val.shape[1:]) if val.dim() > 1 else torch.zeros(self.num_objects)
+            padded[1:n_particles + 1] = val[:n_particles]
+            particle_data[key] = padded
+
+        # Pileup token at position 0: class 5, neutral
+        particle_data["class"][0] = 5
+        particle_data["is_charged"][0] = 0
 
         # --- Incidence matrix (num_objects x n_nodes) ---
+        # Row 0 = pileup particle (calo only), rows 1..n_particles = real HS particles
         incidence_matrix = np.zeros((self.num_objects, n_nodes))
         indicator = torch.zeros(self.num_objects)
 
+        # Tracks: HS tracks → shifted rows (+1). PU tracks stay unassigned.
         track_idx = np.arange(len(t_particle_idx))
+        t_pidx_np = t_particle_idx.numpy() if isinstance(t_particle_idx, torch.Tensor) else t_particle_idx
         if self.is_inference:
-            t_particle_idx[t_particle_idx < 0] = 0
+            t_pidx_np[t_pidx_np < 0] = 0
+        incidence_matrix[t_pidx_np + 1, track_idx] = 1.0
 
-        t_particle_idx_np = t_particle_idx.numpy() if isinstance(t_particle_idx, torch.Tensor) else t_particle_idx
-        incidence_matrix[t_particle_idx_np, track_idx] = 1.0
-
-        # Cluster -> particle: energy-weighted (using raw_deps)
+        # Cluster deposits from raw_deps (HS particle → cluster), shifted +1
         d_particle_idx_np = get_t("raw_deps_particle_idx", rd_start, rd_end).numpy()
         d_cluster_idx_np = get_t("raw_deps_cluster_idx", rd_start, rd_end).numpy()
         d_energy_np = get_t("raw_deps_total_energy_deps_in_cluster", rd_start, rd_end).numpy()
+        incidence_matrix[d_particle_idx_np + 1, d_cluster_idx_np + n_tracks] = d_energy_np
 
-        incidence_matrix[d_particle_idx_np, d_cluster_idx_np + n_tracks] = d_energy_np
+        # Pileup particle (row 0): PU cluster energy = total - HS (calo only, no tracks)
+        pu_cluster_energy = c_e.numpy() - d_energy_hard_scatter_energy.numpy()
+        pu_cluster_energy = np.clip(pu_cluster_energy, 0, None)
+        incidence_matrix[0, n_tracks:n_tracks + n_clusters] = pu_cluster_energy
 
-        # Zero out entries for non-existing target particles
-        if (incidence_matrix.sum(axis=0) == 0).any():
-            noisy_cols = np.where(incidence_matrix.sum(axis=0) == 0)[0]
-            fake_rows = np.arange(len(noisy_cols)) + n_particles
-            if not (fake_rows < self.num_objects).all():
-                print(f"Warning: fake_rows go beyond maximum ({self.num_objects})(event_id {idx})({np.max(fake_rows)}) particles. Dropping them!")
-                noisy_cols = noisy_cols[fake_rows < self.num_objects]
-                fake_rows = fake_rows[fake_rows < self.num_objects]
-            incidence_matrix[fake_rows, noisy_cols] = 1.0
-
-        # normalize
+        # Column-normalize
         incidence_matrix /= np.clip(incidence_matrix.sum(axis=0, keepdims=True), a_min=1e-6, a_max=None)
 
         incidence = torch.tensor(incidence_matrix, dtype=torch.float32)
         incidence = torch.nn.functional.pad(incidence, (0, self.max_nodes - n_nodes, 0, 0))
 
-        # update the indicator
+        # Indicator: pileup valid + real particles with class < 5
+        indicator[0] = 1.0  # pileup particle is valid
         is_not_res_mask = particle_class < 5
-        indicator[:n_particles][is_not_res_mask] = 1.0
+        indicator[1:n_particles + 1][is_not_res_mask] = 1.0
 
         return {
             "node_inp_features": node_inp_features,
@@ -837,10 +841,10 @@ class ODDDatasetPileup(Dataset):
         labels["reco_particle_node_valid"] = incidence_mask
         labels["reco_particle_incidence"] = data_dict["incidence_truth"]
 
-        # Regression targets
+        # Regression targets (position 0 = pileup = NaN, positions 1..n = real particles)
         for label in self.targets["particle"]:
             tgt = torch.full((self.num_objects,), torch.nan)
-            tgt[:n_particles] = data_dict["particle_data"][label][:n_particles]
+            tgt[1:n_particles + 1] = data_dict["particle_data"][label][1:n_particles + 1]
             labels[f"reco_particle_{label}"] = tgt
 
         return inputs, labels

@@ -3,7 +3,7 @@ from torch import Tensor, nn
 
 from hepattn.models.decoder import MaskFormerDecoder
 from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
-from hepattn.models.maskformer import MaskFormer
+from hepattn.experiments.odd_pileup_reco.maskformer import MaskFormer
 
 
 class PassThroughInputNet(nn.Module):
