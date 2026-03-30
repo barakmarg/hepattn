@@ -1,333 +1,789 @@
-# Two-Stream Causally-Conditioned Hybrid Query Transformer
+# TwoStreamMaskFormer — Architecture Walkthrough
 
-## Motivation
-
-The single-stream MaskFormer (`odd_pileup_maskformer`) uses one query to handle both track HS classification and calo energy fraction prediction. This forces a single query embedding to serve two fundamentally different goals, entangling gradients and limiting calo performance. The two-stream architecture decouples these tasks with strict gradient isolation.
-
-## Architecture Overview
-
-```
-Raw Nodes (tracks + clusters)
-    -> InputNet -> Encoder (8-layer windowed attention, fixed Morton order)
-        -> Stream A: PileupMaskFormerDecoder (4 layers, 1 query, bidirectional CA)
-            -> Track Tasks: ObjectHitMaskTask (HS mask) + ObjectRegressionTask (vz)
-                |
-                | Bridge: extract HS track embeddings, .detach(), pad to fixed size
-                | Training: teacher-forced GT HS tracks
-                | Inference: predicted HS tracks from Stream A
-                v
-        -> Stream B: CaloFlashCrossAttentionDecoder (4 layers, 206 hybrid queries, flash-varlen bidirectional CA)
-            -> Node-classification tasks on enriched node embeddings:
-               CaloNodeMaskTask: Dense(128→1, 3 hidden layers) — binary HS/pileup per node
-               CaloNodeFractionTask: Dense(128→1, 4 hidden layers, Sigmoid) — HS energy fraction per node
-```
-
-## Key Design Decisions
-
-### Gradient Isolation
-- Node embeddings are **`.detach()`ed** before building hybrid queries for Stream B
-- Calo losses cannot backpropagate into the shared encoder or Stream A
-- Stream A track F1 is protected from interference by the calo objective
-
-### Teacher Forcing (Bridge)
-- **Training:** GT HS track mask (`tracks_mask & node_is_track`) selects which track embeddings become hybrid queries
-- **Inference:** Stream A's predicted mask (`sigmoid(logit) >= 0.5 & is_track`) is used instead
-- This ensures Stream B sees clean HS track context during training, learns to handle predicted masks at test time
-
-### Hybrid Queries
-- Slots 0..15: **Learnable latent queries** (16 × `nn.Parameter`) — capture neutral/shared calo context
-- Slots 16..205: **Detached HS track embeddings** — each carries physics context about one HS track, enabling per-track calo association
-- Zero-padded to fixed size (`num_latent_queries=16` + `max_hs_tracks=190` = 206 total) with `query_valid` mask so padded slots are ignored in attention
-
-### CaloFlashCrossAttentionDecoder (Stream B)
-- Each layer: **query self-attention** → **bidirectional cross-attention** (queries ↔ calo nodes)
-- Uses `flash-varlen` (unpadded sequences) for both self-attention and cross-attention — avoids materialising padded positions
-- Calo isolation: only calo nodes (`~node_is_track & valid`) participate as keys/values
-- The decoder enriches node embeddings with query context; classification happens after via Dense heads
-
-### Node-Classification Tasks (Stream B)
-After the decoder enriches calo node embeddings via bidirectional cross-attention with the hybrid queries, two `Task` subclasses classify each node directly from enriched embeddings (no query dot-product):
-
-- **`CaloNodeMaskTask`**: configurable `Dense` MLP head (default: `[128, 64, 32], SiLU`) → per-node HS/pileup logit `(B, 1, N)`
-- **`CaloNodeFractionTask`**: configurable `Dense` MLP head (default: `[256, 128, 64, 32], SiLU, Sigmoid`) → per-node HS energy fraction `(B, N)`
-
-These are drop-in replacements for `CaloHitMaskTask` and `PileupCaloFractionTaskV2` — same output keys, same loss/predict interface. The model code (`model.py`) is unchanged.
-
-This reflects the physics: the hybrid queries are the "truth anchor" of the event (HS track context), but the final decision of whether a calo cluster is HS rests on the context gathered by the cluster itself through cross-attention.
-
-### Calo Mask Loss
-- Target: `calo_hard_scatter_energy_frac > hs_frac_threshold` **AND** `calo_hard_scatter_energy > hs_energy_threshold` (defaults 0.05 / 0.15)
-- BCE + Tversky loss (α=0.2, β=0.8 — FN penalised 4× more than FP)
-- Imbalance handled by `sample_weight`: HS nodes get weight 1.0, pileup nodes get `null_weight=0.05` (20× downweighting)
-- Loss computed inline in `model.loss()` using `loss_fns` from `hepattn.models.loss`
-
-### Calo Fraction Loss
-- L1 loss **only on true HS clusters** (both `calo_hard_scatter_energy_frac > 0.05` and `calo_hard_scatter_energy > 0.15`)
-- Pileup-only clusters are excluded from the regression loss entirely
-- Prediction: `E_HS_pred = frac * E_total`, loss: `|E_HS_pred - E_HS_true|`
-- Loss weight 0.01 (mask losses dominate ~700:1)
-
-### Gated Inference
-- At inference, calo fraction is multiplied by the calo mask prediction: `calo_frac * (calo_hs_prob > 0.5)`
-- Clusters predicted as pileup-only get zero HS energy fraction
-- Note: `calo_mask_pred_threshold=0.2` controls the `calo_node_valid` binary prediction output; the fraction gate uses a hardcoded 0.5
-
-### Physics Priors
-- **Stream A:** `prior = node_is_track` — query attends only to tracks, never calo
-- **Stream B:** calo isolation is enforced by `CaloFlashCrossAttentionDecoder` directly (constructs `calo_mask = key_valid & ~node_is_track` for flash-varlen unpadding)
+This document is a deep-dive into `TwoStreamMaskFormer` ([model.py](model.py)), comparing it line-by-line to the original
+`MaskFormer` ([../../models/maskformer.py](../../models/maskformer.py)). All code excerpts are lifted verbatim from those
+two files.
 
 ---
 
-## Files
+## Table of Contents
 
-```
-odd_pileup_two_stream/
-  __init__.py              # Exports
-  model.py                 # TwoStreamMaskFormer (forward, loss, predict, bridge logic)
-  decoder.py               # CaloMaskFormerDecoder (legacy) + CaloFlashCrossAttentionDecoder (active)
-  tasks.py                 # CaloNodeMaskTask + CaloNodeFractionTask (active); CaloHitMaskTask + PileupCaloFractionTaskV2 (legacy)
-  lightning_module.py       # ODDPFlowTwoStream (metrics, epoch-end plots)
-  main.py                  # CLI entry point
-  configs/
-    base.yaml              # Full training config (node-classification heads)
-```
-
-**One modification to existing code:**
-- `odd_pileup_maskformer/pflow_data.py`: Added `tracks_mask` to `inputs` dict for teacher forcing
-
----
-
-## Data Input
-
-### `inputs` dict (same as baseline + `tracks_mask`)
-
-| Key | Shape | Description |
-|-----|-------|-------------|
-| `node_features` | `(B, 5500, 21)` | Per-node feature vector |
-| `node_valid` | `(B, 5500)` | Bool mask for real nodes |
-| `node_eta` | `(B, 5500)` | Raw eta |
-| `node_phi` | `(B, 5500)` | Raw phi |
-| `node_deltaR_idx` | `(B, 5500)` | Morton sort index |
-| `node_e` | `(B, 5500)` | Raw total energy |
-| `node_is_track` | `(B, 5500)` | 1=track, 0=calo |
-| `tracks_mask` | `(B, 5500)` | **NEW** Bool GT HS track mask (for teacher forcing) |
-
-### `targets` dict
-
-| Key | Shape | Description |
-|-----|-------|-------------|
-| `tracks_mask` | `(B, 5500)` | GT HS track mask |
-| `node_valid` | `(B, 5500)` | Valid node mask |
-| `node_is_track` | `(B, 5500)` | Track/cluster indicator |
-| `node_e` | `(B, 5500)` | Total energy |
-| `calo_hard_scatter_energy` | `(B, 5500)` | True HS energy per cluster |
-| `calo_hard_scatter_energy_frac` | `(B, 5500)` | True HS energy fraction |
-| `particle_valid` | `(B, 1)` | Always True |
-| `particle_node_valid` | `(B, 1, 5500)` | HS track mask for ObjectHitMaskTask |
-| `particle_vz` | `(B, 1)` | True vertex z |
+1. [Problem Statement & Design Goals](#1-problem-statement--design-goals)
+2. [Architecture Overview](#2-architecture-overview)
+3. [Constructor Comparison](#3-constructor-comparison)
+4. [Forward Pass — Step by Step](#4-forward-pass--step-by-step)
+   - [4.1 Embedding & Shared Encoder](#41-embedding--shared-encoder)
+   - [4.2 Stream A — Track MaskFormer](#42-stream-a--track-maskformer)
+   - [4.3 Bridge — Hybrid Query Construction](#43-bridge--hybrid-query-construction)
+   - [4.4 Stream B — Calo MaskFormer](#44-stream-b--calo-maskformer)
+   - [4.5 Stream C — Reconstruction](#45-stream-c--reconstruction)
+5. [Training vs Inference: Teacher Forcing & Noise Sampling](#5-training-vs-inference-teacher-forcing--noise-sampling)
+6. [Loss Computation](#6-loss-computation)
+7. [Prediction](#7-prediction)
+8. [Gradient Flow Diagram](#8-gradient-flow-diagram)
+9. [Data Pipeline Summary](#9-data-pipeline-summary)
+10. [Config Key Differences](#10-config-key-differences)
 
 ---
 
-## Forward Pass Detail
+## 1. Problem Statement & Design Goals
 
-### Stage 1: Shared Embedding + Encoding
+An LHC collision event contains ~200 simultaneous proton-proton interactions ("pileup"). Only one of them — the Hard Scatter (HS) — is physically interesting. Raw detector output (tracks + calorimeter clusters) contains a mix of HS and pileup contributions at a ratio of roughly 1:200. Directly running particle reconstruction on this messy mixture degrades performance.
 
-```
-node_features (B, 5500, 21)
-    -> Dense(21 -> 128) + FourierPosEnc(eta, phi -> 128)
-    -> node_embed (B, 5500, 128)
-    -> Encoder (8 layers, flash-varlen, window=256, Morton sort)
-    -> key_embed (B, 5500, 128)
-```
+**Goal:** Build a model that (a) identifies the HS tracks and calo clusters and (b) runs particle reconstruction *only* on the cleaned HS nodes — all in a single end-to-end differentiable pipeline.
 
-### Stage 2: Stream A — Track MaskFormer
+**Design decisions:**
+- A single shared encoder sees all nodes (HS + pileup together) for full context.
+- Pileup removal and reconstruction are split into sequential streams so each specializes.
+- Reconstruction gradients flow back through the shared encoder (not detached) so the encoder learns to highlight HS-useful features.
+- Stream B nodes are detached before forming hybrid queries so Stream B gradients do not corrupt Stream A's learned representation.
 
-```
-query_embed (B, 1, 128)  <-- learnable nn.Parameter (track_query_initial)
-key_embed   (B, 5500, 128) <-- from encoder
+---
 
-4 decoder layers, each:
-  1. ObjectHitMaskTask.forward() -> mask_logit (B, 1, 5500)
-     learned_mask = sigmoid(logit) >= 0.5
-  2. Physics prior: attn_mask = learned_mask & node_is_track
-  3. Cross-attention: query attends to HS tracks only
-  4. Self-attention + FFN on query
-  5. Bidirectional CA: nodes attend back to query
-  6. Deep supervision: BCE + Dice on mask at every layer
-
-Final tasks:
-  - ObjectHitMaskTask -> pflow_node_logit (B, 1, 5500)
-  - ObjectRegressionTask -> pflow_vz (B, 1)
-```
-
-### Stage 3: Bridge
+## 2. Architecture Overview
 
 ```
-IF training + teacher_forcing:
-    hs_mask = tracks_mask & node_is_track     (GT)
-ELSE:
-    hs_mask = (sigmoid(logit) >= 0.5) & node_is_track   (predicted)
-
-node_embed_detached = node_embed.detach()     # GRADIENT WALL
-
-hybrid_queries (B, 206, 128):
-    slots 0..15:    learnable latent queries (calo_latent_queries)
-    slots 16..N+15: detached HS track embeddings
-    slots N+16..:   zero-padded
-
-query_valid (B, 206):
-    slots 0..15:    True
-    slots 16..N+15: True
-    slots N+16..:   False (masked in attention)
-```
-
-### Stage 4: Stream B — Calo (CaloFlashCrossAttentionDecoder + Node Tasks)
-
-```
-query_embed (B, 206, 128)  <-- hybrid_queries
-key_embed   (B, 5500, 128) <-- from encoder (calo nodes only participate)
-
-4 decoder layers, each:
-  1. Query self-attention (flash-varlen over valid queries)
-  2. Bidirectional cross-attention (flash-varlen, queries ↔ calo nodes only)
-     - a->b: queries attend to calo
-     - b->a: calo nodes attend back to queries
-
-Final tasks (applied once, on enriched node_embed):
-  - CaloNodeMaskTask: Dense(node_embed) -> calo_node_logit (B, 1, N)
-  - CaloNodeFractionTask: Dense(node_embed) -> calo_frac (B, N)
+Input nodes (tracks + calo, ~5500 total including pileup)
+        │
+        ▼
+  ┌────────────────────────────────────────────────┐
+  │  InputNet   (embed to dim=128)                 │
+  │  Shared Encoder (8 × windowed flash-varlen SA) │
+  └────────────────────────────────────────────────┘
+        │                         │
+        │                         └─────────────────────────┐
+        │                                                     │ (skip connection for Stream C)
+        ▼                                                     │
+  ┌──────────────────────────┐                               │
+  │  STREAM A                │                               │
+  │  Track MaskFormerDecoder │                               │
+  │  (4 layers, 1 query)     │                               │
+  │  → HS track mask         │                               │
+  └──────────┬───────────────┘                               │
+             │  teacher forcing (train) / predicted (infer)   │
+             ▼                                               │
+  ┌──────────────────────────────────────────────────┐       │
+  │  BRIDGE                                          │       │
+  │  detach node embeddings                          │       │
+  │  → num_latent + HS_track embeddings as queries   │       │
+  └──────────┬───────────────────────────────────────┘       │
+             ▼                                               │
+  ┌──────────────────────────┐                               │
+  │  STREAM B                │                               │
+  │  CaloFlashCrossAttn Dcdr │                               │
+  │  (4 layers, hybrid Q)    │                               │
+  │  → calo HS/PU mask       │                               │
+  └──────────┬───────────────┘                               │
+             │  teacher forcing + noise sampling (train)      │
+             │  / predicted (infer)                          │
+             ▼                                               │
+  ┌──────────────────────────────────────────────────────────┴──┐
+  │  STREAM C                                                    │
+  │  Filter to HS nodes (≤ max_reco_calo_nodes=1200 calo,        │
+  │               all HS tracks)                                 │
+  │  Skip: reco_embed = encoder_out + initial_encoder_embed      │
+  │  Repack to (B, max_reco_nodes=1400, D)                       │
+  │  → encapsulated MaskFormer (4 layers, 400 queries)           │
+  │     • Classification (6 classes)                             │
+  │     • Hit mask (BCE + Dice)                                  │
+  │     • Incidence regression (KL-div)                          │
+  │     • Incidence-based regression (pt, eta, phi, e)           │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Loss Summary
+## 3. Constructor Comparison
 
-### Stream A (Track) Losses
-
-| Loss key | Task | Computed at | Target |
-|---|---|---|---|
-| `track_layer_{0-3}_mask_mask_bce` | ObjectHitMaskTask | Each decoder layer | `particle_node_valid` |
-| `track_layer_{0-3}_mask_mask_dice` | ObjectHitMaskTask | Each decoder layer | `particle_node_valid` |
-| `track_final_mask_mask_bce` | ObjectHitMaskTask | Final | `particle_node_valid` |
-| `track_final_mask_mask_dice` | ObjectHitMaskTask | Final | `particle_node_valid` |
-| `track_final_vz_regression_smooth_l1` | ObjectRegressionTask | Final only | `particle_vz` |
-
-### Stream B (Calo) Losses
-
-No intermediate losses (`has_intermediate_loss: false` for both node tasks).
-
-| Loss key | Task | Computed at | Target |
-|---|---|---|---|
-| `calo_final_calo_mask_mask_bce` | CaloNodeMaskTask | Final only | `calo_hs_frac > 0.05 & calo_hs_energy > 0.15` |
-| `calo_final_calo_mask_mask_tversky` | CaloNodeMaskTask | Final only | `calo_hs_frac > 0.05 & calo_hs_energy > 0.15` |
-| `calo_final_calo_fraction_l1` | CaloNodeFractionTask | Final only | `calo_hard_scatter_energy` (HS clusters only) |
-
-Loss weights: `mask_bce=5.0`, `mask_tversky=2.0`, `calo_fraction l1=0.01`.
-Tversky parameters: `alpha=0.2, beta=0.8` (FN penalised 4× more than FP — HS-favouring).
-Mask losses dominate fraction loss by ~700:1.
-
----
-
-## Prediction Outputs
+### Original `MaskFormer.__init__`
 
 ```python
-preds = {
-    # Stream A — intermediate + final
-    "track_layer_0": {"mask": {"pflow_node_valid": (B,1,5500), "pflow_node_prob": (B,1,5500)}},
-    "track_layer_1": {"mask": {...}},
-    "track_layer_2": {"mask": {...}},
-    "track_layer_3": {"mask": {...}},
-    "track_final": {
-        "mask": {"pflow_node_valid": (B,1,5500), "pflow_node_prob": (B,1,5500)},
-        "vz_regression": {"pflow_vz": (B, 1)},
-    },
+# maskformer.py
+class MaskFormer(nn.Module):
+    def __init__(
+        self,
+        input_nets: nn.ModuleList,
+        encoder: nn.Module | None,
+        decoder: MaskFormerDecoder,   # single decoder
+        tasks: nn.ModuleList,          # single task list
+        dim: int,
+        target_object: str = "particle",
+        matcher: nn.Module | None = None,
+        ...
+    ):
+        self.input_nets = input_nets
+        self.encoder = encoder
+        self.decoder = decoder
+        self.decoder.tasks = tasks
+        self.tasks = tasks
+        self.matcher = matcher
+        # ONE set of learnable latent queries
+        self.query_initial = nn.Parameter(torch.randn(self.num_queries, dim))
+```
 
-    # Stream B — final only
-    "calo_final": {
-        "calo_mask": {"calo_node_prob": (B,5500), "calo_node_valid": (B,5500)},
-        "calo_fraction": {"calo_hs_fraction": (B,5500)},   # GATED by calo_hs_prob > 0.5
-    },
+### `TwoStreamMaskFormer.__init__`
+
+```python
+# model.py
+class TwoStreamMaskFormer(nn.Module):
+    def __init__(
+        self,
+        input_nets: nn.ModuleList,
+        encoder: nn.Module | None,
+        track_decoder: MaskFormerDecoder,   # Stream A decoder
+        track_tasks: nn.ModuleList,
+        calo_decoder: nn.Module,             # Stream B decoder (different type!)
+        calo_tasks: nn.ModuleList,
+        reco_decoder: MaskFormerDecoder | None = None,  # Stream C (optional)
+        reco_tasks: nn.ModuleList | None = None,
+        reco_matcher: nn.Module | None = None,
+        dim: int = 128,
+        max_hs_tracks: int = 200,
+        num_latent_queries: int = 1,
+        teacher_forcing: bool = True,
+        ...
+    ):
+        # THREE separate decoders, each with their own tasks
+        self.track_decoder = track_decoder
+        self.track_decoder.tasks = track_tasks
+        self.calo_decoder = calo_decoder
+        self.reco_decoder = reco_decoder
+
+        # THREE separate query sets with different semantics:
+        self.track_query_initial = nn.Parameter(torch.randn(1, dim))       # 1 latent for track classification
+        self.calo_latent_queries = nn.Parameter(torch.randn(num_latent_queries, dim))  # latent + track copies
+        # Stream C queries live inside self.reco_model (an encapsulated MaskFormer)
+
+        # Encapsulate a full standard MaskFormer as Stream C
+        if self.reco_decoder is not None:
+            self.reco_model = MaskFormer(
+                input_nets=nn.ModuleList([PassThroughInputNet("node", "node_embed_raw")]),
+                encoder=None,          # no encoder — we provide pre-embedded nodes
+                decoder=self.reco_decoder,
+                tasks=self.reco_tasks,
+                dim=self.dim,
+                target_object=self.reco_target_object,
+                matcher=self.reco_matcher,
+                raw_variables=["node_e", "node_pt", "node_eta", "node_sinphi", "node_cosphi", "node_is_track"]
+            )
+```
+
+**Key difference:** `MaskFormer` has one decoder + one task list + one query set. `TwoStreamMaskFormer` has three decoders, three task lists, three query semantics — and Stream C is literally a full `MaskFormer` instance embedded inside.
+
+The `PassThroughInputNet` is a minimal adapter:
+
+```python
+# model.py
+class PassThroughInputNet(nn.Module):
+    """Passes pre-embedded nodes directly through — bypasses the InputNet projection."""
+    def __init__(self, name="node", key="node_embed_raw"):
+        super().__init__()
+        self.input_name = name
+        self.key = key
+        self.posenc = None
+
+    def forward(self, inputs):
+        return inputs[self.key]  # No-op: just returns the pre-computed embedding
+```
+
+Compared to a real `InputNet` which runs a Dense projection + positional encoding, this is intentionally trivial.
+
+---
+
+## 4. Forward Pass — Step by Step
+
+### 4.1 Embedding & Shared Encoder
+
+**Identical pattern in both models.** Both embed inputs with `input_nets`, merge into `key_embed`, and pass through an optional encoder:
+
+```python
+# maskformer.py — MaskFormer.forward()
+for input_net in self.input_nets:
+    x[input_name + "_embed"] = input_net(inputs)
+    x[input_name + "_valid"] = inputs[input_name + "_valid"]
+
+x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in input_names], dim=-2)
+x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in input_names], dim=-1)
+
+if self.encoder is not None:
+    x["key_embed"] = self.encoder(x["key_embed"],
+                                   x_sort_value=x.get(f"key_{self.input_sort_field}"),
+                                   kv_mask=x.get("key_valid"))
+```
+
+```python
+# model.py — TwoStreamMaskFormer.forward()  (same pattern, one addition)
+# ... identical embedding + encoder code ...
+
+# ADDITION: save initial encoder output for Stream C skip connection
+initial_encoder_embed = x["key_embed"]
+```
+
+This single extra line is what makes the Stream C skip connection work. There's no `.clone()` or `.detach()` here — the reference is kept live so Stream C gradients flow back through the shared encoder.
+
+---
+
+### 4.2 Stream A — Track MaskFormer
+
+**Original `MaskFormer`** runs its one decoder:
+
+```python
+# maskformer.py
+x["query_embed"] = self.query_initial.expand(batch_size, -1, -1)
+x["query_valid"] = torch.full((batch_size, self.num_queries), True, ...)
+x, outputs = self.decoder(x, input_names)
+outputs["final"] = {}
+for task in self.tasks:
+    outputs["final"][task.name] = task(x)
+```
+
+**`TwoStreamMaskFormer` Stream A** is a direct parallel of this but uses `track_query_initial` (1 query) and operates on a shallow copy `x_track` so it doesn't contaminate the shared `x` dict:
+
+```python
+# model.py
+x_track = dict(x)  # shallow copy — same tensors, separate dict
+x_track["query_embed"] = self.track_query_initial.expand(batch_size, -1, -1)  # 1 learnable query
+x_track["query_valid"] = torch.full((batch_size, 1), True, device=...)
+
+x_track, track_outputs = self.track_decoder(x_track, input_names)
+
+track_outputs["final"] = {}
+for task in self.track_tasks:
+    track_outputs["final"][task.name] = task(x_track)
+    if isinstance(task, IncidenceRegressionTask):
+        x_track["incidence"] = track_outputs["final"][task.name][task.outputs[0]].detach()
+    if isinstance(task, ObjectClassificationTask):
+        x_track["class_probs"] = track_outputs["final"][task.name][task.outputs[0]].detach()
+```
+
+The `ObjectHitMaskTask` here produces a *single scalar mask per track* (is this track from the HS vertex?). There is no Hungarian matching in Stream A — this is a node-level binary classification, not a set-prediction problem.
+
+---
+
+### 4.3 Bridge — Hybrid Query Construction
+
+This is entirely absent from the original `MaskFormer`.
+
+The bridge extracts which tracks are classified as HS (using truth during training, predictions at inference) and combines them with a few learnable latent queries to form the "hybrid queries" for Stream B:
+
+```python
+# model.py — Bridge
+is_track = x["node_is_track"].bool().squeeze(-1)  # (B, N)
+
+# Teacher forcing: truth mask during training, prediction at inference
+if self.training and self.teacher_forcing:
+    hs_track_mask = x["tracks_mask"].bool() & is_track
+else:
+    mask_logits = track_outputs["final"]["mask"]["pflow_node_logit"]  # (B, 1, N)
+    hs_track_mask = (mask_logits.squeeze(1).sigmoid() >= 0.5) & is_track
+
+# CRITICAL: detach before building hybrid queries
+# Stream B gradients must not propagate back into Stream A's space
+node_embed_detached = x["node_embed"].detach()  # (B, N, D) — gradient blocked here
+
+hybrid_queries, query_valid = self._build_hybrid_queries(
+    node_embed_detached, hs_track_mask, batch_size
+)
+```
+
+`_build_hybrid_queries` packs the queries into a padded tensor of fixed size `(B, num_latent_queries + max_hs_tracks, D)`:
+
+```python
+# model.py
+def _build_hybrid_queries(self, node_embed, hs_mask, batch_size):
+    Q = self.max_hs_tracks + NL  # fixed-size padded tensor (NL = num_latent_queries)
+    queries = torch.zeros(batch_size, Q, D, ...)
+    valid   = torch.zeros(batch_size, Q, ...)
+
+    queries[:, :NL, :] = self.calo_latent_queries  # first NL slots: learnable latents
+    valid[:, :NL] = True
+
+    for b in range(batch_size):
+        track_indices = hs_mask[b].nonzero(as_tuple=True)[0]
+        n = min(len(track_indices), self.max_hs_tracks)
+        if n > 0:
+            queries[b, NL : NL + n, :] = node_embed[b, track_indices[:n], :]
+            valid[b, NL : NL + n] = True
+
+    return queries, valid
+```
+
+The original `MaskFormer` query preparation is simply:
+```python
+# maskformer.py — comparison
+x["query_embed"] = self.query_initial.expand(batch_size, -1, -1)  # static, same for all events
+```
+
+The bridge queries are *dynamic per event* — they encode physical information specific to that collision.
+
+---
+
+### 4.4 Stream B — Calo MaskFormer
+
+**Original `MaskFormer`** would run:
+```python
+# maskformer.py — generic decoder call
+x, outputs = self.decoder(x, input_names)
+```
+
+**`TwoStreamMaskFormer` Stream B** runs the calo-specialized `CaloFlashCrossAttentionDecoder` with the hybrid queries, on a separate `x_calo` copy:
+
+```python
+# model.py
+x_calo = dict(x)  # another shallow copy
+x_calo["query_embed"] = hybrid_queries   # (B, Q, D) where Q = latent + HS tracks
+x_calo["query_valid"] = query_valid      # (B, Q) — padded HS tracks marked invalid
+
+x_calo, calo_outputs = self.calo_decoder(x_calo, input_names)
+
+calo_outputs["final"] = {}
+for task in self.calo_tasks:
+    calo_outputs["final"][task.name] = task(x_calo)
+```
+
+The `CaloFlashCrossAttentionDecoder` uses flash-varlen attention internally, strips out track nodes from the key sequence (calo-only cross-attention), and runs bidirectional cross-attention between hybrid queries and calo nodes.
+
+The `CaloNodeMaskTask` then runs a Dense MLP over each enriched calo node embedding to predict HS probability — a node-level binary classification (no matching needed).
+
+---
+
+### 4.5 Stream C — Reconstruction
+
+This is where `TwoStreamMaskFormer` diverges most from `MaskFormer`, and where the design is most elaborate.
+
+#### Step 1: Build the HS node mask
+
+```python
+# model.py — _forward_reco()
+# Training: truth track mask + truth calo mask + sampled noise from predictions
+if self.training and self.teacher_forcing and targets is not None:
+    reco_track_mask = targets["tracks_mask"].bool() & is_track
+
+    truth_calo_mask = (
+        (calo_hs_frac > self.calo_hs_frac_threshold)
+        & (calo_hs_energy > self.calo_hs_energy_threshold)
+        & ~is_track & node_valid
+    )
+
+    # Sample ~N(reco_calo_noise_mean, reco_calo_noise_std) predicted-but-wrong nodes
+    # to make Stream C robust to imperfect pileup removal at inference time
+    extra_pred = pred_calo_mask & ~truth_calo_mask   # predicted HS but truth says pileup
+    n_extra = int(max(0, torch.normal(mean=..., std=...).item()))
+    # ... random sample n_extra of extra_pred per batch element ...
+    reco_calo_mask = truth_calo_mask | sampled_extra
+else:
+    # Inference: use predicted masks from Streams A and B
+    reco_track_mask = (track_logits.sigmoid() >= 0.5) & is_track
+    reco_calo_mask  = (calo_logits.sigmoid() >= self.calo_pred_threshold) & ~is_track
+```
+
+The original `MaskFormer` runs on all input nodes unconditionally. This filtering step reduces the sequence length by ~4× before Stream C, which has a quadratic attention cost.
+
+#### Step 2: Top-k calo selection
+
+```python
+# model.py
+# Keep only top max_reco_calo_nodes calo nodes by cluster energy
+node_e = x.get("node_e", ...)
+calo_energy_masked = torch.where(reco_calo_mask, node_e, torch.zeros_like(node_e))
+max_k = min(self.max_reco_calo_nodes, calo_energy_masked.shape[-1])
+_, topk_indices = calo_energy_masked.topk(max_k, dim=-1, sorted=False)
+reco_calo_topk = torch.zeros_like(reco_calo_mask)
+reco_calo_topk.scatter_(1, topk_indices, True)
+reco_calo_topk = reco_calo_topk & reco_calo_mask   # AND to keep only HS-predicted ones
+
+reco_node_mask = reco_track_mask | reco_calo_topk  # final HS node mask
+```
+
+#### Step 3: Skip connection + gather filtered nodes
+
+```python
+# model.py
+# Skip connection: sum of final encoder output with the saved initial output
+# This gives Stream C access to both local and global information
+reco_embed = x["key_embed"] + initial_encoder_embed  # (B, N, D)
+
+# Repack variable-length HS nodes into a fixed-size padded tensor
+filtered_embed = torch.zeros(batch_size, max_rn, D, ...)
+filtered_valid  = torch.zeros(batch_size, max_rn, dtype=torch.bool, ...)
+reco_node_indices = torch.zeros(batch_size, max_rn, dtype=torch.long, ...)
+
+for b in range(batch_size):
+    indices = reco_node_mask[b].nonzero(as_tuple=True)[0]
+    n = min(len(indices), max_rn)
+    if n > 0:
+        filtered_embed[b, :n]     = reco_embed[b, indices[:n]]
+        filtered_valid[b, :n]     = True
+        reco_node_indices[b, :n]  = indices[:n]   # saved for loss reindexing
+        for k in raw_keys:
+            filtered_raw[k][b, :n] = x[k][b][indices[:n]]
+
+self._reco_node_indices    = reco_node_indices  # used in _build_reco_targets
+self._reco_filtered_valid  = filtered_valid
+```
+
+#### Step 4: Run encapsulated standard MaskFormer
+
+```python
+# model.py
+reco_inputs = {
+    "node_embed_raw": filtered_embed,   # pre-embedded, PassThroughInputNet returns this directly
+    "node_valid":     filtered_valid,
+    "node_is_track":  filtered_is_track,
+    **filtered_raw,                     # node_e, node_pt, node_eta, etc.
 }
+reco_outputs = self.reco_model(reco_inputs)
+```
+
+Compare this to the original `MaskFormer.forward()`:
+
+```python
+# maskformer.py — what reco_model.forward() does internally
+for input_net in self.input_nets:
+    x[input_name + "_embed"] = input_net(inputs)   # PassThroughInputNet: just returns inputs["node_embed_raw"]
+    x[input_name + "_valid"] = inputs[input_name + "_valid"]
+
+x["key_embed"] = ... concat ...
+# encoder=None, so skipped
+x["query_embed"] = self.query_initial.expand(batch_size, -1, -1)  # 400 learnable reco queries
+x["query_valid"]  = torch.full((batch_size, self.num_queries), True, ...)
+x, outputs = self.decoder(x, input_names)  # standard MaskFormerDecoder, 4 layers
+outputs["final"] = {}
+for task in self.tasks:
+    outputs["final"][task.name] = task(x)  # classification, mask, incidence, regression
+```
+
+**The `reco_model` is a fully unmodified `MaskFormer` — zero customization.** The entire complexity lives in the filtering + packaging that prepares its inputs.
+
+---
+
+## 5. Training vs Inference: Teacher Forcing & Noise Sampling
+
+| Stage | Track mask | Calo mask |
+|---|---|---|
+| **Training** | Ground truth `targets["tracks_mask"]` | Ground truth HS calo + ~N(300, 50) sampled predicted-but-wrong nodes |
+| **Inference** | Stream A predicted sigmoid ≥ 0.5 | Stream B predicted sigmoid ≥ `calo_pred_threshold=0.2` |
+
+The noise sampling during training is essential for robustness:
+
+```python
+# model.py
+# Extra predicted nodes not in truth — pileup that Stream B incorrectly predicted as HS
+extra_pred = pred_calo_mask & ~truth_calo_mask
+
+# Sample a random number of them to inject into Stream C's inputs
+n_extra = int(max(0, torch.normal(
+    mean=torch.tensor(float(self.reco_calo_noise_mean)),   # ~300
+    std=torch.tensor(self.reco_calo_noise_std),            # 50
+).item()))
+
+sampled_extra = torch.zeros_like(extra_pred)
+for b in range(batch_size):
+    extra_indices = extra_pred[b].nonzero(as_tuple=True)[0]
+    if len(extra_indices) > 0 and n_extra > 0:
+        k = min(n_extra, len(extra_indices))
+        perm = torch.randperm(len(extra_indices), device=device)[:k]
+        sampled_extra[b, extra_indices[perm]] = True
+
+reco_calo_mask = truth_calo_mask | sampled_extra
+```
+
+Without this, Stream C trains only on clean HS nodes and would degrade at inference time when Stream B makes imperfect predictions. The sampled noise teaches Stream C to be robust to ~300 residual pileup nodes.
+
+The original `MaskFormer` has no teacher forcing concept — it processes all nodes equally in all stages.
+
+---
+
+## 6. Loss Computation
+
+### Original `MaskFormer.loss()`
+
+```python
+# maskformer.py
+def loss(self, outputs, targets):
+    if self.matcher is not None:
+        # 1. Compute cost matrix from all tasks for each decoder layer
+        costs = {}
+        for layer_name, layer_outputs in outputs.items():
+            layer_costs = None
+            for task in self.tasks:
+                if layer_name != "final" and not task.has_intermediate_loss:
+                    continue
+                task_costs = task.cost(layer_outputs[task.name], targets)
+                for cost in task_costs.values():
+                    layer_costs = cost if layer_costs is None else layer_costs + cost
+            costs[layer_name] = layer_costs.detach()
+
+        # 2. Hungarian matching + permute predictions for each layer
+        for layer_name, cost in costs.items():
+            pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
+            for task in self.tasks:
+                if not task.permute_loss: continue
+                for output_name in task.outputs:
+                    outputs[layer_name][task.name][output_name] = \
+                        outputs[layer_name][task.name][output_name][batch_idxs, pred_idxs]
+
+    # 3. Compute losses
+    losses = {}
+    for layer_name in outputs:
+        losses[layer_name] = {}
+        for task in self.tasks:
+            losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
+    return losses
+```
+
+### `TwoStreamMaskFormer.loss()`
+
+Stream A and B use **direct binary classification** (no matching), while Stream C reuses the exact `MaskFormer.loss()` logic by delegating:
+
+```python
+# model.py
+def loss(self, outputs, targets):
+    losses = {}
+
+    # Stream A: direct per-node binary loss, no matching
+    for layer_name, layer_out in outputs.items():
+        if layer_name.startswith("track_"):
+            real_layer = layer_name[len("track_"):]
+            losses[layer_name] = {}
+            for task in self.track_tasks:
+                if real_layer != "final" and not task.has_intermediate_loss:
+                    continue
+                if task.name in layer_out:
+                    losses[layer_name][task.name] = task.loss(layer_out[task.name], targets)
+
+        # Stream B: same pattern
+        elif layer_name.startswith("calo_"):
+            ...
+
+    # Stream C: reindex targets to filtered node space, then delegate entirely
+    if hasattr(self, "reco_model") and any(k.startswith("reco_") for k in outputs):
+        reco_targets = self._build_reco_targets(targets)  # reindex node dim: 5500 → 1400
+        reco_layer_outputs = {k[len("reco_"):]: v for k, v in outputs.items() if k.startswith("reco_")}
+        reco_losses = self.reco_model.loss(reco_layer_outputs, reco_targets)  # full Hungarian matching
+        for layer_name, layer_losses in reco_losses.items():
+            losses[f"reco_{layer_name}"] = layer_losses
+
+    return losses
+```
+
+`_build_reco_targets` reindexes the `(B, num_objects, max_nodes=5500)` incidence matrix to `(B, num_objects, max_reco_nodes=1400)` using `torch.gather`:
+
+```python
+# model.py
+def _build_reco_targets(self, targets):
+    indices = self._reco_node_indices    # (B, 1400) — stored during forward()
+
+    for key in ["node_valid", "node_incidence"]:
+        src_key = f"{self.reco_target_object}_{key}"
+        if src_key in reco_targets and reco_targets[src_key].dim() == 3:
+            num_objects = reco_targets[src_key].shape[1]
+            idx_expanded = indices.unsqueeze(1).expand(-1, num_objects, -1)  # view, zero-copy
+            reco_targets[src_key] = torch.gather(reco_targets[src_key], 2, idx_expanded)
+            # (B, 400, 5500) → (B, 400, 1400) in one GPU kernel
 ```
 
 ---
 
-## Metrics Logged
+## 7. Prediction
 
-### Track Metrics (Stream A)
-| Metric | Source |
-|--------|--------|
-| `val/track_f1` | `track_final.mask.pflow_node_prob` vs `tracks_mask` (track nodes only) |
-| `val/track_precision` | same |
-| `val/track_recall` | same |
-| `val/vz_mae` | `track_final.vz_regression.pflow_vz` vs `particle_vz` |
+### Original `MaskFormer.predict()`
 
-### Calo Metrics (Stream B)
-| Metric | Source |
-|--------|--------|
-| `val/calo_mask_f1` | `calo_final.calo_mask.calo_node_prob` vs `calo_hs_frac > 0.05 & calo_hs_energy > 0.15` |
-| `val/calo_mask_precision` | same |
-| `val/calo_mask_recall` | same |
-| `val/calo_frac_mae` | `calo_final.calo_fraction.calo_hs_fraction` vs `calo_hard_scatter_energy_frac` |
-| `val/calo_frac_mae_{pu_only,mix_pu,balanced,mix_hs,hs_only}` | Per-type MAE by true HS fraction |
-| `val/calo_hs_energy_ratio` | `sum(pred HS E) / sum(true HS E)` |
+```python
+# maskformer.py
+def predict(self, outputs):
+    preds = {}
+    for layer_name, layer_outputs in outputs.items():
+        preds[layer_name] = {}
+        for task in self.tasks:
+            if layer_name != "final" and not task.has_intermediate_loss:
+                continue
+            preds[layer_name][task.name] = task.predict(layer_outputs[task.name])
+    return preds
+```
 
-### Epoch-End Plots (CometML)
-| Plot | Description |
-|------|-------------|
-| `calo/energy_corr` | Predicted vs true HS energy correlation |
-| `calo/frac_corr` | Predicted vs true HS fraction correlation |
-| `calo/frac_dist` | Predicted and true HS fraction distributions |
-| `calo/energy_resid` | HS energy residual distribution |
-| `calo/hs_energy_dist` | Predicted and true HS energy distributions |
-| `track/score_dist` | Track HS score distribution (HS vs PU) |
-| `track/eff_vs_pt` | Track efficiency vs pT |
-| `track/rej_vs_pt` | Pileup rejection vs pT |
-| `track/mistag_eta` | Mistag rate vs eta |
-| `track/score_by_pt` | Track score distributions by pT bin |
-| `track/roc` | ROC curve |
-| `track/z0_dist` | Track z0 distribution (HS vs PU) |
-| `track/pt_dist` | Track pT distribution (HS vs PU) |
+### `TwoStreamMaskFormer.predict()`
 
----
+```python
+# model.py
+def predict(self, outputs):
+    preds = {}
 
-## Configurable Parameters
+    for layer_name, layer_out in outputs.items():
+        preds[layer_name] = {}
+        if layer_name.startswith("track_"):
+            for task in self.track_tasks:
+                ...
+                preds[layer_name][task.name] = task.predict(layer_out[task.name])
+        elif layer_name.startswith("calo_"):
+            ...
 
-| Parameter | Location | Value | Description |
-|-----------|----------|-------|-------------|
-| `max_hs_tracks` | `model.init_args` | 190 | Max HS tracks in hybrid queries |
-| `num_latent_queries` | `model.init_args` | 16 | Learnable latent query slots (always valid) |
-| `teacher_forcing` | `model.init_args` | true | Use GT HS tracks during training bridge |
-| `hs_energy_threshold` | `CaloNodeMaskTask`, `CaloNodeFractionTask` | 0.15 | Min absolute HS energy to count as HS |
-| `hs_frac_threshold` | `CaloNodeMaskTask`, `CaloNodeFractionTask` | 0.05 | Min HS energy fraction to count as HS |
-| `null_weight` | `CaloNodeMaskTask` | 0.05 | BCE sample weight for pileup nodes (1.0 for HS → 20:1 ratio) |
-| `pred_threshold` | `CaloNodeMaskTask` | 0.2 | Threshold for `calo_node_valid` binary prediction |
-| `loss_weight` | `CaloNodeFractionTask` | 0.01 | L1 fraction loss weight (mask losses dominate) |
-| `net` (mask) | `CaloNodeMaskTask` | `Dense(128,1,[128,64,32],SiLU)` | Per-node HS/pileup binary classifier |
-| `net` (frac) | `CaloNodeFractionTask` | `Dense(128,1,[256,128,64,32],SiLU,Sigmoid)` | Per-node HS energy fraction regressor |
-| `batch_size` | `data` | 64 | Training batch size |
+    # Stream C: delegate to encapsulated reco_model
+    if hasattr(self, "reco_model") and any(k.startswith("reco_") for k in outputs):
+        reco_layer_outputs = {k[len("reco_"):]: v for k, v in outputs.items() if k.startswith("reco_")}
+        reco_preds = self.reco_model.predict(reco_layer_outputs)  # full predict with thresholding
+        for layer_name, layer_preds in reco_preds.items():
+            preds[f"reco_{layer_name}"].update(layer_preds)
+```
+
+The prefix juggling (`reco_` → strip → delegate → re-add `reco_`) keeps `reco_model`'s internal naming convention intact while namespacing its outputs in the outer model.
 
 ---
 
-## Training
+## 8. Gradient Flow Diagram
 
-```bash
-cd src/hepattn/experiments/odd_pileup_two_stream
-python main.py fit --config configs/base.yaml
+```
+Shared Encoder
+     ║
+     ╠══════════════════════╗
+     ║                      ║ (initial_encoder_embed — live reference, not clone)
+     ▼                      ║
+  Stream A tasks             ║
+     │ (gradients flow       ║
+     │  back through         ║
+     │  shared encoder)      ║
+     │                       ║
+     │ detach()              ║
+     ▼                       ║
+  Bridge queries             ║
+     │                       ║
+     ▼                       ║
+  Stream B tasks             ║
+     │ (Stream B cannot      ║
+     │  affect encoder via   ║
+     │  query path —         ║
+     │  detach blocked it)   ║
+     │                       ║
+     └──────────►  Stream C ◄╝
+                  │ (gradients flow back through
+                  │  both x["key_embed"] AND initial_encoder_embed
+                  │  → shared encoder trained jointly by reco signal)
+```
+
+**Key contrast with original `MaskFormer`:** All tasks in the standard model share exactly one gradient path through one encoder. Here, Stream A's track classification gradient and Stream C's reconstruction gradient both flow through the shared encoder (in parallel), while Stream B's gradient is intentionally blocked.
+
+---
+
+## 9. Data Pipeline Summary
+
+The dataset ([pflow_data.py](pflow_data.py)) loads Parquet files and builds the following labels for Stream C:
+
+| Target key | Shape | Description |
+|---|---|---|
+| `reco_particle_class` | `(num_objects,)` | PDG→class mapping (0=photon, 1=electron, 2=muon, 3=charged hadron, 4=neutral hadron, 5=null/padding) |
+| `reco_particle_valid` | `(num_objects,)` | `class < 5` |
+| `reco_particle_node_valid` | `(num_objects, max_nodes)` | incidence > cutval (binary hit association mask) |
+| `reco_particle_incidence` | `(num_objects, max_nodes)` | energy-weighted, column-normalized particle→node matrix |
+| `reco_particle_e/pt/eta/sinphi/cosphi` | `(num_objects,)` | regression targets (scaled) |
+
+The incidence matrix construction follows the `odd` experiment:
+
+```python
+# pflow_data.py
+incidence = torch.zeros(self.num_objects, self.max_nodes)
+
+# Track association: particle → track (binary)
+incidence[t_particle_idx, track_idx] = 1.0
+
+# Cluster association: particle → cluster (energy-weighted)
+incidence[d_particle_idx, d_cluster_idx + n_tracks] = d_energy
+
+# Column-normalize: each node's associations sum to 1
+col_sums = incidence.sum(0, keepdim=True).clamp(min=1e-6)
+incidence = incidence / col_sums
+```
+
+Trackless charged particles are reclassified to their neutral counterpart:
+
+```python
+# pflow_data.py
+is_charged = particle_class.isin([1, 2, 3])  # electron, muon, charged hadron
+has_track  = particle_has_track.bool()
+# class 1→0 (e→photon), 2→2 (muon stays), 3→4 (charged hadron→neutral hadron)
+reclassify_map = {1: 0, 3: 4}
+particle_class[(is_charged & ~has_track)] = reclassify_map.get(particle_class, particle_class)
 ```
 
 ---
 
-## Differences from Single-Stream Baseline (`odd_pileup_maskformer`)
+## 10. Config Key Differences
 
-| Aspect | Single-Stream | Two-Stream |
-|--------|---------------|------------|
-| Decoders | 1 (PileupMaskFormerDecoder, 4 layers) | 2 (Track: 4 layers + Calo: 4 layers) |
-| Queries | 1 learnable query | 16 latent queries + up to 190 HS track embeddings (206 total) |
-| Calo mask | None (implicit via fraction task) | CaloNodeMaskTask: per-node Dense classifier (final layer only) |
-| Calo mask loss | — | BCE (×5) + Tversky α=0.2,β=0.8 (×2) |
-| Calo fraction loss | All clusters (weighted) | HS clusters only (`hs_frac > 0.05 & hs_energy > 0.15`), weight=0.01 |
-| Gradient flow | Single path (encoder ↔ decoder) | Isolated: calo loss detached from encoder/tracks |
-| Inference | Direct fraction output | Gated: `frac * (calo_mask > 0.5)` |
-| Calo decoder | — | CaloFlashCrossAttentionDecoder (flash-varlen, bidirectional q↔calo) |
-| Calo tasks | Query-hit dot-product tasks | Node-classification tasks (Dense head on enriched nodes) |
+**Stream C specific config in [configs/base.yaml](configs/base.yaml):**
+
+```yaml
+model:
+  model:
+    class_path: hepattn.experiments.odd_pileup_reco.model.TwoStreamMaskFormer
+    init_args:
+      # Noise injection parameters (training only)
+      reco_calo_noise_mean: 300    # ~N(300, 50) extra pileup nodes per event
+      reco_calo_noise_std: 50.0
+      max_reco_calo_nodes: 1200    # Top-k calo filter
+      max_reco_nodes: 1400         # Padded sequence length for Stream C
+      num_reco_queries: 400        # Max reconstructed particles
+      reco_target_object: reco_particle
+      calo_pred_threshold: 0.2     # Stream B threshold for inference filtering
+      teacher_forcing: true
+
+      reco_decoder:
+        class_path: hepattn.models.decoder.MaskFormerDecoder
+        init_args:
+          num_decoder_layers: 4
+          num_queries: 400
+          mask_attention: true
+          decoder_layer_config:
+            dim: 128
+            hybrid_norm: true
+            bidirectional_ca: true
+            attn_kwargs:
+              num_heads: 16
+
+      reco_matcher:
+        class_path: hepattn.models.matcher.Matcher
+        init_args:
+          default_solver: scipy
+          parallel_solver: true
+          n_jobs: 16
+
+      reco_tasks:
+        # 1. 6-class classification (0-4 + null=5)
+        - class_path: hepattn.models.task.ObjectClassificationTask
+          init_args:
+            num_classes: 5
+            null_weight: 0.5
+            loss_class_weights: [1.0, 3.0, 8.0, 1.5, 1.0]
+
+        # 2. Hit mask (BCE + Dice)
+        - class_path: hepattn.models.task.ObjectHitMaskTask
+
+        # 3. Incidence regression (KL-div)
+        - class_path: hepattn.models.task.IncidenceRegressionTask
+
+        # 4. Incidence-based kinematics regression
+        #    input_size = 2*dim + 6 raw vars = 2*128 + 6 = 262
+        - class_path: hepattn.models.task.IncidenceBasedRegressionTask
+          init_args:
+            fields: ["e", "pt", "eta", "sinphi", "cosphi"]
+            net:
+              input_size: 262   # ← 262, not 518 — dim=128 not 256
+```
+
+Compare to the original `odd` experiment where `dim=256` and `input_size=518`. Here `dim=128` halves the channel dimension; the raw-variable count (6) stays the same.
+
+---
+
+## Quick Reference: What Maps to What
+
+| Concept | `MaskFormer` | `TwoStreamMaskFormer` |
+|---|---|---|
+| Input embedding | `input_nets[i](inputs)` | same |
+| Shared encoder | `self.encoder(key_embed)` | same, + `initial_encoder_embed` saved |
+| Latent queries | `self.query_initial` (static) | `self.track_query_initial` (A), `self.calo_latent_queries` (B), `self.reco_model.query_initial` (C) |
+| Decoder | `self.decoder(x, ...)` | A: `track_decoder`, B: `calo_decoder`, C: `reco_model.decoder` |
+| Tasks | `self.tasks` | A: `track_tasks`, B: `calo_tasks`, C: inside `reco_model` |
+| Hungarian matching | inside `self.matcher` | only for Stream C, delegated to `reco_model` |
+| Loss | `self.loss(outputs, targets)` | A+B: direct, C: `self.reco_model.loss(reco_layer_outputs, reco_targets)` |
+| Predict | `self.predict(outputs)` | A+B: direct, C: `self.reco_model.predict(reco_layer_outputs)` |
+| Gradient isolation | none | `node_embed.detach()` before Bridge |
+| Skip connection | none | `x["key_embed"] + initial_encoder_embed` for C |
+| Noise robustness | none | ~N(300,50) extra predicted calo nodes injected into C during training |

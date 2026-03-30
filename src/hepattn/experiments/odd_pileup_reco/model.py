@@ -3,6 +3,19 @@ from torch import Tensor, nn
 
 from hepattn.models.decoder import MaskFormerDecoder
 from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
+from hepattn.models.maskformer import MaskFormer
+
+
+class PassThroughInputNet(nn.Module):
+    """Helper module to pass already-embedded nodes directly into an encapsulated MaskFormer."""
+    def __init__(self, name="node", key="node_embed_raw"):
+        super().__init__()
+        self.input_name = name
+        self.key = key
+        self.posenc = None
+        
+    def forward(self, inputs):
+        return inputs[self.key]
 
 
 class TwoStreamMaskFormer(nn.Module):
@@ -88,7 +101,19 @@ class TwoStreamMaskFormer(nn.Module):
 
         if self.reco_decoder is not None:
             self.reco_decoder.tasks = self.reco_tasks
-            self.reco_query_initial = nn.Parameter(torch.randn(num_reco_queries, dim))
+            self.reco_decoder.num_queries = self.num_reco_queries
+            
+            # Instantiate the inner MaskFormer object
+            self.reco_model = MaskFormer(
+                input_nets=nn.ModuleList([PassThroughInputNet("node", "node_embed_raw")]),
+                encoder=None,
+                decoder=self.reco_decoder,
+                tasks=self.reco_tasks,
+                dim=self.dim,
+                target_object=self.reco_target_object,
+                matcher=self.reco_matcher,
+                raw_variables=["node_e", "node_pt", "node_eta", "node_sinphi", "node_cosphi", "node_is_track"]
+            )
 
         # Expose all tasks for ModelWrapper compatibility
         self.tasks = nn.ModuleList([*track_tasks, *calo_tasks, *self.reco_tasks])
@@ -267,12 +292,16 @@ class TwoStreamMaskFormer(nn.Module):
             ).item()))
 
             sampled_extra = torch.zeros_like(extra_pred)
-            for b in range(batch_size):
-                extra_indices = extra_pred[b].nonzero(as_tuple=True)[0]
-                if len(extra_indices) > 0 and n_extra > 0:
-                    k = min(n_extra, len(extra_indices))
-                    perm = torch.randperm(len(extra_indices), device=device)[:k]
-                    sampled_extra[b, extra_indices[perm]] = True
+            if n_extra > 0 and extra_pred.any():
+                N_nodes = x["key_embed"].shape[1]
+                noise_scores = torch.where(
+                    extra_pred,
+                    torch.rand(batch_size, N_nodes, device=device),
+                    torch.full((batch_size, N_nodes), -1.0, device=device),
+                )
+                _, sample_idx = noise_scores.topk(min(n_extra, N_nodes), dim=-1)
+                sampled_extra.scatter_(1, sample_idx, True)
+                sampled_extra = sampled_extra & extra_pred
 
             reco_calo_mask = truth_calo_mask | sampled_extra
         else:
@@ -302,63 +331,45 @@ class TwoStreamMaskFormer(nn.Module):
         # --- Skip connection with initial encoder output ---
         reco_embed = x["key_embed"] + initial_encoder_embed
 
-        # --- Gather filtered nodes into padded tensor ---
-        N_full = reco_embed.shape[1]
+        # --- Gather filtered nodes (vectorized) ---
         D = reco_embed.shape[2]
         max_rn = self.max_reco_nodes
-
-        filtered_embed = torch.zeros(batch_size, max_rn, D, device=device, dtype=reco_embed.dtype)
-        filtered_valid = torch.zeros(batch_size, max_rn, device=device, dtype=torch.bool)
-        filtered_is_track = torch.zeros(batch_size, max_rn, device=device, dtype=torch.float32)
-        # Store original indices for target reindexing
-        reco_node_indices = torch.zeros(batch_size, max_rn, device=device, dtype=torch.long)
-
-        # Gather raw variables for reco tasks
         raw_keys = ["node_e", "node_pt", "node_eta", "node_sinphi", "node_cosphi", "node_is_track"]
-        filtered_raw = {k: torch.zeros(batch_size, max_rn, device=device) for k in raw_keys}
 
-        for b in range(batch_size):
-            indices = reco_node_mask[b].nonzero(as_tuple=True)[0]
-            n = min(len(indices), max_rn)
-            if n > 0:
-                filtered_embed[b, :n] = reco_embed[b, indices[:n]]
-                filtered_valid[b, :n] = True
-                filtered_is_track[b, :n] = is_track[b, indices[:n]].float()
-                reco_node_indices[b, :n] = indices[:n]
-                for k in raw_keys:
-                    if k in x:
-                        src = x[k][b]
-                        if src.dim() > 1:
-                            src = src.squeeze(-1)
-                        filtered_raw[k][b, :n] = src[indices[:n]]
+        # argsort: True (1) first via descending; stable preserves original index order
+        sort_idx = torch.argsort(reco_node_mask.long(), dim=-1, descending=True, stable=True)
+        reco_node_indices = sort_idx[:, :max_rn]
+        filtered_valid = reco_node_mask.gather(1, reco_node_indices)
+
+        idx_3d = reco_node_indices.unsqueeze(-1).expand(-1, -1, D)
+        filtered_embed = reco_embed.gather(1, idx_3d)
+        filtered_is_track = is_track.float().gather(1, reco_node_indices)
+
+        filtered_raw = {}
+        for k in raw_keys:
+            if k in x:
+                src = x[k]
+                if src.dim() > 2:
+                    src = src.squeeze(-1)
+                filtered_raw[k] = src.gather(1, reco_node_indices)
+            else:
+                filtered_raw[k] = torch.zeros(batch_size, max_rn, device=device)
 
         # Store for target reindexing in loss()
         self._reco_node_indices = reco_node_indices
         self._reco_filtered_valid = filtered_valid
 
-        # --- Build x_reco dict ---
-        x_reco = {
-            "key_embed": filtered_embed,
-            "key_valid": filtered_valid,
-            "key_is_node": torch.ones(max_rn, device=device, dtype=torch.bool),
-            "query_embed": self.reco_query_initial.expand(batch_size, -1, -1),
-            "query_valid": torch.full((batch_size, self.num_reco_queries), True, device=device),
+        # --- Build reco_inputs dict formatted for PassThroughInputNet ---
+        reco_inputs = {
+            "node_embed_raw": filtered_embed,
+            "node_valid": filtered_valid,
             "node_is_track": filtered_is_track,
         }
         for k in raw_keys:
-            x_reco[k] = filtered_raw[k]
+            reco_inputs[k] = filtered_raw[k]
 
-        # --- Run reco decoder ---
-        x_reco, reco_outputs = self.reco_decoder(x_reco, ["node"])
-
-        # --- Final reco task outputs ---
-        reco_outputs["final"] = {}
-        for task in self.reco_tasks:
-            reco_outputs["final"][task.name] = task(x_reco)
-            if isinstance(task, IncidenceRegressionTask):
-                x_reco["incidence"] = reco_outputs["final"][task.name][task.outputs[0]].detach()
-            if isinstance(task, ObjectClassificationTask):
-                x_reco["class_probs"] = reco_outputs["final"][task.name][task.outputs[0]].detach()
+        # --- Run encapsulated MaskFormer ---
+        reco_outputs = self.reco_model(reco_inputs)
 
         return reco_outputs
 
@@ -374,15 +385,16 @@ class TwoStreamMaskFormer(nn.Module):
         queries = torch.zeros(batch_size, Q, D, device=device, dtype=node_embed.dtype)
         valid = torch.zeros(batch_size, Q, device=device, dtype=torch.bool)
 
-        queries[:, :NL, :] = self.calo_latent_queries
-        valid[:, :NL] = True
+        sort_idx = torch.argsort(hs_mask.long(), dim=-1, descending=True, stable=True)
+        track_indices = sort_idx[:, :self.max_hs_tracks]
+        track_valid = hs_mask.gather(1, track_indices)
+        idx_3d = track_indices.unsqueeze(-1).expand(-1, -1, D)
+        track_embeds = node_embed.gather(1, idx_3d)
 
-        for b in range(batch_size):
-            track_indices = hs_mask[b].nonzero(as_tuple=True)[0]
-            n = min(len(track_indices), self.max_hs_tracks)
-            if n > 0:
-                queries[b, NL : NL + n, :] = node_embed[b, track_indices[:n], :]
-                valid[b, NL : NL + n] = True
+        queries[:, :NL, :] = self.calo_latent_queries
+        queries[:, NL:, :] = track_embeds
+        valid[:, :NL] = True
+        valid[:, NL:] = track_valid
 
         return queries, valid
 
@@ -408,49 +420,18 @@ class TwoStreamMaskFormer(nn.Module):
                         losses[layer_name][task.name] = task.loss(layer_out[task.name], targets)
 
         # --- Reconstruction losses (Stream C) with Hungarian matching ---
-        if self.reco_decoder is not None and any(k.startswith("reco_") for k in outputs):
+        if hasattr(self, "reco_model") and self.reco_model is not None and any(k.startswith("reco_") for k in outputs):
             reco_targets = self._build_reco_targets(targets)
+            
+            # Strip prefixes since reco_model expects native names
             reco_layer_outputs = {k[len("reco_"):]: v for k, v in outputs.items() if k.startswith("reco_")}
 
-            if self.reco_matcher is not None:
-                batch_idxs = torch.arange(reco_targets[f"{self.reco_target_object}_valid"].shape[0]).unsqueeze(1)
+            # Let MaskFormer natively handle permutation and bipartite matching
+            reco_losses = self.reco_model.loss(reco_layer_outputs, reco_targets)
 
-                costs = {}
-                for layer_name, layer_outputs in reco_layer_outputs.items():
-                    layer_costs = None
-                    for task in self.reco_tasks:
-                        if layer_name != "final" and not task.has_intermediate_loss:
-                            continue
-                        if task.name not in layer_outputs:
-                            continue
-                        task_costs = task.cost(layer_outputs[task.name], reco_targets)
-                        for cost in task_costs.values():
-                            layer_costs = cost if layer_costs is None else layer_costs + cost
-                    if layer_costs is not None:
-                        layer_costs = layer_costs.detach()
-                    costs[layer_name] = layer_costs
-
-                for layer_name, cost in costs.items():
-                    if cost is None:
-                        continue
-                    pred_idxs = self.reco_matcher(cost, reco_targets[f"{self.reco_target_object}_valid"])
-                    for task in self.reco_tasks:
-                        if not task.permute_loss:
-                            continue
-                        if layer_name != "final" and not task.has_intermediate_loss:
-                            continue
-                        for output_name in task.outputs:
-                            if output_name in reco_layer_outputs[layer_name].get(task.name, {}):
-                                reco_layer_outputs[layer_name][task.name][output_name] = \
-                                    reco_layer_outputs[layer_name][task.name][output_name][batch_idxs, pred_idxs]
-
-            for layer_name, layer_outputs in reco_layer_outputs.items():
-                losses[f"reco_{layer_name}"] = {}
-                for task in self.reco_tasks:
-                    if layer_name != "final" and not task.has_intermediate_loss:
-                        continue
-                    if task.name in layer_outputs:
-                        losses[f"reco_{layer_name}"][task.name] = task.loss(layer_outputs[task.name], reco_targets)
+            # Re-apply prefix
+            for layer_name, layer_losses in reco_losses.items():
+                losses[f"reco_{layer_name}"] = layer_losses
 
         return losses
 
@@ -509,11 +490,17 @@ class TwoStreamMaskFormer(nn.Module):
                     if task.name in layer_out:
                         preds[layer_name][task.name] = task.predict(layer_out[task.name])
             elif layer_name.startswith("reco_"):
-                real_layer = layer_name[len("reco_"):]
-                for task in self.reco_tasks:
-                    if real_layer != "final" and not task.has_intermediate_loss:
-                        continue
-                    if task.name in layer_out:
-                        preds[layer_name][task.name] = task.predict(layer_out[task.name])
+                pass  # Handled natively below
+
+        # Use the encapsulated reco_model to handle predicting matching and sorting outputs natively
+        if hasattr(self, "reco_model") and self.reco_model is not None and any(k.startswith("reco_") for k in outputs):
+            reco_layer_outputs = {k[len("reco_"):]: v for k, v in outputs.items() if k.startswith("reco_")}
+            reco_preds = self.reco_model.predict(reco_layer_outputs)
+            
+            for layer_name, layer_preds in reco_preds.items():
+                if f"reco_{layer_name}" not in preds:
+                    preds[f"reco_{layer_name}"] = {}
+                for k, v in layer_preds.items():
+                    preds[f"reco_{layer_name}"][k] = v
 
         return preds
