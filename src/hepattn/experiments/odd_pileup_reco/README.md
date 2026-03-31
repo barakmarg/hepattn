@@ -83,11 +83,13 @@ Input nodes (tracks + calo, ~5500 total including pileup)
   │               all HS tracks)                                 │
   │  Skip: reco_embed = encoder_out + initial_encoder_embed      │
   │  Repack to (B, max_reco_nodes=1400, D)                       │
-  │  → encapsulated MaskFormer (4 layers, 400 queries)           │
-  │     • Classification (6 classes)                             │
+  │  → custom MaskFormer (4 layers, 400 queries)                 │
+  │     • Query 0 = pileup token (forced match to target 0)      │
+  │     • Classification (6 classes, class 5 = pileup/null)      │
   │     • Hit mask (BCE + Dice)                                  │
   │     • Incidence regression (KL-div)                          │
   │     • Incidence-based regression (pt, eta, phi, e)           │
+  │       (excluded for pileup token — no meaningful kinematics) │
   └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -453,7 +455,11 @@ for task in self.tasks:
     outputs["final"][task.name] = task(x)  # classification, mask, incidence, regression
 ```
 
-**The `reco_model` is a fully unmodified `MaskFormer` — zero customization.** The entire complexity lives in the filtering + packaging that prepares its inputs.
+**The `reco_model` is a custom `MaskFormer`** (copied to [maskformer.py](maskformer.py)) with two modifications to `loss()`:
+1. **Forced pileup matching**: Before Hungarian matching, cost matrix is manipulated to force query 0 ↔ target 0 (the pileup particle).
+2. **Regression exclusion**: `IncidenceBasedRegressionTask` temporarily masks position 0 as invalid (pileup has no meaningful kinematics).
+
+The rest of the complexity lives in the filtering + packaging that prepares its inputs.
 
 ---
 
@@ -496,41 +502,38 @@ The original `MaskFormer` has no teacher forcing concept — it processes all no
 
 ## 6. Loss Computation
 
-### Original `MaskFormer.loss()`
+### Custom `MaskFormer.loss()` ([maskformer.py](maskformer.py))
+
+The experiment uses a custom copy of `MaskFormer` with two changes in `loss()`:
+
+**1. Forced pileup matching** — Before the Hungarian matcher, cost is manipulated to force query 0 → target 0:
 
 ```python
-# maskformer.py
-def loss(self, outputs, targets):
-    if self.matcher is not None:
-        # 1. Compute cost matrix from all tasks for each decoder layer
-        costs = {}
-        for layer_name, layer_outputs in outputs.items():
-            layer_costs = None
-            for task in self.tasks:
-                if layer_name != "final" and not task.has_intermediate_loss:
-                    continue
-                task_costs = task.cost(layer_outputs[task.name], targets)
-                for cost in task_costs.values():
-                    layer_costs = cost if layer_costs is None else layer_costs + cost
-            costs[layer_name] = layer_costs.detach()
+# maskformer.py (experiment-local)
+# Force pileup assignment: query 0 ↔ target 0
+if cost.shape[2] > 1:
+    cost[:, 0, 1:] = 1e6   # query 0 can't match any real particle
+    cost[:, 1:, 0] = 1e6   # no other query can match pileup target
+    cost[:, 0, 0] = -1e6   # forced match
 
-        # 2. Hungarian matching + permute predictions for each layer
-        for layer_name, cost in costs.items():
-            pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
-            for task in self.tasks:
-                if not task.permute_loss: continue
-                for output_name in task.outputs:
-                    outputs[layer_name][task.name][output_name] = \
-                        outputs[layer_name][task.name][output_name][batch_idxs, pred_idxs]
-
-    # 3. Compute losses
-    losses = {}
-    for layer_name in outputs:
-        losses[layer_name] = {}
-        for task in self.tasks:
-            losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
-    return losses
+pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
 ```
+
+**2. Regression exclusion for pileup** — In the loss loop, `IncidenceBasedRegressionTask` temporarily masks position 0:
+
+```python
+# maskformer.py (experiment-local)
+for task in self.tasks:
+    if isinstance(task, IncidenceBasedRegressionTask):
+        saved = targets[valid_key][:, 0].clone()
+        targets[valid_key][:, 0] = False     # exclude pileup from regression
+        losses[layer_name][task.name] = task.loss(...)
+        targets[valid_key][:, 0] = saved     # restore
+    else:
+        losses[layer_name][task.name] = task.loss(...)
+```
+
+All other tasks (classification, mask, incidence KL) include the pileup token at position 0.
 
 ### `TwoStreamMaskFormer.loss()`
 
@@ -670,39 +673,46 @@ The dataset ([pflow_data.py](pflow_data.py)) loads Parquet files and builds the 
 
 | Target key | Shape | Description |
 |---|---|---|
-| `reco_particle_class` | `(num_objects,)` | PDG→class mapping (0=photon, 1=electron, 2=muon, 3=charged hadron, 4=neutral hadron, 5=null/padding) |
-| `reco_particle_valid` | `(num_objects,)` | `class < 5` |
+| `reco_particle_class` | `(num_objects,)` | Position 0 = pileup (class 5), positions 1..n = real particles (0-4), padding = 5 |
+| `reco_particle_valid` | `(num_objects,)` | Position 0 = True (pileup), positions 1..n = True (real), padding = False |
 | `reco_particle_node_valid` | `(num_objects, max_nodes)` | incidence > cutval (binary hit association mask) |
 | `reco_particle_incidence` | `(num_objects, max_nodes)` | energy-weighted, column-normalized particle→node matrix |
-| `reco_particle_e/pt/eta/sinphi/cosphi` | `(num_objects,)` | regression targets (scaled) |
+| `reco_particle_e/pt/eta/sinphi/cosphi` | `(num_objects,)` | Position 0 = NaN (excluded from regression), positions 1..n = real kinematics |
 
-The incidence matrix construction follows the `odd` experiment:
+### Pileup Token (Position 0)
+
+A single pileup particle sits at row 0 of the incidence matrix. It claims the PU energy fraction of each calorimeter cluster:
 
 ```python
-# pflow_data.py
-incidence = torch.zeros(self.num_objects, self.max_nodes)
+# pflow_data.py — incidence matrix with pileup token at position 0
+incidence = torch.zeros(self.num_objects, n_nodes)
 
-# Track association: particle → track (binary)
-incidence[t_particle_idx, track_idx] = 1.0
+# Row 0 = pileup particle: claims PU cluster energy (total - HS), calo only
+pu_cluster_energy = c_e - d_energy_hard_scatter_energy
+pu_cluster_energy = pu_cluster_energy.clamp(min=0)
+incidence[0, n_tracks:n_tracks + n_clusters] = pu_cluster_energy
 
-# Cluster association: particle → cluster (energy-weighted)
-incidence[d_particle_idx, d_cluster_idx + n_tracks] = d_energy
+# Rows 1..n = real HS particles (shifted by +1)
+incidence[t_particle_idx + 1, track_idx] = 1.0       # tracks → HS particles
+incidence[d_particle_idx + 1, d_cluster_idx + n_tracks] = d_energy  # clusters → HS particles
 
 # Column-normalize: each node's associations sum to 1
 col_sums = incidence.sum(0, keepdim=True).clamp(min=1e-6)
 incidence = incidence / col_sums
 ```
 
-Trackless charged particles are reclassified to their neutral counterpart:
+The pileup token is valid for classification (class 5), mask (which nodes are PU), and incidence KL (PU energy distribution). It is excluded from kinematic regression (NaN targets, masked in custom `MaskFormer.loss()`).
 
-```python
-# pflow_data.py
-is_charged = particle_class.isin([1, 2, 3])  # electron, muon, charged hadron
-has_track  = particle_has_track.bool()
-# class 1→0 (e→photon), 2→2 (muon stays), 3→4 (charged hadron→neutral hadron)
-reclassify_map = {1: 0, 3: 4}
-particle_class[(is_charged & ~has_track)] = reclassify_map.get(particle_class, particle_class)
-```
+| Class | Meaning |
+|-------|---------|
+| 0 | Charged hadron (pi+-, K+-, etc.) |
+| 1 | Electron/positron |
+| 2 | Muon |
+| 3 | Neutral hadron (K0, n, etc.) |
+| 4 | Photon |
+| 5 | Pileup (position 0) or null/padding (unmatched queries) |
+
+Trackless charged particles are reclassified to their neutral counterpart (charged hadron → neutral hadron +3, muon → neutral hadron).
 
 ---
 
@@ -781,8 +791,8 @@ Compare to the original `odd` experiment where `dim=256` and `input_size=518`. H
 | Latent queries | `self.query_initial` (static) | `self.track_query_initial` (A), `self.calo_latent_queries` (B), `self.reco_model.query_initial` (C) |
 | Decoder | `self.decoder(x, ...)` | A: `track_decoder`, B: `calo_decoder`, C: `reco_model.decoder` |
 | Tasks | `self.tasks` | A: `track_tasks`, B: `calo_tasks`, C: inside `reco_model` |
-| Hungarian matching | inside `self.matcher` | only for Stream C, delegated to `reco_model` |
-| Loss | `self.loss(outputs, targets)` | A+B: direct, C: `self.reco_model.loss(reco_layer_outputs, reco_targets)` |
+| Hungarian matching | inside `self.matcher` | only for Stream C, delegated to custom `reco_model` (query 0 ↔ target 0 forced) |
+| Loss | `self.loss(outputs, targets)` | A+B: direct, C: custom `reco_model.loss()` (regression excluded for pileup at pos 0) |
 | Predict | `self.predict(outputs)` | A+B: direct, C: `self.reco_model.predict(reco_layer_outputs)` |
 | Gradient isolation | none | `node_embed.detach()` before Bridge |
 | Skip connection | none | `x["key_embed"] + initial_encoder_embed` for C |

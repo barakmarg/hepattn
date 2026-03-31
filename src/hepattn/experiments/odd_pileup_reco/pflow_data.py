@@ -189,8 +189,10 @@ class ODDDatasetPileup(Dataset):
         }
         
         total_events_loaded = 0
-        stats_total_events = 0 # New
-        stats_dropped_nodes = 0 # New
+        stats_total_events = 0
+        stats_dropped_nodes = 0
+        stats_dropped_particles = 0
+        stats_max_particles_seen = 0
         stats_dropped_particles = 0 # New
         
         # List of variables to extract (keeping consistent with original code)
@@ -233,9 +235,15 @@ class ODDDatasetPileup(Dataset):
             # Update Stats
             stats_total_events += len(n_nodes)
             mask_nodes_ok = n_nodes < self.max_nodes
+            max_particles = self.num_objects - 1  # position 0 reserved for pileup token
+            mask_particles_ok = n_particles <= max_particles
             stats_dropped_nodes += (~mask_nodes_ok).sum()
+            stats_dropped_particles += (~mask_particles_ok & mask_nodes_ok).sum()
+            if (~mask_particles_ok & mask_nodes_ok).any():
+                over = n_particles[(~mask_particles_ok) & mask_nodes_ok]
+                stats_max_particles_seen = max(stats_max_particles_seen, int(over.max()))
 
-            mask = mask_nodes_ok 
+            mask = mask_nodes_ok & mask_particles_ok
             
             # Check if we need to trim the batch to meet exact num_events
             valid_count = mask.sum()
@@ -335,6 +343,8 @@ class ODDDatasetPileup(Dataset):
         print(f"--- Filtering Statistics ---")
         print(f"Total events processed: {stats_total_events}")
         print(f"Events dropped (Too many nodes > {self.max_nodes}): {stats_dropped_nodes}")
+        print(f"Events dropped (Too many particles > {self.num_objects - 1}): {stats_dropped_particles}"
+              + (f" (max seen: {stats_max_particles_seen})" if stats_max_particles_seen > 0 else ""))
         print(f"Total events kept: {total_events_loaded}")
         print(f"----------------------------")
 

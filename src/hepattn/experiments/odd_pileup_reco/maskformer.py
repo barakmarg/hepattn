@@ -253,10 +253,10 @@ class MaskFormer(nn.Module):
 
                 # Mask position 0 for regression only (pileup has no kinematics)
                 if isinstance(task, IncidenceBasedRegressionTask):
-                    saved = targets[valid_key][:, 0].clone()
-                    targets[valid_key][:, 0] = False
-                    losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
-                    targets[valid_key][:, 0] = saved
+                    masked_valid = targets[valid_key].clone()
+                    masked_valid[:, 0] = False
+                    masked_targets = {**targets, valid_key: masked_valid}
+                    losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], masked_targets)
                 else:
                     losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
 
