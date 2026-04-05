@@ -64,7 +64,7 @@ class CaloHitMaskTask(Task):
         node_valid = x[f"{self.input_hit}_valid"]
         if node_valid is not None:
             invalid_mask = ~node_valid.unsqueeze(-2).expand_as(per_query_logit)
-            per_query_logit = per_query_logit.masked_fill(invalid_mask, torch.finfo(per_query_logit.dtype).min)
+            per_query_logit = per_query_logit.masked_fill(invalid_mask, -100.0)
 
         # Pool to master mask: max over query dimension
         master_logit = per_query_logit.max(dim=1)[0]  # (B, N)
@@ -244,7 +244,7 @@ class CaloNodeMaskTask(Task):
 
         node_valid = x[f"{self.input_hit}_valid"]
         if node_valid is not None:
-            logit = logit.masked_fill(~node_valid, torch.finfo(logit.dtype).min)
+            logit = logit.masked_fill(~node_valid, -100.0)
 
         # (B, 1, N) for compatibility with mask loss functions
         return {"calo_node_logit": logit.unsqueeze(1)}

@@ -42,14 +42,14 @@ data:
   val_split: 0.1
   test_split: 0.1
   val_and_test_split_same: true
-  overtrain: true
+  overtrain: false
 
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: 1000
-  num_test: 1000
-  num_val: 1000
+  num_train: -1
+  num_test: -1
+  num_val: -1
 
   batch_size: 64
   incidence_cutval: 0.01
