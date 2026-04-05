@@ -168,6 +168,13 @@ class MaskFormer(nn.Module):
                     continue
                 preds[layer_name][task.name] = task.predict(layer_outputs[task.name])
 
+                # Query 0 (pileup sink) is always valid — bypass null filtering
+                # since query 0 receives no classification gradient
+                if isinstance(task, ObjectClassificationTask):
+                    valid_key = task.output_object + "_valid"
+                    if valid_key in preds[layer_name][task.name]:
+                        preds[layer_name][task.name][valid_key][:, 0] = True
+
         return preds
 
     def loss(self, outputs: dict, targets: dict) -> dict:
@@ -220,15 +227,18 @@ class MaskFormer(nn.Module):
                 if cost is None:
                     continue
 
-                # Force pileup assignment: query 0 ↔ target 0
-                # Pileup particle is always at position 0 — no matching needed
-                if cost.shape[2] > 1:
-                    cost[:, 0, 1:] = 1e6   # query 0 can't match any real particle
-                    cost[:, 1:, 0] = 1e6   # no other query can match pileup target
-                    cost[:, 0, 0] = -1e6   # forced match
+                # Exclude pileup (query 0 / target 0) from matching entirely.
+                # Pileup is always at position 0 — fixed assignment, no matching needed.
+                cost_no_pu = cost[:, 1:, 1:]  # queries[1:] vs targets[1:]
+                valid_no_pu = targets[f"{self.target_object}_valid"][:, 1:]
 
-                # Get the indicies that can permute the predictions to yield their optimal matching
-                pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
+                pred_idxs_no_pu = self.matcher(cost_no_pu, valid_no_pu)
+
+                # Shift indices +1 since we removed target 0
+                pred_idxs = torch.cat([
+                    torch.zeros(pred_idxs_no_pu.shape[0], 1, dtype=pred_idxs_no_pu.dtype, device=pred_idxs_no_pu.device),
+                    pred_idxs_no_pu + 1,
+                ], dim=1)
 
                 for task in self.tasks:
                     # Tasks without a object dimension do not need permutation (constituent-level or sample-level)
@@ -244,6 +254,7 @@ class MaskFormer(nn.Module):
 
         # Compute the losses for each task in each block
         valid_key = f"{self.target_object}_valid"
+        class_key = f"{self.target_object}_class"
         losses = {}
         for layer_name in outputs:
             losses[layer_name] = {}
@@ -251,13 +262,45 @@ class MaskFormer(nn.Module):
                 if layer_name != "final" and not task.has_intermediate_loss:
                     continue
 
-                # Mask position 0 for regression only (pileup has no kinematics)
+                # Mask position 0 for regression (pileup has no kinematics)
                 if isinstance(task, IncidenceBasedRegressionTask):
                     masked_valid = targets[valid_key].clone()
                     masked_valid[:, 0] = False
                     masked_targets = {**targets, valid_key: masked_valid}
                     losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], masked_targets)
+                # Exclude position 0 (pileup) from classification loss via ignore_index=-100
+                elif isinstance(task, ObjectClassificationTask):
+                    masked_class = targets[class_key].clone()
+                    masked_class[:, 0] = -100
+                    masked_targets = {**targets, class_key: masked_class}
+                    losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], masked_targets)
                 else:
+                    # ── DEBUG: find source of Inf in mask_bce ─────────────────
+                    if task.name == "mask" and "layer_0" in layer_name:
+                        if not getattr(self, "_mask_debug_done", False):
+                            self._mask_debug_done = True
+                            task_out = outputs[layer_name][task.name]
+                            logit_key = next((k for k in task_out if k.endswith("_logit")), None)
+                            if logit_key:
+                                lg = task_out[logit_key].float()
+                                print(f"[DBG logit] key={logit_key} shape={tuple(lg.shape)}")
+                                print(f"[DBG logit] min={lg.min():.2f} max={lg.max():.2f} mean={lg.mean():.2f}")
+                                print(f"[DBG logit] isinf={lg.isinf().sum().item()} isnan={lg.isnan().sum().item()}")
+                                # Row 0 (pileup token) specifically
+                                print(f"[DBG logit row0] min={lg[:,0,:].min():.2f} max={lg[:,0,:].max():.2f}")
+                            tgt_key = next((k for k in targets if "reco_particle_node" in k and "valid" in k), None)
+                            if tgt_key:
+                                tgt = targets[tgt_key].float()
+                                print(f"[DBG target] key={tgt_key} shape={tuple(tgt.shape)}")
+                                print(f"[DBG target] min={tgt.min():.4f} max={tgt.max():.4f} sum={tgt.sum().item():.1f}")
+                                print(f"[DBG target] >1: {(tgt > 1).sum().item()}  <0: {(tgt < 0).sum().item()}")
+                                print(f"[DBG target row0] sum={tgt[:,0,:].sum():.1f} max={tgt[:,0,:].max():.4f}")
+                            nv = targets.get("node_valid")
+                            if nv is not None:
+                                counts = nv.float().sum(-1)
+                                print(f"[DBG node_valid] valid_per_sample: min={counts.min():.0f} max={counts.max():.0f} mean={counts.mean():.1f}")
+                                print(f"[DBG node_valid] any_zero_rows={( counts == 0).any().item()}")
+                    # ── END DEBUG ─────────────────────────────────────────────
                     losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
 
         return losses

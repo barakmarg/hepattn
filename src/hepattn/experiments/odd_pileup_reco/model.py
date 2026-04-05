@@ -285,23 +285,18 @@ class TwoStreamMaskFormer(nn.Module):
             # Extra predicted nodes not already in truth
             extra_pred = pred_calo_mask & ~truth_calo_mask
 
-            # Sample ~N(reco_calo_noise_mean, reco_calo_noise_std) extra nodes per batch element
-            n_extra = int(max(0, torch.normal(
-                mean=torch.tensor(float(self.reco_calo_noise_mean)),
-                std=torch.tensor(self.reco_calo_noise_std),
-            ).item()))
-
+            # Sample extra noise nodes — fixed k for torch.compile compatibility
+            N_nodes = x["key_embed"].shape[1]
+            n_sample = min(self.reco_calo_noise_mean, N_nodes)
+            noise_scores = torch.where(
+                extra_pred,
+                torch.rand(batch_size, N_nodes, device=device),
+                torch.full((batch_size, N_nodes), -1.0, device=device),
+            )
+            _, sample_idx = noise_scores.topk(n_sample, dim=-1)
             sampled_extra = torch.zeros_like(extra_pred)
-            if n_extra > 0 and extra_pred.any():
-                N_nodes = x["key_embed"].shape[1]
-                noise_scores = torch.where(
-                    extra_pred,
-                    torch.rand(batch_size, N_nodes, device=device),
-                    torch.full((batch_size, N_nodes), -1.0, device=device),
-                )
-                _, sample_idx = noise_scores.topk(min(n_extra, N_nodes), dim=-1)
-                sampled_extra.scatter_(1, sample_idx, True)
-                sampled_extra = sampled_extra & extra_pred
+            sampled_extra.scatter_(1, sample_idx, True)
+            sampled_extra = sampled_extra & extra_pred  # masks out non-extra nodes
 
             reco_calo_mask = truth_calo_mask | sampled_extra
         else:

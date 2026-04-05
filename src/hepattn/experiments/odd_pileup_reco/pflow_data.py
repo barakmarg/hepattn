@@ -713,8 +713,8 @@ class ODDDatasetPileup(Dataset):
             padded[1:n_particles + 1] = val[:n_particles]
             particle_data[key] = padded
 
-        # Pileup token at position 0: class 5, neutral
-        particle_data["class"][0] = 5
+        # Pileup token at position 0: dummy class 0 (ignored in loss via ignore_index=-100)
+        particle_data["class"][0] = 0
         particle_data["is_charged"][0] = 0
 
         # --- Incidence matrix (num_objects x n_nodes) ---
@@ -840,7 +840,7 @@ class ODDDatasetPileup(Dataset):
         # =====================================================================
         n_particles = data_dict["n_particles"]
 
-        # Class labels: 5 = null/residual for padded slots
+        # Class labels: 5 = null for padded/unmatched slots
         reco_class = data_dict["particle_data"]["class"].long()
         reco_class[data_dict["indicator_truth"] == 0] = 5
         labels["reco_particle_class"] = reco_class

@@ -84,8 +84,8 @@ Input nodes (tracks + calo, ~5500 total including pileup)
   │  Skip: reco_embed = encoder_out + initial_encoder_embed      │
   │  Repack to (B, max_reco_nodes=1400, D)                       │
   │  → custom MaskFormer (4 layers, 400 queries)                 │
-  │     • Query 0 = pileup token (forced match to target 0)      │
-  │     • Classification (6 classes, class 5 = pileup/null)      │
+  │     • Query 0 = pileup sink (excluded from matcher + class)    │
+  │     • Classification (6 classes: 0-4 real, 5 null)            │
   │     • Hit mask (BCE + Dice)                                  │
   │     • Incidence regression (KL-div)                          │
   │     • Incidence-based regression (pt, eta, phi, e)           │
@@ -456,8 +456,10 @@ for task in self.tasks:
 ```
 
 **The `reco_model` is a custom `MaskFormer`** (copied to [maskformer.py](maskformer.py)) with two modifications to `loss()`:
-1. **Forced pileup matching**: Before Hungarian matching, cost matrix is manipulated to force query 0 ↔ target 0 (the pileup particle).
-2. **Regression exclusion**: `IncidenceBasedRegressionTask` temporarily masks position 0 as invalid (pileup has no meaningful kinematics).
+1. **Pileup exclusion from matcher**: Query 0 and target 0 are sliced out before matching. The cost matrix is `cost[:, 1:, 1:]` — only non-pileup queries vs non-pileup targets. After matching, indices are shifted +1 and query 0 is prepended (fixed assignment to target 0).
+2. **Classification exclusion**: `ObjectClassificationTask` sets target position 0 to -100 (`F.cross_entropy` ignore_index), so query 0 receives no classification gradient.
+3. **Regression exclusion**: `IncidenceBasedRegressionTask` uses a cloned valid mask with position 0 set to False (pileup has no meaningful kinematics).
+4. **Inference**: Query 0 is hardcoded as always valid in `predict()`, bypassing null-class filtering.
 
 The rest of the complexity lives in the filtering + packaging that prepares its inputs.
 
@@ -506,17 +508,18 @@ The original `MaskFormer` has no teacher forcing concept — it processes all no
 
 The experiment uses a custom copy of `MaskFormer` with two changes in `loss()`:
 
-**1. Forced pileup matching** — Before the Hungarian matcher, cost is manipulated to force query 0 → target 0:
+**1. Pileup exclusion from matcher** — Query 0 and target 0 are removed before matching:
 
 ```python
 # maskformer.py (experiment-local)
-# Force pileup assignment: query 0 ↔ target 0
-if cost.shape[2] > 1:
-    cost[:, 0, 1:] = 1e6   # query 0 can't match any real particle
-    cost[:, 1:, 0] = 1e6   # no other query can match pileup target
-    cost[:, 0, 0] = -1e6   # forced match
+# Exclude pileup from matching entirely
+cost_no_pu = cost[:, 1:, 1:]  # queries[1:] vs targets[1:]
+valid_no_pu = targets[valid_key][:, 1:]
 
-pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
+pred_idxs_no_pu = self.matcher(cost_no_pu, valid_no_pu)
+
+# Reconstruct: query 0 → target 0 (fixed), rest shifted +1
+pred_idxs = torch.cat([zeros, pred_idxs_no_pu + 1], dim=1)
 ```
 
 **2. Regression exclusion for pileup** — In the loss loop, `IncidenceBasedRegressionTask` temporarily masks position 0:
@@ -710,7 +713,8 @@ The pileup token is valid for classification (class 5), mask (which nodes are PU
 | 2 | Muon |
 | 3 | Neutral hadron (K0, n, etc.) |
 | 4 | Photon |
-| 5 | Pileup (position 0) or null/padding (unmatched queries) |
+| 5 | Null/background (unmatched queries, weighted by `null_weight`) |
+| — | Query 0 = pileup sink (excluded from classification, always valid at inference) |
 
 Trackless charged particles are reclassified to their neutral counterpart (charged hadron → neutral hadron +3, muon → neutral hadron).
 
@@ -791,8 +795,8 @@ Compare to the original `odd` experiment where `dim=256` and `input_size=518`. H
 | Latent queries | `self.query_initial` (static) | `self.track_query_initial` (A), `self.calo_latent_queries` (B), `self.reco_model.query_initial` (C) |
 | Decoder | `self.decoder(x, ...)` | A: `track_decoder`, B: `calo_decoder`, C: `reco_model.decoder` |
 | Tasks | `self.tasks` | A: `track_tasks`, B: `calo_tasks`, C: inside `reco_model` |
-| Hungarian matching | inside `self.matcher` | only for Stream C, delegated to custom `reco_model` (query 0 ↔ target 0 forced) |
-| Loss | `self.loss(outputs, targets)` | A+B: direct, C: custom `reco_model.loss()` (regression excluded for pileup at pos 0) |
+| Hungarian matching | inside `self.matcher` | only for Stream C; query 0 excluded from matcher (pileup), rest matched normally |
+| Loss | `self.loss(outputs, targets)` | A+B: direct, C: custom `reco_model.loss()` (pileup: class+mask+incidence only; residual: class only) |
 | Predict | `self.predict(outputs)` | A+B: direct, C: `self.reco_model.predict(reco_layer_outputs)` |
 | Gradient isolation | none | `node_embed.detach()` before Bridge |
 | Skip connection | none | `x["key_embed"] + initial_encoder_embed` for C |

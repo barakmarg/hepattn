@@ -42,7 +42,7 @@ data:
   val_split: 0.1
   test_split: 0.1
   val_and_test_split_same: true
-  overtrain: false
+  overtrain: true
 
   num_workers: 4
   num_val_workers: 1
