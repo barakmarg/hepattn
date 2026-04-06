@@ -8,7 +8,7 @@ Usage (standalone):
     python eval_plots.py
 
 Usage (notebook):
-    from hepattn.experiments.odd_pileup_two_stream.eval_plots import run_eval
+    from hepattn.experiments.odd_pileup_reco.eval_plots import run_eval
 
     # Specific files
     figs, track, cluster = run_eval(files=[
@@ -30,10 +30,15 @@ import yaml
 from torch.utils.data import DataLoader
 
 # ── Configuration ──────────────────────────────────────────────────────────
-CKPT_PATH = "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_two_stream/logs/odd_pflow_two_stream_20260316-T193015/ckpts/epoch=015-val_loss=6.57477.ckpt"
-CONFIG_PATH = "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_two_stream/configs/base.yaml"
+CKPT_PATH = "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260331-T135040/ckpts/epoch=008-val_loss=25.69795.ckpt"
+CONFIG_PATH = "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/configs/base.yaml"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 48
+RECO_TRUTH_PT_BINS = np.array([0.0, 0.2, 0.5, 0.9, 2.0, 4.0, 10.0, 20.0, np.inf], dtype=np.float64)
+RECO_NUM_CLASSES = 6
+CALO_PRED_THRESHOLD = 0.2
+CALO_HS_FRAC_THRESHOLD = 0.05
+CALO_HS_ENERGY_THRESHOLD = 0.15
 
 
 def compute_deltaR_window_stats(
@@ -153,7 +158,7 @@ def build_dataloader(
         batch_size: Batch size.
         num_workers: DataLoader workers.
     """
-    from hepattn.experiments.odd_pileup_maskformer.pflow_data import ODDDatasetPileup
+    from hepattn.experiments.odd_pileup_reco.pflow_data import ODDDatasetPileup
 
     data_cfg = cfg["data"]
 
@@ -192,7 +197,7 @@ def build_dataloader(
 
 
 def load_model(ckpt_path: str = CKPT_PATH, device: str = DEVICE):
-    from hepattn.experiments.odd_pileup_two_stream.lightning_module import ODDPFlowTwoStream
+    from hepattn.experiments.odd_pileup_reco.lightning_module import ODDPFlowTwoStream
 
     model = ODDPFlowTwoStream.load_from_checkpoint(ckpt_path, map_location=device)
     model.eval()
@@ -203,11 +208,22 @@ def load_model(ckpt_path: str = CKPT_PATH, device: str = DEVICE):
 def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: int | None = None):
     """Run inference on dataloader and accumulate data for plots.
 
-    Returns (track_data, cluster_data) dicts with numpy arrays.
+    Returns (track_data, cluster_data, reco_data) dicts with numpy arrays.
     """
     track_data = defaultdict(list)
     cluster_data = defaultdict(list)
+    reco_data = defaultdict(list)
     event_counter = 0
+    warned_no_cluster_nodes = False
+    warned_no_reco_head = False
+    warned_no_reco_truth = False
+    var_transform = getattr(getattr(dataloader.dataset, "scaler", None), "transforms", {})
+
+    def _inverse_if_needed(x: torch.Tensor, field: str) -> torch.Tensor:
+        y = x.detach().cpu().float().unsqueeze(-1)
+        if field in var_transform:
+            y = var_transform[field].inverse_transform(y)
+        return y.squeeze(-1)
 
     with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.bfloat16):
         for i, batch in enumerate(dataloader):
@@ -218,12 +234,12 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
             targets = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in targets.items()}
 
-            outputs = model.model(inputs)
+            outputs = model.model(inputs, targets=targets)
             preds = model.model.predict(outputs)
 
             labels = targets
             node_valid = labels["node_valid"].bool()
-            is_track = labels["node_is_track"].bool()
+            is_track = labels["node_is_track"].bool().squeeze(-1)
 
             # ── Track data (Stream A) ──
             track_final = preds.get("track_final", {})
@@ -243,18 +259,25 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
             calo_final = preds.get("calo_final", {})
             cluster_node_mask = node_valid & (~is_track)
 
-            if cluster_node_mask.any() and "calo_fraction" in calo_final:
-                calo_frac_pred = calo_final["calo_fraction"]["calo_hs_fraction"].squeeze(-1)[cluster_node_mask]
-                calo_frac_true = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
+            if (not cluster_node_mask.any()) and (not warned_no_cluster_nodes):
+                print("Warning: no cluster nodes in batch; cluster diagnostics may stay empty.")
+                warned_no_cluster_nodes = True
+
+            if cluster_node_mask.any():
                 node_e = labels["node_e"][cluster_node_mask]
                 true_hs_energy = labels["calo_hard_scatter_energy"][cluster_node_mask]
 
-                cluster_data["pred_frac"].append(calo_frac_pred.float().cpu().numpy())
-                cluster_data["true_frac"].append(calo_frac_true.float().cpu().numpy())
                 cluster_data["total_e"].append(node_e.float().cpu().numpy())
                 cluster_data["true_hs_e"].append(true_hs_energy.float().cpu().numpy())
                 cluster_data["eta"].append(labels["node_eta"][cluster_node_mask].float().cpu().numpy())
                 cluster_data["phi"].append(labels["node_phi"][cluster_node_mask].float().cpu().numpy())
+
+                # Fraction regression may be absent in some checkpoints.
+                if "calo_fraction" in calo_final and "calo_hs_fraction" in calo_final["calo_fraction"]:
+                    calo_frac_pred = calo_final["calo_fraction"]["calo_hs_fraction"].squeeze(-1)[cluster_node_mask]
+                    calo_frac_true = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
+                    cluster_data["pred_frac"].append(calo_frac_pred.float().cpu().numpy())
+                    cluster_data["true_frac"].append(calo_frac_true.float().cpu().numpy())
 
                 # Truth neutral/charged energy per cluster (for composition plot)
                 if "calo_hs_neutral_energy" in labels:
@@ -262,12 +285,15 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
                     cluster_data["charged_e"].append(labels["calo_hs_charged_energy"][cluster_node_mask].float().cpu().numpy())
 
                 # Calo mask predictions for cluster swap plot
-                if "calo_mask" in calo_final:
+                if "calo_mask" in calo_final and "calo_node_prob" in calo_final["calo_mask"]:
                     calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
                     calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
-                    cluster_data["mask_pred"].append((calo_prob_flat > 0.5).cpu().numpy())
+                    cluster_data["mask_pred"].append((calo_prob_flat > CALO_PRED_THRESHOLD).cpu().numpy())
                     cluster_data["calo_mask_probs"].append(calo_prob_flat.float().cpu().numpy())
-                    cluster_data["mask_truth"].append((calo_hs_e_flat > 0.15).cpu().numpy())
+                    calo_hs_frac_flat = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
+                    cluster_data["mask_truth"].append(
+                        ((calo_hs_frac_flat > CALO_HS_FRAC_THRESHOLD) & (calo_hs_e_flat > CALO_HS_ENERGY_THRESHOLD)).cpu().numpy()
+                    )
 
                 # Per-event indices
                 counts = cluster_node_mask.sum(dim=-1).cpu().numpy()
@@ -279,25 +305,25 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
                 event_counter += len(counts)
 
                 # Per-event mask energy sums (binary mask, no fraction regression)
-                if "calo_mask" in calo_final:
-                    pred_mask_b  = (calo_final["calo_mask"]["calo_node_prob"] > 0.5).float()
+                if "calo_mask" in calo_final and "calo_node_prob" in calo_final["calo_mask"]:
+                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > CALO_PRED_THRESHOLD).float()
                     truth_mask_b = (
-                        (labels["calo_hard_scatter_energy_frac"] > 0.05)
-                        & (labels["calo_hard_scatter_energy"] > 0.15)
+                        (labels["calo_hard_scatter_energy_frac"] > CALO_HS_FRAC_THRESHOLD)
+                        & (labels["calo_hard_scatter_energy"] > CALO_HS_ENERGY_THRESHOLD)
                     ).float()
                     node_e_b = labels["node_e"]
                     cluster_valid = cluster_node_mask.float()
                     cluster_data["evt_pred_mask_e"].append(
-                        (pred_mask_b  * cluster_valid * node_e_b).sum(dim=-1).cpu().numpy())
+                        (pred_mask_b * cluster_valid * node_e_b).sum(dim=-1).cpu().numpy())
                     cluster_data["evt_truth_mask_e"].append(
                         (truth_mask_b * cluster_valid * node_e_b).sum(dim=-1).cpu().numpy())
 
                 # Per-event neutral/charged HS energy (mask-weighted sums)
-                if "calo_mask" in calo_final and "calo_hs_neutral_energy" in labels:
-                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > 0.5).float()  # (B, N)
+                if "calo_mask" in calo_final and "calo_node_prob" in calo_final["calo_mask"] and "calo_hs_neutral_energy" in labels:
+                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > CALO_PRED_THRESHOLD).float()  # (B, N)
                     truth_mask_b = (
-                        (labels["calo_hard_scatter_energy_frac"] > 0.05)
-                        & (labels["calo_hard_scatter_energy"] > 0.15)
+                        (labels["calo_hard_scatter_energy_frac"] > CALO_HS_FRAC_THRESHOLD)
+                        & (labels["calo_hard_scatter_energy"] > CALO_HS_ENERGY_THRESHOLD)
                     ).float()  # (B, N)
 
                     cluster_valid = cluster_node_mask.float()  # (B, N)
@@ -313,16 +339,358 @@ def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: in
                     cluster_data["evt_truth_charged_e"].append(
                         (truth_mask_b * cluster_valid * charged_e).sum(dim=-1).cpu().numpy())
 
+            # ── Reconstruction data (Stream C) ──
+            reco_final = preds.get("reco_final", {})
+            if (not reco_final) and (not warned_no_reco_head):
+                print("Warning: no reco_final predictions; this checkpoint/model may not include Stream C outputs.")
+                warned_no_reco_head = True
+            reco_cls = reco_final.get("classification", {})
+            reco_reg = reco_final.get("regression", {})
+
+            pred_class_t = reco_cls.get("reco_pflow_class")
+            pred_valid_t = reco_cls.get("reco_pflow_valid")
+            truth_class_t = labels.get("reco_particle_class")
+            if truth_class_t is None:
+                truth_class_t = labels.get("particle_class")
+
+            truth_valid_t = labels.get("reco_particle_valid")
+            if truth_valid_t is None:
+                truth_valid_t = labels.get("particle_valid")
+
+            found_reco_truth = False
+
+            if pred_class_t is not None:
+                reco_data["pred_class"].append(pred_class_t.detach().cpu().numpy().astype(np.int64))
+                if pred_valid_t is None:
+                    pred_valid_t = pred_class_t < (RECO_NUM_CLASSES - 1)
+                reco_data["pred_valid"].append(pred_valid_t.detach().cpu().numpy().astype(bool))
+
+            if truth_class_t is not None:
+                reco_data["truth_class"].append(truth_class_t.detach().cpu().numpy().astype(np.int64))
+                if truth_valid_t is None:
+                    truth_valid_t = truth_class_t < (RECO_NUM_CLASSES - 1)
+                reco_data["truth_valid"].append(truth_valid_t.detach().cpu().numpy().astype(bool))
+                found_reco_truth = True
+
+            for field in ["pt", "eta", "sinphi", "cosphi"]:
+                pred_key = f"reco_pflow_{field}"
+                truth_key = f"reco_particle_{field}"
+                truth_alt_key = f"particle_{field}"
+
+                if pred_key in reco_reg:
+                    pred_field = _inverse_if_needed(reco_reg[pred_key], field)
+                    reco_data[f"pred_{field}"].append(pred_field.numpy())
+
+                if truth_key in labels:
+                    truth_field = _inverse_if_needed(labels[truth_key], field)
+                    reco_data[f"truth_{field}"].append(truth_field.numpy())
+                    found_reco_truth = True
+                elif truth_alt_key in labels:
+                    truth_field = _inverse_if_needed(labels[truth_alt_key], field)
+                    reco_data[f"truth_{field}"].append(truth_field.numpy())
+                    found_reco_truth = True
+
+            if (not found_reco_truth) and (not warned_no_reco_truth):
+                print("Warning: no truth reco labels found in targets (expected reco_particle_* or particle_* keys).")
+                warned_no_reco_truth = True
+
             if (i + 1) % 10 == 0:
                 print(f"  Batch {i + 1} done")
 
     # Concatenate
     track_data = {k: np.concatenate(v) for k, v in track_data.items() if v}
     cluster_data = {k: np.concatenate(v) for k, v in cluster_data.items() if v}
-    return track_data, cluster_data
+    reco_data = {k: np.concatenate(v) for k, v in reco_data.items() if v}
+    return track_data, cluster_data, reco_data
 
 
-def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
+def reco_plots(
+    reco_data: dict,
+    truth_pt_bins: np.ndarray | list[float] = RECO_TRUTH_PT_BINS,
+) -> dict[str, plt.Figure]:
+    """Create reconstruction diagnostics binned in truth particle pt.
+
+    Produces:
+    - pt residual (pred-truth)/truth by truth-pt bin
+    - eta residual (pred-truth) by truth-pt bin
+    - phi residual (pred-truth, wrapped) by truth-pt bin
+    - predicted vs truth class histogram by truth-pt bin
+    - class count residual (N_pred - N_truth) by truth-pt bin
+    """
+    figs: dict[str, plt.Figure] = {}
+
+    required = {
+        "pred_class", "truth_class", "pred_valid", "truth_valid",
+        "pred_pt", "truth_pt", "pred_eta", "truth_eta",
+        "pred_sinphi", "pred_cosphi", "truth_sinphi", "truth_cosphi",
+    }
+    if not required.issubset(set(reco_data.keys())):
+        return figs
+
+    pt_edges = np.asarray(truth_pt_bins, dtype=np.float64)
+    if pt_edges.ndim != 1 or len(pt_edges) < 2:
+        raise ValueError("truth_pt_bins must be a 1D array with at least two edges")
+
+    def _flat(name: str):
+        return np.asarray(reco_data[name]).reshape(-1)
+
+    pred_class = _flat("pred_class").astype(np.int64)
+    truth_class = _flat("truth_class").astype(np.int64)
+    pred_valid = _flat("pred_valid").astype(bool)
+    truth_valid = _flat("truth_valid").astype(bool)
+
+    pred_pt = _flat("pred_pt")
+    truth_pt = _flat("truth_pt")
+    pred_eta = _flat("pred_eta")
+    truth_eta = _flat("truth_eta")
+    pred_phi = np.arctan2(_flat("pred_sinphi"), _flat("pred_cosphi"))
+    truth_phi = np.arctan2(_flat("truth_sinphi"), _flat("truth_cosphi"))
+
+    finite = (
+        np.isfinite(pred_pt) & np.isfinite(truth_pt)
+        & np.isfinite(pred_eta) & np.isfinite(truth_eta)
+        & np.isfinite(pred_phi) & np.isfinite(truth_phi)
+    )
+    base_mask = truth_valid & finite
+    paired_mask = base_mask & pred_valid
+
+    pt_res = (pred_pt - truth_pt) / np.clip(np.abs(truth_pt), 1e-8, None)
+    eta_res = pred_eta - truth_eta
+    phi_res = np.arctan2(np.sin(pred_phi - truth_phi), np.cos(pred_phi - truth_phi))
+
+    def _pt_bin_label(i: int) -> str:
+        lo = pt_edges[i]
+        hi = pt_edges[i + 1]
+        if np.isinf(hi):
+            return f"[{lo:g}, inf)"
+        return f"[{lo:g}, {hi:g})"
+
+    def _in_pt_bin(i: int) -> np.ndarray:
+        lo = pt_edges[i]
+        hi = pt_edges[i + 1]
+        mask = truth_pt >= lo
+        if np.isfinite(hi):
+            mask &= truth_pt < hi
+        return mask
+
+    def _plot_residual_grid(values: np.ndarray, title: str, xlabel: str, key: str):
+        fig, axes = plt.subplots(2, 4, figsize=(18, 8), sharex=True)
+        axes = axes.flatten()
+
+        sample = values[paired_mask & np.isfinite(values)]
+        if len(sample) > 10:
+            lo, hi = np.percentile(sample, [0.5, 99.5])
+            if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+                lo, hi = float(sample.min()), float(sample.max())
+            if lo == hi:
+                lo -= 1.0
+                hi += 1.0
+            hist_range = (lo, hi)
+        else:
+            hist_range = None
+
+        for i in range(len(pt_edges) - 1):
+            ax = axes[i]
+            mask = paired_mask & _in_pt_bin(i) & np.isfinite(values)
+            if mask.any():
+                vals = values[mask]
+                q1, q2, q3 = np.percentile(vals, [25.0, 50.0, 75.0])
+                iqr = q3 - q1
+                mean = float(np.mean(vals))
+                std = float(np.std(vals))
+
+                ax.hist(vals, bins=80, range=hist_range, log=True, color="#1f77b4", alpha=0.85)
+                ax.axvline(q1, color="#2ca02c", linestyle="--", linewidth=1.6, alpha=0.95)
+                ax.axvline(q3, color="#2ca02c", linestyle="--", linewidth=1.6, alpha=0.95)
+                ax.axvline(q2, color="#d62728", linestyle=":", linewidth=1.8, alpha=0.95)
+                ax.axvline(mean, color="#9467bd", linestyle="-.", linewidth=1.8, alpha=0.95)
+                ax.text(
+                    0.03,
+                    0.97,
+                    f"mean={mean:.3g}\nstd={std:.3g}\nIQR={iqr:.3g}\nQ1={q1:.3g}\nQ3={q3:.3g}",
+                    transform=ax.transAxes,
+                    va="top",
+                    ha="left",
+                    fontsize=8,
+                    bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+                )
+            else:
+                ax.text(0.5, 0.5, "no entries", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(_pt_bin_label(i), fontsize=10)
+            ax.grid(True, alpha=0.25)
+
+        fig.suptitle(title)
+        fig.supxlabel(xlabel)
+        fig.supylabel("Count (log scale)")
+        fig.tight_layout()
+        figs[key] = fig
+
+    _plot_residual_grid(
+        pt_res,
+        "Reco pt residual by truth pt bin",
+        "(pred_pt - truth_pt) / truth_pt",
+        "reco/pt_residual_by_truth_pt",
+    )
+    _plot_residual_grid(
+        eta_res,
+        "Reco eta residual by truth pt bin",
+        "pred_eta - truth_eta",
+        "reco/eta_residual_by_truth_pt",
+    )
+    _plot_residual_grid(
+        phi_res,
+        "Reco phi residual by truth pt bin",
+        "wrapped(pred_phi - truth_phi)",
+        "reco/phi_residual_by_truth_pt",
+    )
+
+    # Predicted vs truth class histogram in each truth-pt bin.
+    class_ids = np.arange(RECO_NUM_CLASSES)
+    fig_cls, axes_cls = plt.subplots(2, 4, figsize=(20, 8), sharex=True, sharey=True)
+    axes_cls = axes_cls.flatten()
+    width = 0.42
+    for i in range(len(pt_edges) - 1):
+        ax = axes_cls[i]
+        mask = base_mask & _in_pt_bin(i)
+        if mask.any():
+            truth_counts = np.bincount(np.clip(truth_class[mask], 0, RECO_NUM_CLASSES - 1), minlength=RECO_NUM_CLASSES)
+            pred_counts = np.bincount(np.clip(pred_class[mask], 0, RECO_NUM_CLASSES - 1), minlength=RECO_NUM_CLASSES)
+            ax.bar(class_ids - width / 2, truth_counts, width=width, label="truth", color="#4c72b0", alpha=0.85)
+            ax.bar(class_ids + width / 2, pred_counts, width=width, label="pred", color="#dd8452", alpha=0.85)
+            ax.set_yscale("log")
+        else:
+            ax.text(0.5, 0.5, "no entries", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(_pt_bin_label(i), fontsize=10)
+        ax.set_xticks(class_ids)
+        ax.grid(True, alpha=0.25)
+
+    axes_cls[0].legend(loc="upper right")
+    fig_cls.suptitle("Predicted vs truth particle class by truth pt bin")
+    fig_cls.supxlabel("Particle class")
+    fig_cls.supylabel("Count (log scale)")
+    fig_cls.tight_layout()
+    figs["reco/class_pred_vs_truth_by_truth_pt"] = fig_cls
+
+    # Residual number of particles by class: N_pred - N_truth in each truth-pt bin.
+    class_residual = np.zeros((len(pt_edges) - 1, RECO_NUM_CLASSES), dtype=np.int64)
+    for i in range(len(pt_edges) - 1):
+        mask = base_mask & _in_pt_bin(i)
+        if mask.any():
+            truth_counts = np.bincount(np.clip(truth_class[mask], 0, RECO_NUM_CLASSES - 1), minlength=RECO_NUM_CLASSES)
+            pred_counts = np.bincount(np.clip(pred_class[mask], 0, RECO_NUM_CLASSES - 1), minlength=RECO_NUM_CLASSES)
+            class_residual[i] = pred_counts - truth_counts
+
+    vmax = int(np.max(np.abs(class_residual))) if class_residual.size else 1
+    vmax = max(vmax, 1)
+    fig_res, ax_res = plt.subplots(figsize=(12, 5))
+    im = ax_res.imshow(class_residual, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+    for i in range(class_residual.shape[0]):
+        for j in range(class_residual.shape[1]):
+            ax_res.text(j, i, f"{class_residual[i, j]:d}", ha="center", va="center", fontsize=9)
+    ax_res.set_xticks(np.arange(RECO_NUM_CLASSES))
+    ax_res.set_yticks(np.arange(len(pt_edges) - 1))
+    ax_res.set_yticklabels([_pt_bin_label(i) for i in range(len(pt_edges) - 1)])
+    ax_res.set_xlabel("Particle class")
+    ax_res.set_ylabel("Truth pt bin")
+    ax_res.set_title("Class count residual by truth pt bin (N_pred - N_truth)")
+    cbar = fig_res.colorbar(im, ax=ax_res)
+    cbar.set_label("N_pred - N_truth")
+    fig_res.tight_layout()
+    figs["reco/class_count_residual_by_truth_pt"] = fig_res
+
+    # Truth-vs-pred kinematic histograms (all / charged / neutral)
+    charged_mask = paired_mask & (truth_class < 3)
+    neutral_mask = paired_mask & (truth_class >= 3) & (truth_class < (RECO_NUM_CLASSES - 1))
+
+    def _finite_percentile_range(a: np.ndarray, b: np.ndarray, default: tuple[float, float]) -> tuple[float, float]:
+        vals = np.concatenate([a, b])
+        vals = vals[np.isfinite(vals)]
+        if len(vals) < 2:
+            return default
+        lo, hi = np.percentile(vals, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+            lo, hi = float(vals.min()), float(vals.max())
+        if lo == hi:
+            lo -= 1.0
+            hi += 1.0
+        return lo, hi
+
+    def _plot_truth_vs_pred_kinematics(mask: np.ndarray, title: str, key: str) -> None:
+        if not np.any(mask):
+            return
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        t_pt = truth_pt[mask]
+        p_pt = pred_pt[mask]
+        pt_vals = np.concatenate([t_pt, p_pt])
+        pt_vals = pt_vals[np.isfinite(pt_vals) & (pt_vals > 0)]
+        if len(pt_vals) >= 2:
+            pt_lo, pt_hi = np.percentile(pt_vals, [0.5, 99.5])
+            pt_lo = max(float(pt_lo), 1e-4)
+            pt_hi = max(float(pt_hi), pt_lo * 1.1)
+            pt_bins = np.logspace(np.log10(pt_lo), np.log10(pt_hi), 80)
+        else:
+            pt_bins = 80
+
+        eta_lo, eta_hi = _finite_percentile_range(truth_eta[mask], pred_eta[mask], (-5.0, 5.0))
+        eta_bins = np.linspace(eta_lo, eta_hi, 80)
+        phi_bins = np.linspace(-np.pi, np.pi, 80)
+
+        axes[0].hist(t_pt, bins=pt_bins, histtype="step", linewidth=2.0, label="truth", color="#4c72b0")
+        axes[0].hist(p_pt, bins=pt_bins, histtype="step", linewidth=2.0, label="pred", color="#dd8452")
+        if not np.isscalar(pt_bins):
+            axes[0].set_xscale("log")
+        axes[0].set_yscale("log")
+        axes[0].set_title("pt")
+        axes[0].set_xlabel("pt")
+        axes[0].set_ylabel("Count (log scale)")
+        axes[0].grid(True, alpha=0.25)
+
+        axes[1].hist(truth_eta[mask], bins=eta_bins, histtype="step", linewidth=2.0, label="truth", color="#4c72b0")
+        axes[1].hist(pred_eta[mask], bins=eta_bins, histtype="step", linewidth=2.0, label="pred", color="#dd8452")
+        axes[1].set_yscale("log")
+        axes[1].set_title("eta")
+        axes[1].set_xlabel("eta")
+        axes[1].grid(True, alpha=0.25)
+
+        axes[2].hist(truth_phi[mask], bins=phi_bins, histtype="step", linewidth=2.0, label="truth", color="#4c72b0")
+        axes[2].hist(pred_phi[mask], bins=phi_bins, histtype="step", linewidth=2.0, label="pred", color="#dd8452")
+        axes[2].set_yscale("log")
+        axes[2].set_title("phi")
+        axes[2].set_xlabel("phi")
+        axes[2].grid(True, alpha=0.25)
+
+        axes[0].legend(loc="best")
+        fig.suptitle(title)
+        fig.tight_layout()
+        figs[key] = fig
+
+    _plot_truth_vs_pred_kinematics(
+        paired_mask,
+        "Reco kinematics: truth vs pred (all valid particles)",
+        "reco/kinematics_truth_vs_pred_all",
+    )
+    _plot_truth_vs_pred_kinematics(
+        charged_mask,
+        "Reco kinematics: truth vs pred (charged particles)",
+        "reco/kinematics_truth_vs_pred_charged",
+    )
+    _plot_truth_vs_pred_kinematics(
+        neutral_mask,
+        "Reco kinematics: truth vs pred (neutral particles)",
+        "reco/kinematics_truth_vs_pred_neutral",
+    )
+
+    return figs
+
+
+def make_plots(
+    track_data: dict,
+    cluster_data: dict,
+    reco_data: dict | None = None,
+    truth_pt_bins: np.ndarray | list[float] = RECO_TRUTH_PT_BINS,
+) -> dict[str, plt.Figure]:
     """Reproduce all validation plots from ODDPFlowTwoStream."""
     import time
     from hepattn.experiments.odd_pileup_maskformer.plots import PhysicsPlotter
@@ -401,13 +769,16 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
     if cluster_data.get("mask_pred") is not None and len(cluster_data.get("mask_pred", [])) > 0:
         is_fn = cluster_data["mask_truth"].astype(bool) & ~cluster_data["mask_pred"].astype(bool)
         is_fp = ~cluster_data["mask_truth"].astype(bool) & cluster_data["mask_pred"].astype(bool)
-        t0 = time.perf_counter()
-        for bin_key, bin_fig in PhysicsPlotter.plot_calo_mask_errors_by_energy(
-            cluster_data["mask_pred"], cluster_data["mask_truth"],
-            cluster_data["total_e"], cluster_data["true_hs_e"], cluster_data["pred_frac"],
-        ).items():
-            figs[f"calo/mask_errors_by_energy/{bin_key}"] = bin_fig
-        print(f"  {'calo/mask_errors_by_energy':<40s} {time.perf_counter() - t0:.2f}s")
+        if cluster_data.get("pred_frac") is not None and len(cluster_data.get("pred_frac", [])) > 0:
+            t0 = time.perf_counter()
+            for bin_key, bin_fig in PhysicsPlotter.plot_calo_mask_errors_by_energy(
+                cluster_data["mask_pred"], cluster_data["mask_truth"],
+                cluster_data["total_e"], cluster_data["true_hs_e"], cluster_data["pred_frac"],
+            ).items():
+                figs[f"calo/mask_errors_by_energy/{bin_key}"] = bin_fig
+            print(f"  {'calo/mask_errors_by_energy':<40s} {time.perf_counter() - t0:.2f}s")
+        else:
+            print("  calo/mask_errors_by_energy               skipped (pred_frac unavailable)")
         _plot("calo/mistag_eta", PhysicsPlotter.plot_calo_mistag_vs_eta,
               cluster_data["mask_pred"], cluster_data["mask_truth"], cluster_data["eta"])
         _plot("calo/mask_metrics_vs_eta", PhysicsPlotter.plot_calo_mask_metrics_vs_eta,
@@ -446,6 +817,9 @@ def make_plots(track_data: dict, cluster_data: dict) -> dict[str, plt.Figure]:
         _plot("track/pt_dist", PhysicsPlotter.plot_track_pt_distribution,
               track_data["probs"], track_data["truth"], track_data["pt"])
 
+    if reco_data is not None:
+        figs.update(reco_plots(reco_data, truth_pt_bins=truth_pt_bins))
+
     return figs
 
 
@@ -460,7 +834,7 @@ def load_eval(
     num_workers: int = 1,
     max_batches: int | None = None,
 ):
-    """Full eval pipeline. Returns (figs, track_data, cluster_data).
+    """Full eval pipeline. Returns (track_data, cluster_data, model, loader).
 
     Args:
         files: List of parquet file paths to evaluate on.
@@ -479,10 +853,25 @@ def load_eval(
     model = load_model(ckpt_path, device=device)
 
     print("Running inference...")
-    track_data, cluster_data = collect_predictions(model, loader, device=device, max_batches=max_batches)
+    track_data, cluster_data, reco_data = collect_predictions(model, loader, device=device, max_batches=max_batches)
+    cluster_arr = (
+        cluster_data["pred_frac"]
+        if "pred_frac" in cluster_data
+        else cluster_data.get("total_e", np.array([]))
+    )
+    reco_arr = (
+        reco_data["truth_pt"]
+        if "truth_pt" in reco_data
+        else reco_data["truth_class"]
+        if "truth_class" in reco_data
+        else reco_data.get("pred_class", np.array([]))
+    )
+    cluster_count = int(np.asarray(cluster_arr).size)
+    reco_count = int(np.asarray(reco_arr).size)
     print(f"  Tracks: {len(track_data.get('probs', []))} nodes")
-    print(f"  Clusters: {len(cluster_data.get('pred_frac', []))} nodes")
-    return track_data, cluster_data,model,loader
+    print(f"  Clusters: {cluster_count} nodes")
+    print(f"  Reco objects: {reco_count} slots")
+    return track_data, cluster_data,reco_data,model,loader
 
 def run_eval(
     ckpt_path: str = CKPT_PATH,
@@ -514,12 +903,32 @@ def run_eval(
     model = load_model(ckpt_path, device=device)
 
     print("Running inference...")
-    track_data, cluster_data = collect_predictions(model, loader, device=device, max_batches=max_batches)
+    track_data, cluster_data, reco_data = collect_predictions(model, loader, device=device, max_batches=max_batches)
+    cluster_arr = (
+        cluster_data["pred_frac"]
+        if "pred_frac" in cluster_data
+        else cluster_data.get("total_e", np.array([]))
+    )
+    reco_arr = (
+        reco_data["truth_pt"]
+        if "truth_pt" in reco_data
+        else reco_data["truth_class"]
+        if "truth_class" in reco_data
+        else reco_data.get("pred_class", np.array([]))
+    )
+    cluster_count = int(np.asarray(cluster_arr).size)
+    reco_count = int(np.asarray(reco_arr).size)
     print(f"  Tracks: {len(track_data.get('probs', []))} nodes")
-    print(f"  Clusters: {len(cluster_data.get('pred_frac', []))} nodes")
+    print(f"  Clusters: {cluster_count} nodes")
+    print(f"  Reco objects: {reco_count} slots")
 
     print("Making plots...")
-    figs = make_plots(track_data, cluster_data)
+    figs = make_plots(
+        track_data,
+        cluster_data,
+        reco_data=reco_data,
+        truth_pt_bins=RECO_TRUTH_PT_BINS,
+    )
     figs.update(make_data_plots(loader.dataset))
     print(f"  Generated {len(figs)} plots: {list(figs.keys())}")
 
