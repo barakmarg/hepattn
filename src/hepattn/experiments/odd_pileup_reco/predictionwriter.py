@@ -85,27 +85,7 @@ class PflowPredictionWriter(Callback):
         suffix = f"_{self.test_suff}" if self.test_suff else ""
         return Path(out_dir / f"{out_basename}__test{suffix}.h5")
 
-    def _write_batch_outputs(self, batch_outputs, pad_masks, batch_idx):
-        to_write = {}
-        for input_name, outputs in batch_outputs.items():
-            this_outputs = []
-            name = input_name
-            inputs = None
-
-            for preds in outputs.values():
-                if inputs is not None:
-                    this_outputs.append(maybe_pad(preds, inputs))
-                else:
-                    this_outputs.append(preds)
-
-            # add mask if present
-            if name in pad_masks:
-                pad_mask = pad_masks[name].cpu()
-                pad_mask = u2s(np.expand_dims(pad_mask, -1), dtype=np.dtype([("mask", "?")]))
-                this_outputs.append(maybe_pad(pad_mask, inputs))
-            to_write[name] = join_structured_arrays(this_outputs)
-
-        # If the writer hasn't been created yet, create it now that we have the dtypes and shapes
+    def _write_batch(self, to_write):
         if self.writer is None:
             from ftag.hdf5 import H5Writer
             dtypes = {k: v.dtype for k, v in to_write.items()}
@@ -126,132 +106,152 @@ class PflowPredictionWriter(Callback):
 
         to_write = {}
 
-        # Event numbers
-        to_write["events"] = {
-            "event_number": u2s(
-                targets["event_number"].cpu().numpy().astype(np.int64).reshape(-1, 1),
-                dtype=np.dtype([("event_number", "i8")]),
-            )
-        }
+        # --- Event numbers ---
+        to_write["events"] = u2s(
+            targets["event_number"].cpu().numpy().astype(np.int64).reshape(-1, 1),
+            dtype=np.dtype([("event_number", "i8")]),
+        )
 
-        # --- Pileup removal outputs (Stream A & B) ---
+        # --- Pileup removal outputs (Stream A & B) — full 5500-node space ---
         track_final = preds.get("track_final", {})
         if "mask" in track_final:
-            to_write["track_mask"] = {
-                "preds": u2s(
-                    track_final["mask"]["pflow_node_prob"].cpu().float().unsqueeze(-1).numpy(),
-                    dtype=np.dtype([("track_prob", np.float32)]),
-                )
-            }
+            to_write["track_mask"] = u2s(
+                track_final["mask"]["pflow_node_prob"].cpu().float().unsqueeze(-1).numpy(),
+                dtype=np.dtype([("track_prob", np.float32)]),
+            )
 
         calo_final = preds.get("calo_final", {})
         if "calo_mask" in calo_final:
-            to_write["calo_mask"] = {
-                "preds": u2s(
-                    calo_final["calo_mask"]["calo_node_prob"].cpu().float().unsqueeze(-1).numpy(),
-                    dtype=np.dtype([("calo_prob", np.float32)]),
-                )
-            }
+            to_write["calo_mask"] = u2s(
+                calo_final["calo_mask"]["calo_node_prob"].cpu().float().unsqueeze(-1).numpy(),
+                dtype=np.dtype([("calo_prob", np.float32)]),
+            )
 
-        # --- Reco node indices (1400 → 5500 mapping) ---
-        reco_node_indices = getattr(module.model.model, "_reco_node_indices", None)
+        # --- Reco node indices: (B, 1400) maps filtered positions → full 5500 space ---
+        reco_node_indices = getattr(module.model, "_reco_node_indices", None)
         if reco_node_indices is not None:
-            to_write["reco_node_indices"] = {
-                "indices": u2s(
-                    reco_node_indices.cpu().numpy().astype(np.int32).reshape(*reco_node_indices.shape, 1),
-                    dtype=np.dtype([("index", np.int32)]),
-                )
-            }
+            to_write["reco_node_indices"] = u2s(
+                reco_node_indices.cpu().numpy().astype(np.int32).reshape(*reco_node_indices.shape, 1),
+                dtype=np.dtype([("index", np.int32)]),
+            )
 
         # --- Reconstruction outputs (Stream C) ---
         reco_final_preds = preds.get("reco_final", {})
         reco_final_outputs = outputs.get("reco_final", {})
 
-        # Object class: truth + predicted
-        to_write["object_class"] = {}
+        # Object class: truth + predicted — both (B, 400), joinable
+        class_arrays = []
         if "reco_particle_class" in targets:
-            to_write["object_class"]["targets"] = u2s(
+            class_arrays.append(u2s(
                 targets["reco_particle_class"].cpu().unsqueeze(-1).numpy(),
                 dtype=np.dtype([("object_class", "i8")]),
-            )
+            ))
         if "classification" in reco_final_preds:
             for key, val in reco_final_preds["classification"].items():
                 if "class" in key:
-                    to_write["object_class"]["preds"] = u2s(
+                    class_arrays.append(u2s(
                         val.cpu().unsqueeze(-1).numpy(),
                         dtype=np.dtype([("pflow_class", "i8")]),
-                    )
+                    ))
+        if class_arrays:
+            to_write["object_class"] = join_structured_arrays(class_arrays)
 
-        # Object masks: truth + raw logits
-        to_write["object_masks"] = {}
+        # Truth masks — (B, 400, 5500) full node space
         if "reco_particle_node_valid" in targets:
-            to_write["object_masks"]["targets"] = u2s(
+            to_write["truth_masks"] = u2s(
                 targets["reco_particle_node_valid"].cpu().unsqueeze(-1).numpy(),
                 dtype=np.dtype([("truth_masks", "i8")]),
             )
+
+        # Pred mask logits — (B, 400, 1400) filtered space, use reco_node_indices to map
         if "mask" in reco_final_outputs:
             logit_key = next((k for k in reco_final_outputs["mask"] if k.endswith("_logit")), None)
             if logit_key:
-                to_write["object_masks"]["preds"] = u2s(
+                to_write["pred_mask_logits"] = u2s(
                     reco_final_outputs["mask"][logit_key].cpu().unsqueeze(-1).float().numpy(),
                     dtype=np.dtype([("mask_logits", np.float32)]),
                 )
 
-        # Incidence: truth + predicted
-        if "reco_particle_incidence" in targets and "incidence" in reco_final_preds:
-            to_write["incidence"] = {}
-            to_write["incidence"]["targets"] = u2s(
+        # Truth incidence — (B, 400, 5500) full node space
+        if "reco_particle_incidence" in targets:
+            to_write["truth_incidence"] = u2s(
                 targets["reco_particle_incidence"].cpu().unsqueeze(-1).numpy(),
                 dtype=np.dtype([("truth_incidence", np.float32)]),
             )
+
+        # Pred incidence — (B, 400, 1400) filtered space
+        if "incidence" in reco_final_preds:
             incidence_key = next((k for k in reco_final_preds["incidence"] if "incidence" in k), None)
             if incidence_key:
-                to_write["incidence"]["preds"] = u2s(
+                to_write["pred_incidence"] = u2s(
                     reco_final_preds["incidence"][incidence_key].cpu().unsqueeze(-1).float().numpy(),
                     dtype=np.dtype([("pred_incidence", np.float32)]),
                 )
 
-        # Regression: truth + pred + proxy for each kinematic
-        to_write["regression"] = {}
+        # Regression: truth + pred + proxy — all (B, 400), joinable
+        reg_arrays = []
         for t in ["e", "pt", "eta", "sinphi", "cosphi"]:
-            # Truth
             truth_key = f"reco_particle_{t}"
             if truth_key in targets:
                 truth_data = targets[truth_key].cpu().float().unsqueeze(-1)
                 if t in self.var_transform:
                     truth_data = self.var_transform[t].inverse_transform(truth_data)
-                to_write["regression"][f"truth_{t}"] = u2s(
-                    truth_data.numpy(),
-                    dtype=np.dtype([(f"truth_{t}", np.float32)]),
-                )
+                reg_arrays.append(u2s(truth_data.numpy(), dtype=np.dtype([(f"truth_{t}", np.float32)])))
 
-            # Predicted
             if "regression" in reco_final_preds:
                 pred_key = f"reco_pflow_{t}"
                 if pred_key in reco_final_preds["regression"]:
                     pred_data = reco_final_preds["regression"][pred_key].cpu().float().unsqueeze(-1)
                     if t in self.var_transform:
                         pred_data = self.var_transform[t].inverse_transform(pred_data)
-                    to_write["regression"][f"pred_{t}"] = u2s(
-                        pred_data.numpy(),
-                        dtype=np.dtype([(f"pred_{t}", np.float32)]),
-                    )
+                    reg_arrays.append(u2s(pred_data.numpy(), dtype=np.dtype([(f"pred_{t}", np.float32)])))
 
-                # Proxy (if available)
                 proxy_key = f"reco_pflow_proxy_{t}"
                 if proxy_key in reco_final_preds["regression"]:
                     proxy_data = reco_final_preds["regression"][proxy_key].cpu().float().unsqueeze(-1)
                     if t in self.var_transform:
                         proxy_data = self.var_transform[t].inverse_transform(proxy_data)
-                    to_write["regression"][f"proxy_{t}"] = u2s(
-                        proxy_data.numpy(),
-                        dtype=np.dtype([(f"proxy_{t}", np.float32)]),
-                    )
+                    reg_arrays.append(u2s(proxy_data.numpy(), dtype=np.dtype([(f"proxy_{t}", np.float32)])))
 
-        # Remove empty groups
-        to_write = {k: v for k, v in to_write.items() if v}
+        if reg_arrays:
+            to_write["regression"] = join_structured_arrays(reg_arrays)
 
-        self._write_batch_outputs(to_write, {}, batch_idx)
+        # --- Node-level metadata for offline track/cluster evaluation ---
+        node_meta_arrays = []
+        for field, target_key, dtype in [
+            ("node_valid", "node_valid", np.int8),
+            ("node_is_track", "node_is_track", np.int8),
+            ("tracks_mask", "tracks_mask", np.int8),
+            ("node_pt", "node_pt", np.float32),
+            ("node_eta", "node_eta", np.float32),
+            ("node_phi", "node_phi", np.float32),
+            ("node_z0", "node_z0", np.float32),
+            ("node_e", "node_e", np.float32),
+            ("calo_hs_energy", "calo_hard_scatter_energy", np.float32),
+            ("calo_hs_frac", "calo_hard_scatter_energy_frac", np.float32),
+            ("calo_neutral_e", "calo_hs_neutral_energy", np.float32),
+            ("calo_charged_e", "calo_hs_charged_energy", np.float32),
+        ]:
+            if target_key in targets:
+                val = targets[target_key].cpu().float().numpy()
+                if val.ndim == 2:
+                    val = val[..., np.newaxis]
+                node_meta_arrays.append(u2s(val, dtype=np.dtype([(field, dtype)])))
+
+        if node_meta_arrays:
+            to_write["node_metadata"] = join_structured_arrays(node_meta_arrays)
+
+        # --- Calo fraction predictions (if calo_fraction task is present) ---
+        if "calo_fraction" in calo_final and "calo_hs_fraction" in calo_final.get("calo_fraction", {}):
+            calo_frac_val = calo_final["calo_fraction"]["calo_hs_fraction"].cpu().float().numpy()
+            if calo_frac_val.ndim == 2:
+                calo_frac_val = calo_frac_val[..., np.newaxis]
+            to_write["calo_fraction"] = u2s(
+                calo_frac_val,
+                dtype=np.dtype([("calo_frac_pred", np.float32)]),
+            )
+
+        self._write_batch(to_write)
 
     def on_test_end(self, trainer, module):
         if self.writer is not None:

@@ -47,9 +47,9 @@ data:
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: -1
-  num_test: -1
-  num_val: -1
+  num_train: 1000
+  num_test: 320
+  num_val: 1000
 
   batch_size: 64
   incidence_cutval: 0.01
@@ -81,6 +81,7 @@ trainer:
     - class_path: hepattn.callbacks.Compile
     - class_path: hepattn.callbacks.InferenceTimer
     - class_path: hepattn.callbacks.SaveConfig
+    - class_path: hepattn.experiments.odd_pileup_reco.PflowPredictionWriter
     - class_path: hepattn.callbacks.Checkpoint
       init_args:
         monitor: val/loss

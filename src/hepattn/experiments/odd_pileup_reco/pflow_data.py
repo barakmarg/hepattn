@@ -722,12 +722,13 @@ class ODDDatasetPileup(Dataset):
         incidence_matrix = np.zeros((self.num_objects, n_nodes))
         indicator = torch.zeros(self.num_objects)
 
-        # Tracks: HS tracks → shifted rows (+1). PU tracks stay unassigned.
-        track_idx = np.arange(len(t_particle_idx))
-        t_pidx_np = t_particle_idx.numpy() if isinstance(t_particle_idx, torch.Tensor) else t_particle_idx
-        if self.is_inference:
-            t_pidx_np[t_pidx_np < 0] = 0
-        incidence_matrix[t_pidx_np + 1, track_idx] = 1.0
+        # Tracks: only valid HS track→particle assignments go to rows 1..n_particles.
+        # PU tracks (track_particle_idx == -1) are left unassigned (all-zero column).
+        track_idx = np.arange(len(t_particle_idx), dtype=np.int64)
+        t_pidx_np = t_particle_idx.numpy() if isinstance(t_particle_idx, torch.Tensor) else np.asarray(t_particle_idx)
+        valid_track_assoc = (t_pidx_np >= 0) & (t_pidx_np < n_particles)
+        if np.any(valid_track_assoc):
+            incidence_matrix[t_pidx_np[valid_track_assoc] + 1, track_idx[valid_track_assoc]] = 1.0
 
         # Cluster deposits from raw_deps (HS particle → cluster), shifted +1
         d_particle_idx_np = get_t("raw_deps_particle_idx", rd_start, rd_end).numpy()

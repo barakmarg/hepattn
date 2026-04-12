@@ -1,44 +1,392 @@
-"""
-Offline evaluation script for the Two-Stream MaskFormer.
+"""Offline evaluation plots for the Two-Stream MaskFormer.
 
-Loads a checkpoint and data files, runs inference, and produces
-all validation plots from ODDPFlowTwoStream.on_validation_epoch_end().
+Data is loaded from prediction writer H5 files (canonical format). Two paths:
 
-Usage (standalone):
-    python eval_plots.py
+1. Load existing H5 directly (no model/GPU needed)::
 
-Usage (notebook):
     from hepattn.experiments.odd_pileup_reco.eval_plots import run_eval
+    figs, track, cluster, reco = run_eval(
+        h5_path="logs/.../epoch=042-val_loss=13.01940__test.h5"
+    )
 
-    # Specific files
-    figs, track, cluster = run_eval(files=[
-        "/storage/agrp/barakma/PileupODD/data/ttbar_pu200/target_particles-0042.parquet",
-        "/storage/agrp/barakma/PileupODD/data/ttbar_pu200/target_particles-0043.parquet",
-    ])
+2. Run forward pass (produces H5 via PflowPredictionWriter, then loads it)::
 
-    # Or all files in a directory
-    figs, track, cluster = run_eval(data_dir="/storage/agrp/barakma/PileupODD/data/ttbar_pu200")
+    figs, track, cluster, reco = run_eval(
+        ckpt_path="...", config_path="...", data_dir="..."
+    )
 """
 
-from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import yaml
-from torch.utils.data import DataLoader
+from matplotlib.colors import ListedColormap
+
+from hepattn.experiments.odd_pileup_reco.eval_data import (
+    load_eval_data_from_h5,
+    run_forward_pass,
+)
 
 # ── Configuration ──────────────────────────────────────────────────────────
-CKPT_PATH = "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260331-T135040/ckpts/epoch=008-val_loss=25.69795.ckpt"
 CONFIG_PATH = "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/configs/base.yaml"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 48
 RECO_TRUTH_PT_BINS = np.array([0.0, 0.2, 0.5, 0.9, 2.0, 4.0, 10.0, 20.0, np.inf], dtype=np.float64)
 RECO_NUM_CLASSES = 6
 CALO_PRED_THRESHOLD = 0.2
 CALO_HS_FRAC_THRESHOLD = 0.05
 CALO_HS_ENERGY_THRESHOLD = 0.15
+
+
+def plot_incidence_matrix_event(
+    reco_data: dict,
+    event_index: int,
+    incidence_key: str = "pred_incidence",
+    num_nodes: int = 1400,
+    mode: str = "pileup",
+    truth_key: str = "truth_incidence",
+    max_objects: int | None = None,
+    pred_threshold: float = 0.0,
+    truth_threshold: float = 0.0,
+    tracks_only: bool = False,
+    pred_track_proxy: bool = False,
+    exclude_pileup_row: bool = False,
+) -> tuple[plt.Figure, dict[str, float | int | tuple[int, ...]]]:
+    """Plot reco-space incidence diagnostics for one event.
+
+    Parameters
+    ----------
+    reco_data : dict
+        In-memory output dict produced by load_eval_data_from_h5.
+    event_index : int
+        Event to visualize (supports negative indexing).
+    incidence_key : str
+        Prediction incidence key in reco_data.
+    num_nodes : int
+        Number of reco-node columns to use (1400 by default).
+    mode : str
+        One of: "pileup", "binary_compare", "raw_compare".
+    truth_key : str
+        Truth incidence key in reco_data (used by compare modes).
+    max_objects : int | None
+        Optional cap on number of object rows.
+    pred_threshold : float
+        Threshold for binary prediction incidence (binary_compare).
+    truth_threshold : float
+        Threshold for binary truth incidence (binary_compare).
+    tracks_only : bool
+        If True, restrict columns to reco nodes identified as tracks.
+    pred_track_proxy : bool
+        If True in binary_compare mode, keep only one predicted track per object
+        (highest-score track above threshold), matching old charged-track proxy style.
+    exclude_pileup_row : bool
+        If True, drop row 0 before plotting/statistics. Useful when comparing
+        to non-pileup-style object rows.
+    """
+
+    def _read_event_matrix(key: str) -> tuple[np.ndarray, int]:
+        if key not in reco_data:
+            raise KeyError(
+                f"Key '{key}' not found in reco_data. "
+                f"Available keys: {sorted(reco_data.keys())}. "
+                "Reload reco_data with load_eval_data_from_h5(...) before calling this function."
+            )
+
+        inc_all = np.asarray(reco_data[key])
+        if inc_all.ndim != 3:
+            raise ValueError(
+                f"Expected incidence array with shape (events, objects, nodes), got {inc_all.shape}"
+            )
+
+        n_events_local = inc_all.shape[0]
+        evt = event_index
+        if evt < 0:
+            evt = n_events_local + evt
+        if evt < 0 or evt >= n_events_local:
+            raise IndexError(f"event_index={evt} out of range for {n_events_local} events")
+
+        mat_local = inc_all[evt]
+        if mat_local.ndim != 2:
+            raise ValueError(f"Expected per-event incidence to be 2D, got {mat_local.shape}")
+        if mat_local.shape[1] < num_nodes:
+            raise ValueError(
+                f"Requested num_nodes={num_nodes}, but incidence has only {mat_local.shape[1]} nodes"
+            )
+
+        mat_local = mat_local[:, :num_nodes]
+        if max_objects is not None:
+            n_obj = int(max_objects)
+            if n_obj <= 0:
+                raise ValueError(f"max_objects must be positive when provided, got {max_objects}")
+            n_obj = min(n_obj, mat_local.shape[0])
+            mat_local = mat_local[:n_obj]
+
+        return mat_local, evt
+
+    pred_mat, resolved_event_index = _read_event_matrix(incidence_key)
+    obj_row_offset = 0
+    if exclude_pileup_row:
+        if pred_mat.shape[0] < 2:
+            raise ValueError("Cannot exclude pileup row: incidence has fewer than 2 object rows")
+        pred_mat = pred_mat[1:]
+        obj_row_offset = 1
+
+    reco_node_valid = None
+    if "reco_node_valid" in reco_data:
+        node_valid_all = np.asarray(reco_data["reco_node_valid"])
+        if node_valid_all.ndim == 2 and resolved_event_index < node_valid_all.shape[0]:
+            reco_node_valid = node_valid_all[resolved_event_index, :num_nodes].astype(bool)
+
+    truth_valid_evt = None
+    if "truth_valid" in reco_data:
+        truth_valid_all = np.asarray(reco_data["truth_valid"])
+        if truth_valid_all.ndim == 2 and resolved_event_index < truth_valid_all.shape[0]:
+            truth_valid_evt = truth_valid_all[
+                resolved_event_index,
+                obj_row_offset:obj_row_offset + pred_mat.shape[0],
+            ].astype(bool)
+
+    n_tracks = None
+    if "reco_n_tracks" in reco_data:
+        n_tracks_all = np.asarray(reco_data["reco_n_tracks"]).reshape(-1)
+        if resolved_event_index < len(n_tracks_all):
+            n_tracks = int(max(0, min(int(n_tracks_all[resolved_event_index]), pred_mat.shape[1])))
+
+    track_mask = None
+    if "reco_is_track" in reco_data:
+        reco_is_track_all = np.asarray(reco_data["reco_is_track"])
+        if reco_is_track_all.ndim == 2 and resolved_event_index < reco_is_track_all.shape[0]:
+            track_mask = reco_is_track_all[resolved_event_index, :pred_mat.shape[1]].astype(bool)
+
+    if tracks_only:
+        if track_mask is None:
+            raise KeyError(
+                "tracks_only=True requires reco_data['reco_is_track']. "
+                "Reload reco_data from a v2 prediction-writer H5 with node_metadata."
+            )
+        pred_mat = pred_mat[:, track_mask]
+        if reco_node_valid is not None:
+            reco_node_valid = reco_node_valid[track_mask]
+        n_tracks = pred_mat.shape[1]
+
+    if mode == "pileup":
+        if exclude_pileup_row:
+            raise ValueError("exclude_pileup_row is not supported in mode='pileup'")
+        pileup_row = pred_mat[0]
+        mat_sum = np.sum(pred_mat)
+        pileup_sum = np.sum(pileup_row)
+
+        stats: dict[str, float | int | tuple[int, ...]] = {
+            "event_index": int(resolved_event_index),
+            "matrix_shape": tuple(int(x) for x in pred_mat.shape),
+            "matrix_sum": float(mat_sum),
+            "pileup_sum": float(pileup_sum),
+            "pileup_fraction_of_total": float(pileup_sum / mat_sum),
+            "pileup_min": float(np.min(pileup_row)),
+            "pileup_max": float(np.max(pileup_row)),
+            "pileup_mean": float(np.mean(pileup_row)),
+            "pileup_std": float(np.std(pileup_row)),
+            "pileup_nan_count": int(np.isnan(pileup_row).sum()),
+            "pileup_posinf_count": int(np.isposinf(pileup_row).sum()),
+            "pileup_neginf_count": int(np.isneginf(pileup_row).sum()),
+            "matrix_nan_count": int(np.isnan(pred_mat).sum()),
+            "matrix_posinf_count": int(np.isposinf(pred_mat).sum()),
+            "matrix_neginf_count": int(np.isneginf(pred_mat).sum()),
+        }
+
+        if n_tracks is not None:
+            stats["n_tracks"] = int(n_tracks)
+
+        fig, (ax_mat, ax_pu) = plt.subplots(
+            2,
+            1,
+            figsize=(15, 9),
+            gridspec_kw={"height_ratios": [3.2, 1.2]},
+            constrained_layout=True,
+        )
+
+        im = ax_mat.imshow(pred_mat, aspect="auto", interpolation="nearest", cmap="viridis")
+        fig.colorbar(im, ax=ax_mat, pad=0.01, label="Incidence value")
+        ax_mat.set_title(
+            f"Reco incidence matrix | event={resolved_event_index} | shape={pred_mat.shape[0]}x{pred_mat.shape[1]}"
+        )
+        ax_mat.set_ylabel("Object index (row 0 = pileup token)")
+        ax_mat.set_xlabel("Filtered node index")
+        if n_tracks is not None and n_tracks > 0 and n_tracks < pred_mat.shape[1]:
+            ax_mat.axvline(n_tracks, color="red", linestyle="--", linewidth=1.2)
+
+        x = np.arange(pred_mat.shape[1], dtype=np.int64)
+        ax_pu.plot(x, pileup_row, color="#d62728", linewidth=1.0)
+        ax_pu.set_title("Pileup token row (row 0) across filtered nodes")
+        ax_pu.set_xlabel("Filtered node index")
+        ax_pu.set_ylabel("Incidence")
+        ax_pu.grid(True, alpha=0.25)
+        if n_tracks is not None and n_tracks > 0 and n_tracks < pred_mat.shape[1]:
+            ax_pu.axvline(n_tracks, color="red", linestyle="--", linewidth=1.2)
+
+        stats_lines = [
+            f"matrix_sum={stats['matrix_sum']:.6g}",
+            f"pileup_sum={stats['pileup_sum']:.6g}",
+            f"pileup_fraction={stats['pileup_fraction_of_total']:.6g}",
+            f"pileup_mean={stats['pileup_mean']:.6g}",
+            f"pileup_std={stats['pileup_std']:.6g}",
+            f"pileup_min={stats['pileup_min']:.6g}",
+            f"pileup_max={stats['pileup_max']:.6g}",
+            f"pileup_nan={stats['pileup_nan_count']} +inf={stats['pileup_posinf_count']} -inf={stats['pileup_neginf_count']}",
+        ]
+        if n_tracks is not None:
+            stats_lines.append(f"n_tracks={n_tracks}")
+        ax_pu.text(
+            1.01,
+            0.5,
+            "\n".join(stats_lines),
+            transform=ax_pu.transAxes,
+            va="center",
+            ha="left",
+            fontsize=9,
+            family="monospace",
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+        )
+
+        return fig, stats
+
+    if mode not in {"binary_compare", "raw_compare"}:
+        raise ValueError(f"Unsupported mode='{mode}'. Use one of: 'pileup', 'binary_compare', 'raw_compare'")
+
+    truth_mat, _ = _read_event_matrix(truth_key)
+    if exclude_pileup_row:
+        truth_mat = truth_mat[obj_row_offset:obj_row_offset + pred_mat.shape[0]]
+    if tracks_only and track_mask is not None:
+        truth_mat = truth_mat[:, track_mask]
+
+    if mode == "binary_compare":
+        if pred_track_proxy:
+            if track_mask is None and not tracks_only:
+                raise KeyError(
+                    "pred_track_proxy=True requires reco_data['reco_is_track'] unless tracks_only=True. "
+                    "Reload reco_data from a v2 prediction-writer H5 with node_metadata."
+                )
+
+            pred_binary = np.zeros_like(pred_mat, dtype=bool)
+            local_track_mask = np.ones(pred_mat.shape[1], dtype=bool) if tracks_only else track_mask
+            pred_track_scores = np.where(local_track_mask[None, :], pred_mat, -np.inf)
+            best_idx = np.argmax(pred_track_scores, axis=1)
+            best_val = pred_track_scores[np.arange(pred_mat.shape[0]), best_idx]
+            valid_rows = best_val > pred_threshold
+            if np.any(valid_rows):
+                row_idx = np.where(valid_rows)[0]
+                pred_binary[row_idx, best_idx[row_idx]] = True
+        else:
+            pred_binary = pred_mat > pred_threshold
+
+        truth_binary = truth_mat > truth_threshold
+
+        matches = truth_binary & pred_binary
+        pred_only = pred_binary & (~truth_binary)
+        truth_only = truth_binary & (~pred_binary)
+
+        n_matches = int(np.count_nonzero(matches))
+        n_pred_only = int(np.count_nonzero(pred_only))
+        n_truth_only = int(np.count_nonzero(truth_only))
+        n_total_truth = int(np.count_nonzero(truth_binary))
+        n_total_pred = int(np.count_nonzero(pred_binary))
+
+        def _safe_pct(num: int, den: int) -> float:
+            return float(100.0 * num / den) if den > 0 else 0.0
+
+        match_eff = _safe_pct(n_matches, n_total_truth)
+        fp_rate = _safe_pct(n_pred_only, n_total_pred)
+        fn_rate = _safe_pct(n_truth_only, n_total_truth)
+
+        display_pred = np.zeros_like(pred_binary, dtype=np.int32)
+        display_truth = np.zeros_like(truth_binary, dtype=np.int32)
+        display_pred[matches] = 1
+        display_pred[pred_only] = 2
+        display_truth[matches] = 1
+        display_truth[truth_only] = 3
+
+        cmap = ListedColormap(["white", "lime", "gold", "red"])
+        fig, axes = plt.subplots(1, 2, figsize=(15, 7), constrained_layout=True)
+
+        title_core = (
+            "Incidence comparison\n"
+            f"match={n_matches} ({match_eff:.1f}%) | "
+            f"fp={n_pred_only} ({fp_rate:.1f}%) | "
+            f"fn={n_truth_only} ({fn_rate:.1f}%)"
+        )
+
+        for ax, data, name in [
+            (axes[0], display_pred, "Pred view"),
+            (axes[1], display_truth, "Truth view"),
+        ]:
+            ax.imshow(data, interpolation="nearest", aspect="auto", cmap=cmap, vmin=0, vmax=3)
+            if n_tracks is not None and n_tracks > 0 and n_tracks < data.shape[1]:
+                ax.axvline(n_tracks, color="blue", linestyle="--", linewidth=1.2)
+            ax.set_title(f"{name}\n{title_core}")
+            ax.set_xlabel("Filtered node index")
+            ax.set_ylabel("Object index")
+
+        stats = {
+            "event_index": int(resolved_event_index),
+            "matrix_shape": tuple(int(x) for x in pred_mat.shape),
+            "n_matches": n_matches,
+            "n_pred_only": n_pred_only,
+            "n_truth_only": n_truth_only,
+            "n_total_pred": n_total_pred,
+            "n_total_truth": n_total_truth,
+            "match_eff_pct": float(match_eff),
+            "fp_rate_pct": float(fp_rate),
+            "fn_rate_pct": float(fn_rate),
+            "pred_threshold": float(pred_threshold),
+            "truth_threshold": float(truth_threshold),
+            "tracks_only": int(bool(tracks_only)),
+            "pred_track_proxy": int(bool(pred_track_proxy)),
+            "exclude_pileup_row": int(bool(exclude_pileup_row)),
+        }
+        if n_tracks is not None:
+            stats["n_tracks"] = int(n_tracks)
+
+        return fig, stats
+
+    pred_plot = pred_mat
+    truth_plot = truth_mat
+
+    if reco_node_valid is not None:
+        pred_plot = pred_plot * reco_node_valid[None, :]
+    if truth_valid_evt is not None:
+        truth_plot = truth_plot * truth_valid_evt[:, None]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), constrained_layout=True)
+    axes[0].imshow(pred_plot, interpolation="nearest", aspect="auto")
+    axes[0].set_title("PFlow incidence (reco-node space)")
+    axes[0].set_xlabel("Filtered node index")
+    axes[0].set_ylabel("Object index")
+
+    axes[1].imshow(truth_plot, interpolation="nearest", aspect="auto")
+    axes[1].set_title("Truth incidence (reco-node space)")
+    axes[1].set_xlabel("Filtered node index")
+    axes[1].set_ylabel("Object index")
+
+    if n_tracks is not None and n_tracks > 0 and n_tracks < pred_plot.shape[1]:
+        axes[0].axvline(n_tracks, color="red", linestyle="--", linewidth=1.2)
+        axes[1].axvline(n_tracks, color="red", linestyle="--", linewidth=1.2)
+
+    stats = {
+        "event_index": int(resolved_event_index),
+        "matrix_shape": tuple(int(x) for x in pred_plot.shape),
+        "pred_sum": float(np.sum(pred_plot)),
+        "truth_sum": float(np.sum(truth_plot)),
+        "pred_nan_count": int(np.isnan(pred_plot).sum()),
+        "truth_nan_count": int(np.isnan(truth_plot).sum()),
+        "tracks_only": int(bool(tracks_only)),
+        "exclude_pileup_row": int(bool(exclude_pileup_row)),
+    }
+    if n_tracks is not None:
+        stats["n_tracks"] = int(n_tracks)
+    if reco_node_valid is not None:
+        stats["n_valid_nodes"] = int(np.count_nonzero(reco_node_valid))
+    if truth_valid_evt is not None:
+        stats["n_valid_truth_objects"] = int(np.count_nonzero(truth_valid_evt))
+
+    return fig, stats
 
 
 def compute_deltaR_window_stats(
@@ -76,9 +424,9 @@ def compute_deltaR_window_stats(
 
     for evt_idx in sample_indices:
         t_start = int(dataset.track_cumsum[evt_idx])
-        t_end   = int(dataset.track_cumsum[evt_idx + 1])
+        t_end = int(dataset.track_cumsum[evt_idx + 1])
         c_start = int(dataset.cluster_cumsum[evt_idx])
-        c_end   = int(dataset.cluster_cumsum[evt_idx + 1])
+        c_end = int(dataset.cluster_cumsum[evt_idx + 1])
 
         eta = np.concatenate([
             dataset.full_data_array["track_eta"][t_start:t_end].numpy(),
@@ -99,309 +447,40 @@ def compute_deltaR_window_stats(
         phi = phi[sort_idx]
 
         half_w = min(max_half_w, n - 1)
-        sum_dR   = {w: 0.0 for w in window_sizes}
+        sum_dR = {w: 0.0 for w in window_sizes}
         sum_deta = {w: 0.0 for w in window_sizes}
         sum_dphi = {w: 0.0 for w in window_sizes}
-        cnt_dR   = {w: 0   for w in window_sizes}
-        max_dR   = {w: 0.0 for w in window_sizes}
+        cnt_dR = {w: 0 for w in window_sizes}
+        max_dR = {w: 0.0 for w in window_sizes}
 
         for d in range(1, half_w + 1):
             deta = eta[d:] - eta[:-d]
             dphi = phi[d:] - phi[:-d]
             dphi = np.arctan2(np.sin(dphi), np.cos(dphi))
             dR = np.sqrt(deta**2 + dphi**2)
-            dR_sum   = float(dR.sum())
-            dR_max   = float(dR.max())
-            dR_cnt   = len(dR)
+            dR_sum = float(dR.sum())
+            dR_max = float(dR.max())
+            dR_cnt = len(dR)
             deta_sum = float(np.abs(deta).sum())
             dphi_sum = float(np.abs(dphi).sum())
 
             for w in window_sizes:
                 if d <= w // 2:
-                    sum_dR[w]   += dR_sum
+                    sum_dR[w] += dR_sum
                     sum_deta[w] += deta_sum
                     sum_dphi[w] += dphi_sum
-                    cnt_dR[w]   += dR_cnt
+                    cnt_dR[w] += dR_cnt
                     if dR_max > max_dR[w]:
                         max_dR[w] = dR_max
 
         for w in window_sizes:
             if cnt_dR[w] > 0:
-                results[w]["mean_dR"].append(sum_dR[w]   / cnt_dR[w])
+                results[w]["mean_dR"].append(sum_dR[w] / cnt_dR[w])
                 results[w]["max_dR"].append(max_dR[w])
                 results[w]["mean_deta"].append(sum_deta[w] / cnt_dR[w])
                 results[w]["mean_dphi"].append(sum_dphi[w] / cnt_dR[w])
 
     return results
-
-
-def load_config(config_path: str = CONFIG_PATH) -> dict:
-    with open(config_path) as f:
-        return yaml.safe_load(f)
-
-
-def build_dataloader(
-    cfg: dict,
-    files: list[str | Path] | None = None,
-    data_dir: str | None = None,
-    num_events: int = -1,
-    batch_size: int = BATCH_SIZE,
-    num_workers: int = 1,
-) -> DataLoader:
-    """Create a DataLoader directly from a list of parquet files or a directory.
-
-    Args:
-        cfg: Parsed YAML config dict.
-        files: Explicit list of parquet file paths. Takes priority over data_dir.
-        data_dir: Directory to glob for parquet files (used if files is None).
-        num_events: Number of events to load (-1 for all).
-        batch_size: Batch size.
-        num_workers: DataLoader workers.
-    """
-    from hepattn.experiments.odd_pileup_reco.pflow_data import ODDDatasetPileup
-
-    data_cfg = cfg["data"]
-
-    if files is not None:
-        files_list = [Path(f) for f in files]
-        filepath = str(files_list[0].parent)
-    elif data_dir is not None:
-        files_list = None
-        filepath = data_dir
-    else:
-        raise ValueError("Provide either `files` (list of parquet paths) or `data_dir`.")
-
-    dataset = ODDDatasetPileup(
-        filepath=filepath,
-        inputs=data_cfg["inputs"],
-        targets=data_cfg["targets"],
-        scale_dict_path=data_cfg["scale_dict_path"],
-        num_events=num_events,
-        max_nodes=data_cfg["max_nodes"],
-        incidence_cutval=data_cfg.get("incidence_cutval", 0.01),
-        hard_scatter_energy_threshold=data_cfg.get("hard_scatter_energy_threshold", 0.03),
-        window_size=data_cfg.get("window_size", 512),
-        files_list=files_list,
-        is_inference=False,
-    )
-    print(f"Dataset: {len(dataset)} events from {len(files_list) if files_list else 'dir'} file(s)")
-
-    return DataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0,
-    )
-
-
-def load_model(ckpt_path: str = CKPT_PATH, device: str = DEVICE):
-    from hepattn.experiments.odd_pileup_reco.lightning_module import ODDPFlowTwoStream
-
-    model = ODDPFlowTwoStream.load_from_checkpoint(ckpt_path, map_location=device)
-    model.eval()
-    model.to(device)
-    return model
-
-
-def collect_predictions(model, dataloader, device: str = DEVICE, max_batches: int | None = None):
-    """Run inference on dataloader and accumulate data for plots.
-
-    Returns (track_data, cluster_data, reco_data) dicts with numpy arrays.
-    """
-    track_data = defaultdict(list)
-    cluster_data = defaultdict(list)
-    reco_data = defaultdict(list)
-    event_counter = 0
-    warned_no_cluster_nodes = False
-    warned_no_reco_head = False
-    warned_no_reco_truth = False
-    var_transform = getattr(getattr(dataloader.dataset, "scaler", None), "transforms", {})
-
-    def _inverse_if_needed(x: torch.Tensor, field: str) -> torch.Tensor:
-        y = x.detach().cpu().float().unsqueeze(-1)
-        if field in var_transform:
-            y = var_transform[field].inverse_transform(y)
-        return y.squeeze(-1)
-
-    with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.bfloat16):
-        for i, batch in enumerate(dataloader):
-            if max_batches is not None and i >= max_batches:
-                break
-
-            inputs, targets = batch
-            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-            targets = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in targets.items()}
-
-            outputs = model.model(inputs, targets=targets)
-            preds = model.model.predict(outputs)
-
-            labels = targets
-            node_valid = labels["node_valid"].bool()
-            is_track = labels["node_is_track"].bool().squeeze(-1)
-
-            # ── Track data (Stream A) ──
-            track_final = preds.get("track_final", {})
-            track_node_mask = node_valid & is_track
-
-            if track_node_mask.any() and "mask" in track_final:
-                track_prob = track_final["mask"]["pflow_node_prob"].squeeze(-2)[track_node_mask]
-                track_truth = labels["tracks_mask"][track_node_mask].int()
-
-                track_data["probs"].append(track_prob.float().cpu().numpy())
-                track_data["truth"].append(track_truth.cpu().numpy())
-                track_data["pt"].append(labels["node_pt"][track_node_mask].float().cpu().numpy())
-                track_data["eta"].append(labels["node_eta"][track_node_mask].float().cpu().numpy())
-                track_data["z0"].append(labels["node_z0"][track_node_mask].float().cpu().numpy())
-
-            # ── Cluster data (Stream B) ──
-            calo_final = preds.get("calo_final", {})
-            cluster_node_mask = node_valid & (~is_track)
-
-            if (not cluster_node_mask.any()) and (not warned_no_cluster_nodes):
-                print("Warning: no cluster nodes in batch; cluster diagnostics may stay empty.")
-                warned_no_cluster_nodes = True
-
-            if cluster_node_mask.any():
-                node_e = labels["node_e"][cluster_node_mask]
-                true_hs_energy = labels["calo_hard_scatter_energy"][cluster_node_mask]
-
-                cluster_data["total_e"].append(node_e.float().cpu().numpy())
-                cluster_data["true_hs_e"].append(true_hs_energy.float().cpu().numpy())
-                cluster_data["eta"].append(labels["node_eta"][cluster_node_mask].float().cpu().numpy())
-                cluster_data["phi"].append(labels["node_phi"][cluster_node_mask].float().cpu().numpy())
-
-                # Fraction regression may be absent in some checkpoints.
-                if "calo_fraction" in calo_final and "calo_hs_fraction" in calo_final["calo_fraction"]:
-                    calo_frac_pred = calo_final["calo_fraction"]["calo_hs_fraction"].squeeze(-1)[cluster_node_mask]
-                    calo_frac_true = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
-                    cluster_data["pred_frac"].append(calo_frac_pred.float().cpu().numpy())
-                    cluster_data["true_frac"].append(calo_frac_true.float().cpu().numpy())
-
-                # Truth neutral/charged energy per cluster (for composition plot)
-                if "calo_hs_neutral_energy" in labels:
-                    cluster_data["neutral_e"].append(labels["calo_hs_neutral_energy"][cluster_node_mask].float().cpu().numpy())
-                    cluster_data["charged_e"].append(labels["calo_hs_charged_energy"][cluster_node_mask].float().cpu().numpy())
-
-                # Calo mask predictions for cluster swap plot
-                if "calo_mask" in calo_final and "calo_node_prob" in calo_final["calo_mask"]:
-                    calo_prob_flat = calo_final["calo_mask"]["calo_node_prob"][cluster_node_mask]
-                    calo_hs_e_flat = labels["calo_hard_scatter_energy"][cluster_node_mask]
-                    cluster_data["mask_pred"].append((calo_prob_flat > CALO_PRED_THRESHOLD).cpu().numpy())
-                    cluster_data["calo_mask_probs"].append(calo_prob_flat.float().cpu().numpy())
-                    calo_hs_frac_flat = labels["calo_hard_scatter_energy_frac"][cluster_node_mask]
-                    cluster_data["mask_truth"].append(
-                        ((calo_hs_frac_flat > CALO_HS_FRAC_THRESHOLD) & (calo_hs_e_flat > CALO_HS_ENERGY_THRESHOLD)).cpu().numpy()
-                    )
-
-                # Per-event indices
-                counts = cluster_node_mask.sum(dim=-1).cpu().numpy()
-                event_indices = np.repeat(
-                    np.arange(event_counter, event_counter + len(counts)),
-                    counts,
-                )
-                cluster_data["event_idx"].append(event_indices)
-                event_counter += len(counts)
-
-                # Per-event mask energy sums (binary mask, no fraction regression)
-                if "calo_mask" in calo_final and "calo_node_prob" in calo_final["calo_mask"]:
-                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > CALO_PRED_THRESHOLD).float()
-                    truth_mask_b = (
-                        (labels["calo_hard_scatter_energy_frac"] > CALO_HS_FRAC_THRESHOLD)
-                        & (labels["calo_hard_scatter_energy"] > CALO_HS_ENERGY_THRESHOLD)
-                    ).float()
-                    node_e_b = labels["node_e"]
-                    cluster_valid = cluster_node_mask.float()
-                    cluster_data["evt_pred_mask_e"].append(
-                        (pred_mask_b * cluster_valid * node_e_b).sum(dim=-1).cpu().numpy())
-                    cluster_data["evt_truth_mask_e"].append(
-                        (truth_mask_b * cluster_valid * node_e_b).sum(dim=-1).cpu().numpy())
-
-                # Per-event neutral/charged HS energy (mask-weighted sums)
-                if "calo_mask" in calo_final and "calo_node_prob" in calo_final["calo_mask"] and "calo_hs_neutral_energy" in labels:
-                    pred_mask_b = (calo_final["calo_mask"]["calo_node_prob"] > CALO_PRED_THRESHOLD).float()  # (B, N)
-                    truth_mask_b = (
-                        (labels["calo_hard_scatter_energy_frac"] > CALO_HS_FRAC_THRESHOLD)
-                        & (labels["calo_hard_scatter_energy"] > CALO_HS_ENERGY_THRESHOLD)
-                    ).float()  # (B, N)
-
-                    cluster_valid = cluster_node_mask.float()  # (B, N)
-                    neutral_e = labels["calo_hs_neutral_energy"]  # (B, N)
-                    charged_e = labels["calo_hs_charged_energy"]  # (B, N)
-
-                    cluster_data["evt_pred_neutral_e"].append(
-                        (pred_mask_b * cluster_valid * neutral_e).sum(dim=-1).cpu().numpy())
-                    cluster_data["evt_truth_neutral_e"].append(
-                        (truth_mask_b * cluster_valid * neutral_e).sum(dim=-1).cpu().numpy())
-                    cluster_data["evt_pred_charged_e"].append(
-                        (pred_mask_b * cluster_valid * charged_e).sum(dim=-1).cpu().numpy())
-                    cluster_data["evt_truth_charged_e"].append(
-                        (truth_mask_b * cluster_valid * charged_e).sum(dim=-1).cpu().numpy())
-
-            # ── Reconstruction data (Stream C) ──
-            reco_final = preds.get("reco_final", {})
-            if (not reco_final) and (not warned_no_reco_head):
-                print("Warning: no reco_final predictions; this checkpoint/model may not include Stream C outputs.")
-                warned_no_reco_head = True
-            reco_cls = reco_final.get("classification", {})
-            reco_reg = reco_final.get("regression", {})
-
-            pred_class_t = reco_cls.get("reco_pflow_class")
-            pred_valid_t = reco_cls.get("reco_pflow_valid")
-            truth_class_t = labels.get("reco_particle_class")
-            if truth_class_t is None:
-                truth_class_t = labels.get("particle_class")
-
-            truth_valid_t = labels.get("reco_particle_valid")
-            if truth_valid_t is None:
-                truth_valid_t = labels.get("particle_valid")
-
-            found_reco_truth = False
-
-            if pred_class_t is not None:
-                reco_data["pred_class"].append(pred_class_t.detach().cpu().numpy().astype(np.int64))
-                if pred_valid_t is None:
-                    pred_valid_t = pred_class_t < (RECO_NUM_CLASSES - 1)
-                reco_data["pred_valid"].append(pred_valid_t.detach().cpu().numpy().astype(bool))
-
-            if truth_class_t is not None:
-                reco_data["truth_class"].append(truth_class_t.detach().cpu().numpy().astype(np.int64))
-                if truth_valid_t is None:
-                    truth_valid_t = truth_class_t < (RECO_NUM_CLASSES - 1)
-                reco_data["truth_valid"].append(truth_valid_t.detach().cpu().numpy().astype(bool))
-                found_reco_truth = True
-
-            for field in ["pt", "eta", "sinphi", "cosphi"]:
-                pred_key = f"reco_pflow_{field}"
-                truth_key = f"reco_particle_{field}"
-                truth_alt_key = f"particle_{field}"
-
-                if pred_key in reco_reg:
-                    pred_field = _inverse_if_needed(reco_reg[pred_key], field)
-                    reco_data[f"pred_{field}"].append(pred_field.numpy())
-
-                if truth_key in labels:
-                    truth_field = _inverse_if_needed(labels[truth_key], field)
-                    reco_data[f"truth_{field}"].append(truth_field.numpy())
-                    found_reco_truth = True
-                elif truth_alt_key in labels:
-                    truth_field = _inverse_if_needed(labels[truth_alt_key], field)
-                    reco_data[f"truth_{field}"].append(truth_field.numpy())
-                    found_reco_truth = True
-
-            if (not found_reco_truth) and (not warned_no_reco_truth):
-                print("Warning: no truth reco labels found in targets (expected reco_particle_* or particle_* keys).")
-                warned_no_reco_truth = True
-
-            if (i + 1) % 10 == 0:
-                print(f"  Batch {i + 1} done")
-
-    # Concatenate
-    track_data = {k: np.concatenate(v) for k, v in track_data.items() if v}
-    cluster_data = {k: np.concatenate(v) for k, v in cluster_data.items() if v}
-    reco_data = {k: np.concatenate(v) for k, v in reco_data.items() if v}
-    return track_data, cluster_data, reco_data
 
 
 def reco_plots(
@@ -823,124 +902,153 @@ def make_plots(
     return figs
 
 
-def load_eval(
-    ckpt_path: str = CKPT_PATH,
-    config_path: str = CONFIG_PATH,
-    device: str = DEVICE,
-    files: list[str | Path] | None = None,
-    data_dir: str | None = None,
-    num_events: int = -1,
-    batch_size: int = BATCH_SIZE,
-    num_workers: int = 1,
-    max_batches: int | None = None,
-):
-    """Full eval pipeline. Returns (track_data, cluster_data, model, loader).
-
-    Args:
-        files: List of parquet file paths to evaluate on.
-        data_dir: Directory to glob for parquet files (used if files is None).
-        num_events: Number of events to load (-1 for all).
-        max_batches: Stop after this many batches (None for all).
-    """
-    print(f"Loading config from {config_path}")
-    cfg = load_config(config_path)
-
-    print("Building dataloader...")
-    loader = build_dataloader(cfg, files=files, data_dir=data_dir, num_events=num_events, batch_size=batch_size, num_workers=num_workers)
-    print(f"  {len(loader)} batches")
-
-    print(f"Loading model from {ckpt_path}")
-    model = load_model(ckpt_path, device=device)
-
-    print("Running inference...")
-    track_data, cluster_data, reco_data = collect_predictions(model, loader, device=device, max_batches=max_batches)
-    cluster_arr = (
-        cluster_data["pred_frac"]
-        if "pred_frac" in cluster_data
-        else cluster_data.get("total_e", np.array([]))
-    )
-    reco_arr = (
-        reco_data["truth_pt"]
-        if "truth_pt" in reco_data
-        else reco_data["truth_class"]
-        if "truth_class" in reco_data
-        else reco_data.get("pred_class", np.array([]))
-    )
-    cluster_count = int(np.asarray(cluster_arr).size)
-    reco_count = int(np.asarray(reco_arr).size)
-    print(f"  Tracks: {len(track_data.get('probs', []))} nodes")
+def _print_data_summary(track_data: dict, cluster_data: dict, reco_data: dict) -> None:
+    track_count = len(track_data.get("probs", []))
+    cluster_count = len(cluster_data.get("total_e", []))
+    reco_count = int(np.asarray(
+        reco_data.get("truth_pt", reco_data.get("truth_class", reco_data.get("pred_class", [])))
+    ).size)
+    print(f"  Tracks: {track_count} nodes")
     print(f"  Clusters: {cluster_count} nodes")
     print(f"  Reco objects: {reco_count} slots")
-    return track_data, cluster_data,reco_data,model,loader
+
+
+def load_eval(
+    h5_path: str | Path | None = None,
+    *,
+    ckpt_path: str | Path | None = None,
+    config_path: str | Path = CONFIG_PATH,
+    data_dir: str | None = None,
+    files: list[str | Path] | None = None,
+    num_events: int = -1,
+    batch_size: int = 48,
+    num_workers: int = 1,
+    accelerator: str = "auto",
+) -> tuple[dict, dict, dict]:
+    """Load evaluation data from H5 file, or run forward pass to generate one.
+
+    Args:
+        h5_path: Path to an existing prediction writer H5 file. If given,
+            loads directly — no model or GPU needed.
+        ckpt_path: Path to model checkpoint (used if h5_path is None).
+        config_path: Path to YAML config (used if h5_path is None).
+        data_dir: Directory with parquet files (used if h5_path is None).
+        files: Explicit list of parquet files (used if h5_path is None).
+        num_events: Number of events to load (-1 for all).
+        batch_size: Batch size for forward pass.
+        num_workers: DataLoader workers.
+        accelerator: Lightning accelerator ("auto", "gpu", "cpu").
+
+    Returns:
+        (track_data, cluster_data, reco_data) dicts ready for ``make_plots()``.
+    """
+    if h5_path is not None:
+        print(f"Loading evaluation data from {h5_path}")
+        track_data, cluster_data, reco_data = load_eval_data_from_h5(h5_path)
+    else:
+        if ckpt_path is None:
+            raise ValueError("Provide either h5_path (existing H5) or ckpt_path (for forward pass).")
+        print("Running forward pass to generate predictions H5...")
+        generated_h5 = run_forward_pass(
+            ckpt_path=ckpt_path,
+            config_path=config_path,
+            data_dir=data_dir,
+            files=files,
+            num_events=num_events,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            accelerator=accelerator,
+        )
+        print(f"Loading evaluation data from {generated_h5}")
+        track_data, cluster_data, reco_data = load_eval_data_from_h5(generated_h5)
+
+    _print_data_summary(track_data, cluster_data, reco_data)
+    return track_data, cluster_data, reco_data
+
 
 def run_eval(
-    ckpt_path: str = CKPT_PATH,
-    config_path: str = CONFIG_PATH,
-    device: str = DEVICE,
-    files: list[str | Path] | None = None,
+    h5_path: str | Path | None = None,
+    *,
+    ckpt_path: str | Path | None = None,
+    config_path: str | Path = CONFIG_PATH,
     data_dir: str | None = None,
+    files: list[str | Path] | None = None,
     num_events: int = -1,
-    batch_size: int = BATCH_SIZE,
+    batch_size: int = 48,
     num_workers: int = 1,
-    max_batches: int | None = None,
-):
-    """Full eval pipeline. Returns (figs, track_data, cluster_data).
+    accelerator: str = "auto",
+    truth_pt_bins: np.ndarray | list[float] = RECO_TRUTH_PT_BINS,
+    reco_analysis: bool = False,
+    reco_analysis_do_jets: bool = True,
+    reco_analysis_event_indices: list[int] | None = None,
+) -> tuple[dict[str, plt.Figure], dict, dict, dict]:
+    """Full eval pipeline: load data + generate plots.
 
     Args:
-        files: List of parquet file paths to evaluate on.
-        data_dir: Directory to glob for parquet files (used if files is None).
-        num_events: Number of events to load (-1 for all).
-        max_batches: Stop after this many batches (None for all).
+        h5_path: Path to existing prediction writer H5 (no model/GPU needed if given).
+        ckpt_path: Model checkpoint path (used when h5_path is None).
+        config_path: YAML config path (used when h5_path is None).
+        data_dir: Parquet data directory (used when h5_path is None).
+        files: Explicit parquet file list (used when h5_path is None).
+        num_events: Events to process (-1 for all).
+        batch_size: Forward-pass batch size.
+        num_workers: DataLoader worker count.
+        accelerator: Lightning accelerator ("auto", "gpu", "cpu").
+        truth_pt_bins: pt bin edges for efficiency/purity curves.
+        reco_analysis: Also run particle-level reco analysis (``reco_analysis.py``).
+        reco_analysis_do_jets: Enable FastJet clustering in reco analysis (requires fastjet).
+        reco_analysis_event_indices: Event indices for event displays in reco analysis.
+
+    Returns:
+        (figs, track_data, cluster_data, reco_data)
     """
-    print(f"Loading config from {config_path}")
-    cfg = load_config(config_path)
-
-    print("Building dataloader...")
-    loader = build_dataloader(cfg, files=files, data_dir=data_dir, num_events=num_events, batch_size=batch_size, num_workers=num_workers)
-    print(f"  {len(loader)} batches")
-
-    print(f"Loading model from {ckpt_path}")
-    model = load_model(ckpt_path, device=device)
-
-    print("Running inference...")
-    track_data, cluster_data, reco_data = collect_predictions(model, loader, device=device, max_batches=max_batches)
-    cluster_arr = (
-        cluster_data["pred_frac"]
-        if "pred_frac" in cluster_data
-        else cluster_data.get("total_e", np.array([]))
+    track_data, cluster_data, reco_data = load_eval(
+        h5_path=h5_path,
+        ckpt_path=ckpt_path,
+        config_path=config_path,
+        data_dir=data_dir,
+        files=files,
+        num_events=num_events,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        accelerator=accelerator,
     )
-    reco_arr = (
-        reco_data["truth_pt"]
-        if "truth_pt" in reco_data
-        else reco_data["truth_class"]
-        if "truth_class" in reco_data
-        else reco_data.get("pred_class", np.array([]))
-    )
-    cluster_count = int(np.asarray(cluster_arr).size)
-    reco_count = int(np.asarray(reco_arr).size)
-    print(f"  Tracks: {len(track_data.get('probs', []))} nodes")
-    print(f"  Clusters: {cluster_count} nodes")
-    print(f"  Reco objects: {reco_count} slots")
 
     print("Making plots...")
     figs = make_plots(
         track_data,
         cluster_data,
         reco_data=reco_data,
-        truth_pt_bins=RECO_TRUTH_PT_BINS,
+        truth_pt_bins=truth_pt_bins,
     )
-    figs.update(make_data_plots(loader.dataset))
     print(f"  Generated {len(figs)} plots: {list(figs.keys())}")
 
-    return figs, track_data, cluster_data
+    if reco_analysis and reco_data:
+        from hepattn.experiments.odd_pileup_reco.reco_analysis import (
+            pflow_data_from_eval_dicts,
+            run_reco_analysis,
+        )
+        print("Running particle-level reco analysis...")
+        pflow_data = pflow_data_from_eval_dicts(reco_data)
+        reco_figs = run_reco_analysis(
+            pflow_data,
+            do_jets=reco_analysis_do_jets,
+            event_display_indices=reco_analysis_event_indices,
+        )
+        figs.update(reco_figs)
+        print(f"  Total figures after reco analysis: {len(figs)}")
+
+    return figs, track_data, cluster_data, reco_data
 
 
 def make_data_plots(dataset_or_loader) -> dict[str, plt.Figure]:
-    from torch.utils.data import DataLoader
-    dataset = dataset_or_loader.dataset if isinstance(dataset_or_loader, DataLoader) else dataset_or_loader
     """Plots that need only the raw dataset — no model inference required."""
+    from torch.utils.data import DataLoader
+
     import time
     from hepattn.experiments.odd_pileup_maskformer.plots import PhysicsPlotter
+
+    dataset = dataset_or_loader.dataset if isinstance(dataset_or_loader, DataLoader) else dataset_or_loader
 
     figs = {}
 
@@ -979,28 +1087,59 @@ def make_data_plots(dataset_or_loader) -> dict[str, plt.Figure]:
 
 
 def run_data_plots(
-    config_path: str = CONFIG_PATH,
+    config_path: str | Path = CONFIG_PATH,
     files: list[str | Path] | None = None,
     data_dir: str | None = None,
     num_events: int = -1,
     num_workers: int = 1,
 ) -> dict[str, plt.Figure]:
-    """Generate all data-only plots without loading a model.
+    """Generate all data-only plots without loading a model."""
+    import yaml
+    from hepattn.experiments.odd_pileup_reco.pflow_data import ODDDatasetPileup
 
-    Usage:
-        figs = run_data_plots(data_dir="/storage/.../ttbar_pu200")
-        figs = run_data_plots(files=["file1.parquet", "file2.parquet"])
-    """
-    cfg = load_config(config_path)
-    loader = build_dataloader(cfg, files=files, data_dir=data_dir, num_events=num_events, num_workers=num_workers)
-    return make_data_plots(loader.dataset)
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    data_cfg = cfg["data"]
+
+    if files is not None:
+        files_list = [Path(f) for f in files]
+        filepath = str(files_list[0].parent)
+    elif data_dir is not None:
+        files_list = None
+        filepath = data_dir
+    else:
+        raise ValueError("Provide either files or data_dir.")
+
+    dataset = ODDDatasetPileup(
+        filepath=filepath,
+        inputs=data_cfg["inputs"],
+        targets=data_cfg["targets"],
+        scale_dict_path=data_cfg["scale_dict_path"],
+        num_events=num_events,
+        max_nodes=data_cfg["max_nodes"],
+        incidence_cutval=data_cfg.get("incidence_cutval", 0.01),
+        hard_scatter_energy_threshold=data_cfg.get("hard_scatter_energy_threshold", 0.03),
+        window_size=data_cfg.get("window_size", 512),
+        files_list=files_list,
+        is_inference=False,
+    )
+    return make_data_plots(dataset)
 
 
 if __name__ == "__main__":
-    figs, track_data, cluster_data = run_eval()
+    import sys
 
-    # Save all figures to disk
-    out_dir = Path(CKPT_PATH).parent.parent / "eval_plots"
+    if len(sys.argv) > 1:
+        # Usage: python eval_plots.py <h5_path> [output_dir]
+        h5_file = sys.argv[1]
+        out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(h5_file).parent.parent / "eval_plots"
+    else:
+        print("Usage: python eval_plots.py <h5_path> [output_dir]")
+        sys.exit(1)
+
+    figs, track_data, cluster_data, reco_data = run_eval(h5_path=h5_file)
+
     out_dir.mkdir(exist_ok=True)
     for name, fig in figs.items():
         fname = name.replace("/", "_") + ".png"
