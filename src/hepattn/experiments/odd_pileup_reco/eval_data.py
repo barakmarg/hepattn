@@ -408,7 +408,10 @@ def run_forward_pass(
     num_events: int = -1,
     batch_size: int = 48,
     num_workers: int = 1,
-    accelerator: str = "auto",
+    accelerator: str | None = None,
+    devices: int | str | list[int] | None = None,
+    precision: str | int | None = None,
+    inference_mode: bool | None = None,
     test_suff: str = "",
 ) -> Path:
     """Run Lightning test step with PflowPredictionWriter, return H5 path.
@@ -426,7 +429,9 @@ def run_forward_pass(
     num_events : number of events to load (-1 for all)
     batch_size : batch size for test dataloader
     num_workers : dataloader workers
-    accelerator : Lightning accelerator ("auto", "gpu", "cpu")
+    accelerator : Lightning accelerator override (defaults to config trainer.accelerator)
+    devices : Lightning devices override (defaults to config trainer.devices)
+    precision : Lightning precision override (defaults to config trainer.precision)
     test_suff : suffix appended to output file name
 
     Returns
@@ -437,7 +442,7 @@ def run_forward_pass(
     from lightning import Trainer
 
     from hepattn.experiments.odd_pileup_reco.lightning_module import ODDPFlowTwoStream
-    from hepattn.experiments.odd_pileup_reco.pflow_data import ODDDataModule, ODDDatasetPileup
+    from hepattn.experiments.odd_pileup_reco.pflow_data import ODDDataModule
     from hepattn.experiments.odd_pileup_reco.predictionwriter import PflowPredictionWriter
 
     ckpt_path = Path(ckpt_path)
@@ -447,9 +452,19 @@ def run_forward_pass(
         cfg = yaml.safe_load(f)
 
     data_cfg = cfg["data"]
+    trainer_cfg = cfg.get("trainer", {})
+
+    # Respect config defaults unless explicitly overridden by function args.
+    trainer_accelerator = accelerator if accelerator is not None else trainer_cfg.get("accelerator", "auto")
+    trainer_devices = devices if devices is not None else trainer_cfg.get("devices", 1)
+    trainer_precision = precision if precision is not None else trainer_cfg.get("precision", "32-true")
+    trainer_inference_mode = inference_mode if inference_mode is not None else bool(trainer_cfg.get("inference_mode", True))
+    trainer_enable_progress_bar = bool(trainer_cfg.get("enable_progress_bar", True))
 
     # Build dataset
     if files is not None:
+        if len(files) == 0:
+            raise ValueError("files must be a non-empty list when provided")
         files_list = [Path(f) for f in files]
         filepath = str(files_list[0].parent)
     elif data_dir is not None:
@@ -460,40 +475,26 @@ def run_forward_pass(
         filepath = data_cfg.get("test_filepath", data_cfg.get("filepath"))
         files_list = None
 
-    dataset = ODDDatasetPileup(
-        filepath=filepath,
+    # Use fully initialized DataModule so Lightning setup hooks have all attributes.
+    datamodule = ODDDataModule(
+        train_path=filepath,
+        valid_path=filepath,
+        test_path=filepath,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        num_test=num_events,
+        scale_dict_path=data_cfg["scale_dict_path"],
         inputs=data_cfg["inputs"],
         targets=data_cfg["targets"],
-        scale_dict_path=data_cfg["scale_dict_path"],
-        num_events=num_events,
         max_nodes=data_cfg["max_nodes"],
         incidence_cutval=data_cfg.get("incidence_cutval", 0.01),
         hard_scatter_energy_threshold=data_cfg.get("hard_scatter_energy_threshold", 0.03),
         window_size=data_cfg.get("window_size", 512),
         files_list=files_list,
-        is_inference=False,
+        is_inference=True,
+        test_suff=test_suff,
+        enable_split=False,
     )
-
-    datamodule = ODDDataModule.__new__(ODDDataModule)
-    datamodule.batch_size = batch_size
-    datamodule.num_workers = num_workers
-    datamodule.test_suff = test_suff
-    datamodule._test_dataset = dataset
-
-    # Patch test_dataloader to use our dataset
-    from torch.utils.data import DataLoader
-
-    def _test_dataloader():
-        return DataLoader(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=num_workers > 0,
-        )
-
-    datamodule.test_dataloader = _test_dataloader
 
     # Load model
     model = ODDPFlowTwoStream.load_from_checkpoint(str(ckpt_path), map_location="cpu")
@@ -502,14 +503,16 @@ def run_forward_pass(
     writer = PflowPredictionWriter()
 
     trainer = Trainer(
-        accelerator=accelerator,
-        devices=1,
+        accelerator=trainer_accelerator,
+        devices=trainer_devices,
+        precision=trainer_precision,
         callbacks=[writer],
         logger=False,
-        enable_progress_bar=True,
+        enable_progress_bar=trainer_enable_progress_bar,
+        inference_mode=trainer_inference_mode,
     )
 
-    print(f"Running test on {len(dataset)} events ({len(_test_dataloader())} batches)...")
+    print("Running test...")
     trainer.test(model, datamodule=datamodule, ckpt_path=str(ckpt_path))
 
     h5_path = writer.output_path

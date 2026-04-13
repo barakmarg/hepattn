@@ -682,7 +682,8 @@ class ODDDatasetPileup(Dataset):
 
         # Trackless particle reclassification: charged particles w/o a matched
         # track become neutral (same logic as odd/pflow_data.py)
-        if self.is_inference:
+        # For now, we keep the trackless mask the same for inference(test) because bad coding, doesnt change anything in training
+        if self.is_inference and False:
             trackless_particle_mask = torch.zeros_like(particle_class, dtype=torch.bool)
         else:
             trackless_particle_mask = torch.ones(n_particles, dtype=torch.bool)
@@ -886,42 +887,49 @@ class ODDDatasetPileup(Dataset):
             df_tracks = df_tracks.rename(rename_map)
 
         cols_to_explode = [col for col in df_tracks.columns if col != 'event_id']
+        tracks_lazy = df_tracks.lazy().explode(cols_to_explode)
+
         if not self.is_inference:
-            # We remove double matched tracks to the same particle, only in the non-test stages.
-            df_tracks = (
-                        df_tracks.lazy()
-                        .explode(cols_to_explode)
-                        .with_columns([
-                            pl.col('pt').len().over(['event_id', 'particle_id']).alias('_count'),
-                            pl.col('pt').max().over(['event_id', 'particle_id']).alias('_max_pt')
-                        ])
-                        .filter(
-                            ~(
-                                (pl.col('particle_id') != -1) &
-                                (pl.col('_count') > 1) &
-                                ((pl.col('pt') - pl.col('_max_pt')).abs() > 1e-3)
-                            )
-                        )
-                        .with_columns(
-                            [
-                                (
-                                    (pl.col("majority_particle_vz") * pl.col("pt").pow(2)).sum().over(["event_id", "majority_particle_vertex_primary"]) /
-                                    pl.col("pt").pow(2).sum().over(["event_id", "majority_particle_vertex_primary"])
-                                ).alias("truth_vz_pt2_weighted")]
-                        )
-                        .with_columns(
-                            pl.when(pl.col("majority_particle_vertex_primary") == 1)
-                            .then(pl.col("truth_vz_pt2_weighted"))
-                            .otherwise(None)
-                            .max()
-                            .over("event_id")
-                            .alias("hard_scatter_vz")
-                        )
-                        .group_by('event_id', maintain_order=True)
-                        .agg(pl.col(cols_to_explode + ["truth_vz_pt2_weighted", "hard_scatter_vz"]))
-                        .sort('event_id')
-                        .collect()
+            # Remove double-matched tracks only in non-inference stages.
+            tracks_lazy = (
+                tracks_lazy
+                .with_columns([
+                    pl.col('pt').len().over(['event_id', 'particle_id']).alias('_count'),
+                    pl.col('pt').max().over(['event_id', 'particle_id']).alias('_max_pt')
+                ])
+                .filter(
+                    ~(
+                        (pl.col('particle_id') != -1) &
+                        (pl.col('_count') > 1) &
+                        ((pl.col('pt') - pl.col('_max_pt')).abs() > 1e-3)
                     )
+                )
+            )
+
+        # Always compute hard_scatter_vz; downstream feature construction requires it.
+        df_tracks = (
+            tracks_lazy
+            .with_columns(
+                [
+                    (
+                        (pl.col("majority_particle_vz") * pl.col("pt").pow(2)).sum().over(["event_id", "majority_particle_vertex_primary"]) /
+                        pl.col("pt").pow(2).sum().over(["event_id", "majority_particle_vertex_primary"])
+                    ).alias("truth_vz_pt2_weighted")
+                ]
+            )
+            .with_columns(
+                pl.when(pl.col("majority_particle_vertex_primary") == 1)
+                .then(pl.col("truth_vz_pt2_weighted"))
+                .otherwise(None)
+                .max()
+                .over("event_id")
+                .alias("hard_scatter_vz")
+            )
+            .group_by('event_id', maintain_order=True)
+            .agg(pl.col(cols_to_explode + ["truth_vz_pt2_weighted", "hard_scatter_vz"]))
+            .sort('event_id')
+            .collect()
+        )
 
         # Build per-particle has_track lookup for neutral/charged energy split
         _particles_exploded = (

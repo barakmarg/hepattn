@@ -716,7 +716,7 @@ The pileup token is valid for classification (class 5), mask (which nodes are PU
 | 5 | Null/background (unmatched queries, weighted by `null_weight`) |
 | — | Query 0 = pileup sink (excluded from classification, always valid at inference) |
 
-Trackless charged particles are reclassified to their neutral counterpart (charged hadron → neutral hadron +3, muon → neutral hadron).
+Trackless charged particles are reclassified to their neutral counterpart (charged hadron -> neutral hadron +3, muon -> neutral hadron).
 
 ---
 

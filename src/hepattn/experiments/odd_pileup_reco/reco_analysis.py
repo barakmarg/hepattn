@@ -36,7 +36,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import ListedColormap
+from matplotlib.colors import ListedColormap, LogNorm
 
 # ── Constants ─────────────────────────────────────────────────────────────
 NUM_CLASSES = 6
@@ -378,6 +378,227 @@ def plot_n_particles(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
     return fig
 
 
+def plot_n_particles_by_pt_bin(
+    data: dict,
+    ind_threshold: float = 0.5,
+    pt_bins: tuple[float, ...] = (0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 200.0),
+) -> plt.Figure:
+    """Per-event particle multiplicity histograms split by particle-pt bins."""
+    if len(pt_bins) < 2:
+        raise ValueError("pt_bins must contain at least two edges")
+
+    truth_pt = data["truth_ptetaphi"][..., 0]
+    pflow_pt = data["pflow_ptetaphi"][..., 0]
+    truth_valid = data["truth_indicator"] > ind_threshold
+    pflow_valid = data["pflow_indicator"] > ind_threshold
+
+    has_proxy = _has_proxy(data)
+    proxy_pt = data["proxy_ptetaphi"][..., 0] if has_proxy else None
+
+    n_panels = len(pt_bins) - 1
+    n_cols = 2 if n_panels > 1 else 1
+    n_rows = int(np.ceil(n_panels / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 3.8 * n_rows), squeeze=False)
+    axes_flat = axes.ravel()
+
+    for i in range(n_panels):
+        lo = float(pt_bins[i])
+        hi = float(pt_bins[i + 1])
+        ax = axes_flat[i]
+
+        truth_counts = (truth_valid & (truth_pt >= lo) & (truth_pt < hi)).sum(axis=-1)
+        pflow_counts = (pflow_valid & (pflow_pt >= lo) & (pflow_pt < hi)).sum(axis=-1)
+
+        series_max = [
+            int(truth_counts.max()) if truth_counts.size else 0,
+            int(pflow_counts.max()) if pflow_counts.size else 0,
+        ]
+        proxy_counts = None
+        if has_proxy and proxy_pt is not None:
+            proxy_counts = (pflow_valid & (proxy_pt >= lo) & (proxy_pt < hi)).sum(axis=-1)
+            series_max.append(int(proxy_counts.max()) if proxy_counts.size else 0)
+
+        max_count = max(1, *series_max)
+        bins = np.arange(-0.5, max_count + 1.5, 1.0)
+
+        ax.hist(truth_counts, bins=bins, histtype="stepfilled", alpha=0.5, label="Truth")
+        ax.hist(pflow_counts, bins=bins, histtype="step", label="PFlow")
+        if proxy_counts is not None:
+            ax.hist(proxy_counts, bins=bins, histtype="step", linestyle="--", label="Proxy")
+
+        ax.set_title(f"{lo:g} <= pt < {hi:g} GeV")
+        ax.set_xlabel("Particles / event")
+        ax.set_ylabel("Events")
+        ax.legend(fontsize=8)
+
+    for ax in axes_flat[n_panels:]:
+        ax.axis("off")
+
+    fig.suptitle("Particle multiplicity per event by pt bin", y=1.01)
+    fig.tight_layout()
+    return fig
+
+
+def plot_extra_particles_pt_bin_diagnostics(
+    data: dict,
+    ind_threshold: float = 0.5,
+    pt_min: float = 1.0,
+    pt_max: float = 2.0,
+    incidence_threshold: float = 0.1,
+) -> plt.Figure:
+    """Diagnostics for extra predicted particles in a pt bin.
+
+    "Extra" means predicted-valid but truth-invalid at the same query slot.
+    """
+
+    pflow_pt = data["pflow_ptetaphi"][..., 0]
+    pflow_eta = data["pflow_ptetaphi"][..., 1]
+    pflow_phi = normalize_phi(data["pflow_ptetaphi"][..., 2])
+    pred_valid = data["pflow_indicator"] > ind_threshold
+    truth_valid = data["truth_indicator"] > ind_threshold
+    pred_class = data["pflow_class"]
+
+    extra_mask = pred_valid & (~truth_valid) & (pflow_pt > pt_min) & (pflow_pt < pt_max)
+    event_counts = extra_mask.sum(axis=-1)
+
+    evt_idx, obj_idx = np.where(extra_mask)
+    extra_classes = pred_class[extra_mask]
+    extra_eta = pflow_eta[extra_mask]
+    extra_phi = pflow_phi[extra_mask]
+
+    incidence = data.get("pflow_incidence_filtered")
+    if incidence is None:
+        incidence = data.get("pflow_incidence")
+
+    inc_rows = None
+    if (
+        incidence is not None
+        and incidence.ndim == 3
+        and incidence.shape[0] == extra_mask.shape[0]
+        and incidence.shape[1] == extra_mask.shape[1]
+        and evt_idx.size > 0
+    ):
+        inc_rows = incidence[evt_idx, obj_idx, :]
+
+    max_frac = np.array([], dtype=np.float32)
+    sum_frac = np.array([], dtype=np.float32)
+    n_links = np.array([], dtype=np.int64)
+    n_cluster_links = np.array([], dtype=np.int64)
+    n_track_links = np.array([], dtype=np.int64)
+
+    if inc_rows is not None and inc_rows.size > 0:
+        max_frac = np.max(inc_rows, axis=1)
+        sum_frac = np.sum(inc_rows, axis=1)
+        n_links = np.sum(inc_rows > incidence_threshold, axis=1).astype(np.int64)
+
+        reco_is_track = data.get("reco_is_track")
+        if (
+            reco_is_track is not None
+            and reco_is_track.ndim == 2
+            and reco_is_track.shape[0] == incidence.shape[0]
+            and reco_is_track.shape[1] == incidence.shape[2]
+        ):
+            track_mask_rows = reco_is_track[evt_idx].astype(bool)
+            track_hits = (inc_rows > incidence_threshold) & track_mask_rows
+            cluster_hits = (inc_rows > incidence_threshold) & (~track_mask_rows)
+            n_track_links = np.sum(track_hits, axis=1).astype(np.int64)
+            n_cluster_links = np.sum(cluster_hits, axis=1).astype(np.int64)
+
+    fig, axes = plt.subplots(3, 3, figsize=(18, 13))
+    ax = axes.ravel()
+
+    bins_cls = np.arange(-0.5, NUM_CLASSES + 0.5, 1)
+    ax[0].hist(extra_classes, bins=bins_cls, histtype="stepfilled", alpha=0.7, color="tab:blue")
+    ax[0].set_xticks(np.arange(NUM_CLASSES - 1))
+    ax[0].set_xticklabels(CLASS_LABELS[:-1])
+    ax[0].set_title(f"Extra particle classes (n={extra_classes.size})")
+    ax[0].set_ylabel("Count")
+
+    max_evt = max(1, int(event_counts.max()) if event_counts.size else 1)
+    ax[1].hist(event_counts, bins=np.arange(-0.5, max_evt + 1.5, 1.0), histtype="stepfilled", alpha=0.7, color="tab:orange")
+    ax[1].set_title("Extra particles per event")
+    ax[1].set_xlabel("Count / event")
+    ax[1].set_ylabel("Events")
+
+    if n_cluster_links.size > 0:
+        max_c = max(1, int(n_cluster_links.max()))
+        ax[2].hist(n_cluster_links, bins=np.arange(-0.5, max_c + 1.5, 1.0), histtype="stepfilled", alpha=0.7, color="tab:green")
+        ax[2].set_title("Cluster links per extra particle")
+        ax[2].set_xlabel(f"# links (> {incidence_threshold:g})")
+        ax[2].set_ylabel("Particles")
+    elif n_links.size > 0:
+        max_l = max(1, int(n_links.max()))
+        ax[2].hist(n_links, bins=np.arange(-0.5, max_l + 1.5, 1.0), histtype="stepfilled", alpha=0.7, color="tab:green")
+        ax[2].set_title("Incidence links per extra particle")
+        ax[2].set_xlabel(f"# links (> {incidence_threshold:g})")
+        ax[2].set_ylabel("Particles")
+    else:
+        ax[2].text(0.5, 0.5, "No incidence data", ha="center", va="center", transform=ax[2].transAxes)
+        ax[2].set_title("Incidence occupancy")
+
+    if max_frac.size > 0:
+        ax[3].hist(max_frac, bins=50, histtype="stepfilled", alpha=0.7, color="tab:red")
+        ax[3].set_title(f"Max incidence fraction (mean={max_frac.mean():.3g})")
+        ax[3].set_xlabel("max incidence value / particle")
+        ax[3].set_ylabel("Particles")
+    else:
+        ax[3].text(0.5, 0.5, "No incidence data", ha="center", va="center", transform=ax[3].transAxes)
+        ax[3].set_title("Max incidence fraction")
+
+    if sum_frac.size > 0:
+        ax[4].hist(sum_frac, bins=50, histtype="stepfilled", alpha=0.7, color="tab:purple")
+        ax[4].set_title(f"Sum incidence fraction (mean={sum_frac.mean():.3g})")
+        ax[4].set_xlabel("sum incidence values / particle")
+        ax[4].set_ylabel("Particles")
+    else:
+        ax[4].text(0.5, 0.5, "No incidence data", ha="center", va="center", transform=ax[4].transAxes)
+        ax[4].set_title("Sum incidence fraction")
+
+    if n_track_links.size > 0:
+        max_t = max(1, int(n_track_links.max()))
+        ax[5].hist(n_track_links, bins=np.arange(-0.5, max_t + 1.5, 1.0), histtype="stepfilled", alpha=0.7, color="tab:brown")
+        ax[5].set_title("Track links per extra particle")
+        ax[5].set_xlabel(f"# links (> {incidence_threshold:g})")
+        ax[5].set_ylabel("Particles")
+    else:
+        ax[5].text(0.5, 0.5, "Track mask unavailable", ha="center", va="center", transform=ax[5].transAxes)
+        ax[5].set_title("Track-link occupancy")
+
+    finite_eta = extra_eta[np.isfinite(extra_eta)]
+    if finite_eta.size > 0:
+        ax[6].hist(finite_eta, bins=np.linspace(-4.0, 4.0, 60), histtype="stepfilled", alpha=0.7, color="tab:cyan")
+        ax[6].set_title("Extra particle eta distribution")
+        ax[6].set_xlabel("eta")
+        ax[6].set_ylabel("Particles")
+    else:
+        ax[6].text(0.5, 0.5, "No finite eta values", ha="center", va="center", transform=ax[6].transAxes)
+        ax[6].set_title("Extra particle eta distribution")
+
+    finite_phi = extra_phi[np.isfinite(extra_phi)]
+    if finite_phi.size > 0:
+        ax[7].hist(finite_phi, bins=np.linspace(-np.pi, np.pi, 60), histtype="stepfilled", alpha=0.7, color="tab:pink")
+        ax[7].set_title("Extra particle phi distribution")
+        ax[7].set_xlabel("phi [rad]")
+        ax[7].set_ylabel("Particles")
+    else:
+        ax[7].text(0.5, 0.5, "No finite phi values", ha="center", va="center", transform=ax[7].transAxes)
+        ax[7].set_title("Extra particle phi distribution")
+
+    ax[8].axis("off")
+
+    fig.suptitle(
+        (
+            f"Extra predicted particles diagnostics | "
+            f"{pt_min:g} < pt < {pt_max:g} GeV | "
+            f"events={extra_mask.shape[0]} | particles={extra_classes.size}"
+        ),
+        y=1.02,
+    )
+    fig.tight_layout()
+    return fig
+
+
 def plot_feature_distributions(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
     """3×3 grid: [pt, eta, phi] × [All, Charged, Neutral] distributions."""
     truth_f = data["truth_ptetaphi"].reshape(-1, 3)
@@ -426,7 +647,7 @@ def plot_feature_distributions(data: dict, ind_threshold: float = 0.5) -> plt.Fi
 
 
 def plot_feature_scatter(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
-    """3×3 scatter: truth vs PFlow (and proxy) for [pt, eta, phi] × [All, Charged, Neutral]."""
+    """3×3 density maps: truth vs PFlow for [pt, eta, phi] × [All, Charged, Neutral]."""
     truth_f = data["truth_ptetaphi"].reshape(-1, 3)
     pflow_f = data["pflow_ptetaphi"].reshape(-1, 3)
     tc      = data["truth_class"].ravel()
@@ -437,6 +658,11 @@ def plot_feature_scatter(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
 
     feat_labels = ["pt [GeV]", "eta", "phi [rad]"]
     row_labels  = ["All", "Charged", "Neutral"]
+    feat_bins = [
+        np.linspace(0.0, 200.0, 70),
+        np.linspace(-4.0, 4.0, 70),
+        np.linspace(-np.pi, np.pi, 70),
+    ]
     masks = [
         (pi > ind_threshold) & (ti > ind_threshold),
         (pi > ind_threshold) & (ti > ind_threshold) & (pc < 3) & (tc < 3),
@@ -452,20 +678,76 @@ def plot_feature_scatter(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
             m = masks[j]
             t = truth_f[:, i][m]
             p = pflow_f[:, i][m]
-            if proxy_f is not None:
-                ax.scatter(t, proxy_f[:, i][m], alpha=0.15, s=3, label="Proxy")
-            ax.scatter(t, p, alpha=0.15, s=3, label="PFlow")
+            finite = np.isfinite(t) & np.isfinite(p)
+
+            if finite.any():
+                bins = feat_bins[i]
+                ax.hist2d(
+                    t[finite],
+                    p[finite],
+                    bins=[bins, bins],
+                    norm=LogNorm(),
+                    cmap="viridis",
+                )
+                lo, hi = bins[0], bins[-1]
+                ax.plot([lo, hi], [lo, hi], linestyle="--", color="red", linewidth=1.0)
+                ax.text(
+                    0.03,
+                    0.97,
+                    f"n={int(finite.sum())}",
+                    transform=ax.transAxes,
+                    va="top",
+                    ha="left",
+                    fontsize=8,
+                    color="white",
+                    bbox={"facecolor": "black", "alpha": 0.35, "pad": 2},
+                )
+
+                if proxy_f is not None:
+                    pr = proxy_f[:, i][m]
+                    proxy_finite = np.isfinite(t) & np.isfinite(pr)
+                    if proxy_finite.any():
+                        h_proxy, xedges, yedges = np.histogram2d(
+                            t[proxy_finite], pr[proxy_finite], bins=[bins, bins]
+                        )
+                        positive = h_proxy[h_proxy > 0]
+                        if positive.size > 2:
+                            levels = np.unique(np.percentile(positive, [70, 90]))
+                            if levels.size > 0:
+                                xc = 0.5 * (xedges[:-1] + xedges[1:])
+                                yc = 0.5 * (yedges[:-1] + yedges[1:])
+                                ax.contour(xc, yc, h_proxy.T, levels=levels, colors="white", linewidths=0.9)
+            else:
+                ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+
             ax.set_xlabel(f"Truth {feat_labels[i]}")
             ax.set_ylabel(f"Pred {feat_labels[i]}")
             ax.set_title(row_labels[j])
-            ax.legend(fontsize=8, markerscale=3)
-    fig.suptitle("Feature scatter: truth vs prediction", y=1.01)
+    fig.suptitle("Feature density (hist2d): truth vs prediction", y=1.01)
     fig.tight_layout()
     return fig
 
 
 def plot_ptetaphi_residuals(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
     """3×3 grid of (pred−truth) residual histograms for [pt, eta, phi] × [All, Charged, Neutral]."""
+    def _stats_label(name: str, values: np.ndarray) -> str:
+        vals = values[np.isfinite(values)]
+        if vals.size == 0:
+            return f"{name} (mu=nan, std=nan, IQR=nan)"
+        q1, q3 = np.percentile(vals, [25, 75])
+        return (
+            f"{name} (mu={np.mean(vals):.3g}, std={np.std(vals):.3g}, "
+            f"IQR={(q3 - q1):.3g})"
+        )
+
+    def _percentile_bins(values: np.ndarray) -> np.ndarray:
+        lo, hi = np.percentile(values, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            lo, hi = np.min(values), np.max(values)
+        if hi <= lo:
+            hi = lo + 1e-6
+        return np.linspace(lo, hi, 60)
+
     truth_f = data["truth_ptetaphi"].reshape(-1, 3)
     pflow_f = data["pflow_ptetaphi"].reshape(-1, 3)
     tc      = data["truth_class"].ravel()
@@ -499,20 +781,118 @@ def plot_ptetaphi_residuals(data: dict, ind_threshold: float = 0.5) -> plt.Figur
                 res_pr = (pr - t) / t_safe
                 finite = np.isfinite(res_pr)
                 if finite.any():
-                    lo, hi = np.percentile(res_pr[finite], [0.5, 99.5])
-                    bins = np.linspace(lo, hi, 60)
-                    ax.hist(res_pr[finite], bins=bins, histtype="step", label="Proxy", density=True)
+                    proxy_vals = res_pr[finite]
+                    bins = _percentile_bins(proxy_vals)
+                    ax.hist(
+                        proxy_vals,
+                        bins=bins,
+                        histtype="step",
+                        label=_stats_label("Proxy", proxy_vals),
+                        density=True,
+                    )
 
             finite = np.isfinite(res_p)
             if finite.any():
-                lo, hi = np.percentile(res_p[finite], [0.5, 99.5])
-                bins = np.linspace(lo, hi, 60)
-                ax.hist(res_p[finite], bins=bins, histtype="stepfilled",
-                        alpha=0.5, label="PFlow", density=True)
+                pflow_vals = res_p[finite]
+                bins = _percentile_bins(pflow_vals)
+                ax.hist(
+                    pflow_vals,
+                    bins=bins,
+                    histtype="stepfilled",
+                    alpha=0.5,
+                    label=_stats_label("PFlow", pflow_vals),
+                    density=True,
+                )
             ax.set_xlabel(feat_labels[i])
             ax.set_title(row_labels[j])
-            ax.legend(fontsize=8)
+            ax.set_ylabel("Density")
+            ax.set_yscale("log")
+            ax.legend(fontsize=7)
     fig.suptitle("Kinematic residuals (pred − truth) / truth", y=1.01)
+    fig.tight_layout()
+    return fig
+
+
+def plot_pt_residual_absolute(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
+    """3×1 grid of absolute pt residual histograms: Δpt = pred_pt − truth_pt."""
+    def _stats_label(name: str, values: np.ndarray) -> str:
+        vals = values[np.isfinite(values)]
+        if vals.size == 0:
+            return f"{name} (mu=nan, std=nan, IQR=nan)"
+        q1, q3 = np.percentile(vals, [25, 75])
+        return (
+            f"{name} (mu={np.mean(vals):.3g}, std={np.std(vals):.3g}, "
+            f"IQR={(q3 - q1):.3g})"
+        )
+
+    def _percentile_bins(values: np.ndarray) -> np.ndarray:
+        lo, hi = np.percentile(values, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            lo, hi = np.min(values), np.max(values)
+        if hi <= lo:
+            hi = lo + 1e-6
+        return np.linspace(lo, hi, 60)
+
+    truth_pt = data["truth_ptetaphi"][..., 0].ravel()
+    pflow_pt = data["pflow_ptetaphi"][..., 0].ravel()
+    tc       = data["truth_class"].ravel()
+    pc       = data["pflow_class"].ravel()
+    ti       = data["truth_indicator"].ravel()
+    pi       = data["pflow_indicator"].ravel()
+    proxy_pt = data["proxy_ptetaphi"][..., 0].ravel() if _has_proxy(data) else None
+
+    row_labels = ["All", "Charged", "Neutral"]
+    masks = [
+        (pi > ind_threshold) & (ti > ind_threshold),
+        (pi > ind_threshold) & (ti > ind_threshold) & (pc < 3) & (tc < 3),
+        (pi > ind_threshold) & (ti > ind_threshold)
+            & (pc >= 3) & (pc < (NUM_CLASSES - 1))
+            & (tc >= 3) & (tc < (NUM_CLASSES - 1)),
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(9, 11))
+    for j in range(3):
+        ax = axes[j]
+        m = masks[j]
+        t = truth_pt[m]
+        p = pflow_pt[m]
+        res_p = p - t
+
+        if proxy_pt is not None:
+            pr = proxy_pt[m]
+            res_pr = pr - t
+            finite = np.isfinite(res_pr)
+            if finite.any():
+                proxy_vals = res_pr[finite]
+                bins = _percentile_bins(proxy_vals)
+                ax.hist(
+                    proxy_vals,
+                    bins=bins,
+                    histtype="step",
+                    label=_stats_label("Proxy", proxy_vals),
+                    density=True,
+                )
+
+        finite = np.isfinite(res_p)
+        if finite.any():
+            pflow_vals = res_p[finite]
+            bins = _percentile_bins(pflow_vals)
+            ax.hist(
+                pflow_vals,
+                bins=bins,
+                histtype="stepfilled",
+                alpha=0.5,
+                label=_stats_label("PFlow", pflow_vals),
+                density=True,
+            )
+
+        ax.set_xlabel("Δpt [GeV]")
+        ax.set_title(row_labels[j])
+        ax.set_ylabel("Density")
+        ax.set_yscale("log")
+        ax.legend(fontsize=7)
+
+    fig.suptitle("Absolute pt residuals: pred − truth", y=1.01)
     fig.tight_layout()
     return fig
 
@@ -725,7 +1105,7 @@ def plot_jet_resolution(
         (pf_res[1], r"Jet $\Delta\eta$",          np.linspace(-0.2, 0.2, 50)),
         (pf_res[2], r"Jet $\Delta\phi$",           np.linspace(-0.2, 0.2, 50)),
         (pf_nc,     "Jet # Constituents",           None),
-        (pf_res[0], r"Jet $p_T$ residual",         np.linspace(-0.15, 0.15, 50)),
+        (pf_res[0], r"Jet $p_T$ residual",         np.linspace(-1.0, 4.0, 110)),
     ]
 
     for idx, (d, xlabel, bins) in enumerate(configs):
@@ -737,23 +1117,28 @@ def plot_jet_resolution(
             continue
 
         b = bins if bins is not None else np.arange(d.min() - 0.5, d.max() + 1.5)
-        ax.hist(d, bins=b, histtype="stepfilled", alpha=0.5, density=True,
+        hist_density = idx != 3
+        ax.hist(d, bins=b, histtype="stepfilled", alpha=0.5, density=hist_density,
                 label=rf"PFlow  $\mu$={np.nanmean(d):.3f}, IQR={iqr(d):.3f}")
 
         if has_proxy:
             pr_d = [pr_res[1], pr_res[2], pr_nc, pr_res[0]][idx]
             if len(pr_d) > 0:
-                ax.hist(pr_d, bins=b, histtype="step", density=True,
+                ax.hist(pr_d, bins=b, histtype="step", density=hist_density,
                         label=rf"Proxy  $\mu$={np.nanmean(pr_d):.3f}, IQR={iqr(pr_d):.3f}")
 
         if idx == 2 and len(tr_nc) > 0:
             ax.hist(tr_nc, bins=b, histtype="stepfilled", alpha=0.4, color="orange", density=True,
                     label=rf"Truth  $\mu$={np.nanmean(tr_nc):.3f}, IQR={iqr(tr_nc):.3f}")
 
+        if idx == 3:
+            ax.set_yscale("log")
         ylo, yhi = ax.get_ylim()
+        if idx == 3:
+            ylo = max(ylo, 1e-4)
         ax.set_ylim(ylo, yhi * 1.35)
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("Density")
+        ax.set_ylabel("Count" if idx == 3 else "Density")
         ax.legend(fontsize=8, loc="upper right")
 
     fig.suptitle("Jet resolution")
@@ -963,6 +1348,95 @@ def plot_incidence_diff(
     return fig
 
 
+def plot_pileup_token_incidence_value_hist(
+    data: dict,
+    pileup_row: int = 0,
+    bins: int = 100,
+) -> plt.Figure | None:
+    """Histogram of incidence values for pileup token row: prediction vs truth."""
+    pred_all = data.get("pflow_incidence_filtered")
+    if pred_all is None:
+        pred_all = data.get("pflow_incidence")
+    truth_all = data.get("truth_incidence")
+
+    if pred_all is None or truth_all is None:
+        return None
+
+    pred_arr = np.asarray(pred_all, dtype=np.float32)
+    truth_arr = np.asarray(truth_all, dtype=np.float32)
+    if pred_arr.ndim != 3 or truth_arr.ndim != 3:
+        return None
+    if pileup_row < 0 or pileup_row >= pred_arr.shape[1] or pileup_row >= truth_arr.shape[1]:
+        return None
+
+    pred_row = pred_arr[:, pileup_row, :]
+    truth_row = truth_arr[:, pileup_row, :]
+
+    # Project truth into pred node space when needed (5500 -> 1400).
+    if truth_row.shape[1] != pred_row.shape[1]:
+        reco_idx = data.get("reco_node_indices")
+        if reco_idx is not None:
+            reco_idx = np.asarray(reco_idx, dtype=np.int64)
+            if reco_idx.ndim == 2 and reco_idx.shape[0] == truth_row.shape[0] and reco_idx.shape[1] == pred_row.shape[1]:
+                max_node = truth_row.shape[1] - 1
+                safe_idx = np.clip(reco_idx, 0, max_node)
+                truth_row = np.take_along_axis(truth_row, safe_idx, axis=1)
+                invalid_idx = (reco_idx < 0) | (reco_idx > max_node)
+                truth_row[invalid_idx] = 0.0
+            else:
+                min_nodes = min(truth_row.shape[1], pred_row.shape[1])
+                truth_row = truth_row[:, :min_nodes]
+                pred_row = pred_row[:, :min_nodes]
+        else:
+            min_nodes = min(truth_row.shape[1], pred_row.shape[1])
+            truth_row = truth_row[:, :min_nodes]
+            pred_row = pred_row[:, :min_nodes]
+
+    pred_vals = pred_row.reshape(-1)
+    truth_vals = truth_row.reshape(-1)
+    pred_vals = pred_vals[np.isfinite(pred_vals)]
+    truth_vals = truth_vals[np.isfinite(truth_vals)]
+    if pred_vals.size == 0 and truth_vals.size == 0:
+        return None
+
+    max_val = 1.0
+    if pred_vals.size:
+        max_val = max(max_val, float(np.percentile(pred_vals, 99.9)))
+    if truth_vals.size:
+        max_val = max(max_val, float(np.percentile(truth_vals, 99.9)))
+    max_val = max(1e-6, max_val)
+
+    hist_bins = np.linspace(0.0, max_val, int(bins) + 1)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    if truth_vals.size:
+        ax.hist(
+            truth_vals,
+            bins=hist_bins,
+            histtype="step",
+            linewidth=1.8,
+            density=True,
+            label=f"Truth (mean={truth_vals.mean():.3g})",
+        )
+    if pred_vals.size:
+        ax.hist(
+            pred_vals,
+            bins=hist_bins,
+            histtype="step",
+            linewidth=1.8,
+            density=True,
+            label=f"Pred (mean={pred_vals.mean():.3g})",
+        )
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Incidence value")
+    ax.set_ylabel("Density")
+    ax.set_title(f"Pileup token incidence distribution (row={pileup_row})")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
 def plot_incidence_track_match(
     data: dict,
     idx: int = 0,
@@ -1145,9 +1619,13 @@ def run_reco_analysis(
     print("Particle-level plots…")
     _plot("reco_analysis/class_distribution",   plot_class_distribution,   data, ind_threshold)
     _plot("reco_analysis/n_particles",           plot_n_particles,          data, ind_threshold)
+    _plot("reco_analysis/n_particles_by_pt_bin", plot_n_particles_by_pt_bin, data, ind_threshold)
     _plot("reco_analysis/feature_distributions", plot_feature_distributions, data, ind_threshold)
     _plot("reco_analysis/feature_scatter",       plot_feature_scatter,      data, ind_threshold)
     _plot("reco_analysis/ptetaphi_residuals",    plot_ptetaphi_residuals,   data, ind_threshold)
+    _plot("reco_analysis/pt_residual_absolute",  plot_pt_residual_absolute, data, ind_threshold)
+    _plot("reco_analysis/extra_particles_pt1to2", plot_extra_particles_pt_bin_diagnostics, data, ind_threshold, 1.0, 2.0)
+    _plot("reco_analysis/pileup_token_incidence_value_hist", plot_pileup_token_incidence_value_hist, data)
     _plot("reco_analysis/incidence_heatmap",     plot_incidences,           data, 0, ind_threshold)
     _plot("reco_analysis/incidence_diff",        plot_incidence_diff,       data, 0, ind_threshold)
     _plot("reco_analysis/incidence_track_match", plot_incidence_track_match, data, 0)
