@@ -57,6 +57,7 @@ class TwoStreamMaskFormer(nn.Module):
         calo_pred_threshold: float = 0.2,
         reco_calo_noise_mean: int = 300,
         reco_calo_noise_std: float = 50.0,
+        reco_track_noise_mean: int = 15,
         reco_debug_use_truth_masks: bool = False,
     ):
         super().__init__()
@@ -99,6 +100,7 @@ class TwoStreamMaskFormer(nn.Module):
         self.calo_pred_threshold = calo_pred_threshold
         self.reco_calo_noise_mean = reco_calo_noise_mean
         self.reco_calo_noise_std = reco_calo_noise_std
+        self.reco_track_noise_mean = reco_track_noise_mean
         # Debug-only toggle: in inference, use truth masks for Stream C filtering.
         self.reco_debug_use_truth_masks = reco_debug_use_truth_masks
 
@@ -274,6 +276,22 @@ class TwoStreamMaskFormer(nn.Module):
         if self.training and self.teacher_forcing and targets is not None:
             # Training teacher-forcing path: truth masks + sampled predicted residual PU.
             reco_track_mask = targets["tracks_mask"].bool() & is_track
+
+            # Sample extra FP tracks from pred, mirroring calo noise logic.
+            pred_track_logits = track_outputs["final"]["mask"]["pflow_node_logit"]  # (B, 1, N)
+            pred_track_mask = (pred_track_logits.squeeze(1).sigmoid() >= 0.5) & is_track
+            extra_pred_tracks = pred_track_mask & ~reco_track_mask
+            n_track_sample = min(self.reco_track_noise_mean, is_track.shape[1])
+            track_noise_scores = torch.where(
+                extra_pred_tracks,
+                torch.rand(batch_size, is_track.shape[1], device=device),
+                torch.full((batch_size, is_track.shape[1]), -1.0, device=device),
+            )
+            _, track_sample_idx = track_noise_scores.topk(n_track_sample, dim=-1)
+            sampled_extra_tracks = torch.zeros_like(extra_pred_tracks)
+            sampled_extra_tracks.scatter_(1, track_sample_idx, True)
+            sampled_extra_tracks = sampled_extra_tracks & extra_pred_tracks
+            reco_track_mask = reco_track_mask | sampled_extra_tracks
 
             calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
             calo_hs_energy = targets["calo_hard_scatter_energy"]

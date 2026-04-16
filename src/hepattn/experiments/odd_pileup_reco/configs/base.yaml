@@ -270,6 +270,7 @@ model:
       calo_pred_threshold: 0.2
       reco_calo_noise_mean: 300
       reco_calo_noise_std: 50.0
+      reco_track_noise_mean: 15
 
       reco_decoder:
         class_path: hepattn.models.decoder.MaskFormerDecoder
@@ -316,7 +317,7 @@ model:
                     activation: torch.nn.SiLU
                     output_size: 6
                     hidden_layers: [128, 64, 32]
-                null_weight: 0.5
+                null_weight: 0.8
                 loss_class_weights: [1.0, 3.0, 8.0, 1.5, 1.0]
                 mask_queries: false
                 has_intermediate_loss: true
