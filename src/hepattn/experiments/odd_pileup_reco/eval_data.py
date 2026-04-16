@@ -248,6 +248,26 @@ def _load_reco(f: h5py.File, event_sel: EventSelector) -> dict:
             reco_node_valid[invalid_idx] = False
             reco_data["reco_node_valid"] = reco_node_valid
 
+    # Optional raw node-level fields in full 5500-node space.
+    # These are used by reco-analysis diagnostics that cluster jets from
+    # calorimeter clusters (valid non-track nodes, including pileup).
+    if "node_metadata" in f:
+        nm = f["node_metadata"]
+        if "node_valid" in nm.dtype.names:
+            reco_data["node_valid"] = _read_struct_field(nm, "node_valid", bool, event_sel)
+        if "node_is_track" in nm.dtype.names:
+            reco_data["node_is_track"] = _read_struct_field(nm, "node_is_track", bool, event_sel)
+        if "node_eta" in nm.dtype.names:
+            reco_data["node_eta"] = _read_struct_field(nm, "node_eta", np.float32, event_sel)
+        if "node_phi" in nm.dtype.names:
+            reco_data["node_phi"] = _read_struct_field(nm, "node_phi", np.float32, event_sel)
+        if "node_e" in nm.dtype.names:
+            reco_data["node_e"] = _read_struct_field(nm, "node_e", np.float32, event_sel)
+        if "calo_hs_energy" in nm.dtype.names:
+            reco_data["calo_hs_energy"] = _read_struct_field(nm, "calo_hs_energy", np.float32, event_sel)
+        if "node_pt" in nm.dtype.names:
+            reco_data["node_pt"] = _read_struct_field(nm, "node_pt", np.float32, event_sel)
+
     return reco_data
 
 
@@ -412,6 +432,7 @@ def run_forward_pass(
     devices: int | str | list[int] | None = None,
     precision: str | int | None = None,
     inference_mode: bool | None = None,
+    reco_debug_use_truth_masks: bool = False,
     test_suff: str = "",
 ) -> Path:
     """Run Lightning test step with PflowPredictionWriter, return H5 path.
@@ -432,6 +453,8 @@ def run_forward_pass(
     accelerator : Lightning accelerator override (defaults to config trainer.accelerator)
     devices : Lightning devices override (defaults to config trainer.devices)
     precision : Lightning precision override (defaults to config trainer.precision)
+    reco_debug_use_truth_masks : if True, use truth masks (oracle) for Stream C
+        reconstruction filtering during inference. Default is False.
     test_suff : suffix appended to output file name
 
     Returns
@@ -498,6 +521,10 @@ def run_forward_pass(
 
     # Load model
     model = ODDPFlowTwoStream.load_from_checkpoint(str(ckpt_path), map_location="cpu")
+    if hasattr(model, "model") and hasattr(model.model, "reco_debug_use_truth_masks"):
+        model.model.reco_debug_use_truth_masks = bool(reco_debug_use_truth_masks)
+    elif reco_debug_use_truth_masks:
+        print("Warning: model does not expose reco_debug_use_truth_masks; running default inference masks")
 
     # Create prediction writer callback
     writer = PflowPredictionWriter()

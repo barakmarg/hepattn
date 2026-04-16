@@ -42,6 +42,7 @@ from matplotlib.colors import ListedColormap, LogNorm
 NUM_CLASSES = 6
 CLASS_LABELS = ["Ch Had", r"$e$", r"$\mu$", "Neu Had", r"$\gamma$", "null"]
 CLASS_COLORS = ["red", "blue", "green", "orange", "purple"]
+JET_RESOLUTION_PT_BINS = (10.0, 20.0, 30.0, 60.0, 100.0, np.inf)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -125,6 +126,13 @@ def load_pflow_data(
         # -- Reco-node mapping + metadata --
         reco_node_indices = None
         reco_is_track = None
+        node_valid = None
+        node_is_track = None
+        node_eta = None
+        node_phi = None
+        node_e = None
+        calo_hs_energy = None
+        node_pt = None
         if "reco_node_indices" in f:
             idx_ds = f["reco_node_indices"]
             idx_field = idx_ds.dtype.names[0] if idx_ds.dtype.names else None
@@ -143,6 +151,37 @@ def load_pflow_data(
                 reco_is_track = np.take_along_axis(node_is_track, safe_idx, axis=1)
                 invalid_idx = (reco_node_indices < 0) | (reco_node_indices > max_node)
                 reco_is_track[invalid_idx] = False
+
+        if "node_metadata" in f:
+            nm = f["node_metadata"]
+            if "node_valid" in nm.dtype.names:
+                node_valid = nm["node_valid"][sel].astype(bool)
+                if node_valid.ndim == 3 and node_valid.shape[-1] == 1:
+                    node_valid = node_valid[..., 0]
+            if "node_is_track" in nm.dtype.names:
+                node_is_track = nm["node_is_track"][sel].astype(bool)
+                if node_is_track.ndim == 3 and node_is_track.shape[-1] == 1:
+                    node_is_track = node_is_track[..., 0]
+            if "node_eta" in nm.dtype.names:
+                node_eta = nm["node_eta"][sel].astype(np.float32)
+                if node_eta.ndim == 3 and node_eta.shape[-1] == 1:
+                    node_eta = node_eta[..., 0]
+            if "node_phi" in nm.dtype.names:
+                node_phi = nm["node_phi"][sel].astype(np.float32)
+                if node_phi.ndim == 3 and node_phi.shape[-1] == 1:
+                    node_phi = node_phi[..., 0]
+            if "node_e" in nm.dtype.names:
+                node_e = nm["node_e"][sel].astype(np.float32)
+                if node_e.ndim == 3 and node_e.shape[-1] == 1:
+                    node_e = node_e[..., 0]
+            if "calo_hs_energy" in nm.dtype.names:
+                calo_hs_energy = nm["calo_hs_energy"][sel].astype(np.float32)
+                if calo_hs_energy.ndim == 3 and calo_hs_energy.shape[-1] == 1:
+                    calo_hs_energy = calo_hs_energy[..., 0]
+            if "node_pt" in nm.dtype.names:
+                node_pt = nm["node_pt"][sel].astype(np.float32)
+                if node_pt.ndim == 3 and node_pt.shape[-1] == 1:
+                    node_pt = node_pt[..., 0]
 
         # -- Incidence --
         pflow_incidence = truth_incidence = pflow_incidence_filtered = None
@@ -186,6 +225,13 @@ def load_pflow_data(
         "truth_incidence":  truth_incidence,
         "reco_node_indices": reco_node_indices,
         "reco_is_track": reco_is_track,
+        "node_valid": node_valid,
+        "node_is_track": node_is_track,
+        "node_eta": node_eta,
+        "node_phi": node_phi,
+        "node_e": node_e,
+        "calo_hs_energy": calo_hs_energy,
+        "node_pt": node_pt,
     }
 
 
@@ -218,6 +264,13 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
     truth_incidence = reco_data.get("truth_incidence")
     reco_node_indices = reco_data.get("reco_node_indices")
     reco_is_track = reco_data.get("reco_is_track")
+    node_valid = reco_data.get("node_valid")
+    node_is_track = reco_data.get("node_is_track")
+    node_eta = reco_data.get("node_eta")
+    node_phi = reco_data.get("node_phi")
+    node_e = reco_data.get("node_e")
+    calo_hs_energy = reco_data.get("calo_hs_energy")
+    node_pt = reco_data.get("node_pt")
 
     return {
         "pflow_class":     pred_class,
@@ -235,6 +288,13 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
         "truth_incidence": truth_incidence,
         "reco_node_indices": reco_node_indices,
         "reco_is_track": reco_is_track,
+        "node_valid": node_valid,
+        "node_is_track": node_is_track,
+        "node_eta": node_eta,
+        "node_phi": node_phi,
+        "node_e": node_e,
+        "calo_hs_energy": calo_hs_energy,
+        "node_pt": node_pt,
     }
 
 
@@ -338,18 +398,44 @@ def plot_class_distribution(data: dict, ind_threshold: float = 0.5) -> plt.Figur
     """Histogram of particle class index (truth vs PFlow)."""
     truth_flat  = data["truth_class"].ravel()
     pflow_flat  = data["pflow_class"].ravel()
-    truth_ind   = data["truth_indicator"].ravel()
-    pflow_ind   = data["pflow_indicator"].ravel()
+
+    truth_cls = truth_flat.astype(np.int64, copy=False)
+    pflow_cls = pflow_flat.astype(np.int64, copy=False)
+    truth_valid = (truth_cls >= 0) & (truth_cls < NUM_CLASSES)
+    pflow_valid = (pflow_cls >= 0) & (pflow_cls < NUM_CLASSES)
+
+    truth_counts = np.bincount(truth_cls[truth_valid], minlength=NUM_CLASSES)
+    pflow_counts = np.bincount(pflow_cls[pflow_valid], minlength=NUM_CLASSES)
+
+    truth_total = max(int(truth_counts.sum()), 1)
+    pflow_total = max(int(pflow_counts.sum()), 1)
+    truth_density = truth_counts / truth_total
+    pflow_density = pflow_counts / pflow_total
 
     fig, ax = plt.subplots(figsize=(7, 4))
     bins = np.arange(-0.5, NUM_CLASSES + 0.5)
-    ax.hist(truth_flat[truth_ind > ind_threshold], bins=bins,
+    # Use all slots so the null class is visible in the distribution.
+    ax.hist(truth_flat, bins=bins,
             histtype="stepfilled", alpha=0.5, label="Truth", density=True)
-    ax.hist(pflow_flat[pflow_ind > ind_threshold], bins=bins,
+    ax.hist(pflow_flat, bins=bins,
             histtype="step", label="PFlow", density=True)
+
+    y_peak = np.maximum(truth_density, pflow_density)
+    y_offset = max(float(y_peak.max()) * 0.03, 0.01)
+    for i in range(NUM_CLASSES):
+        ax.text(
+            i,
+            float(y_peak[i]) + y_offset,
+            f"T:{int(truth_counts[i]):,}\nP:{int(pflow_counts[i]):,}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
     ax.set_xlabel("Class")
-    ax.set_xticks(np.arange(NUM_CLASSES - 1))
-    ax.set_xticklabels(CLASS_LABELS[:-1])
+    ax.set_xticks(np.arange(NUM_CLASSES))
+    ax.set_xticklabels(CLASS_LABELS)
+    ax.set_ylim(top=max(float(y_peak.max()) * 1.35, 0.1))
     ax.legend()
     ax.set_title("Particle class distribution")
     fig.tight_layout()
@@ -595,6 +681,586 @@ def plot_extra_particles_pt_bin_diagnostics(
         ),
         y=1.02,
     )
+    fig.tight_layout()
+    return fig
+
+
+def plot_zero_bin_diagnostics(
+    data: dict,
+    ind_threshold: float = 0.5,
+    eta_zero_width: float = 0.05,
+    phi_zero_width: float = 0.05,
+) -> plt.Figure:
+    """Focused diagnostics for the (eta, phi) ~ (0, 0) spike.
+
+    Splits predicted-valid particles into:
+    - matched: predicted-valid and truth-valid in the same query slot
+    - extra/residual: predicted-valid but truth-invalid in the same query slot
+    """
+
+    pred_valid = data["pflow_indicator"] > ind_threshold
+    truth_valid = data["truth_indicator"] > ind_threshold
+    pred_pt = data["pflow_ptetaphi"][..., 0]
+    pred_eta = data["pflow_ptetaphi"][..., 1]
+    pred_phi = normalize_phi(data["pflow_ptetaphi"][..., 2])
+    pred_cls = data["pflow_class"]
+
+    is_extra = pred_valid & (~truth_valid)
+    is_matched = pred_valid & truth_valid
+
+    zero_peak = pred_valid & (np.abs(pred_eta) < eta_zero_width) & (np.abs(pred_phi) < phi_zero_width)
+    zero_peak_extra = zero_peak & is_extra
+    zero_peak_matched = zero_peak & is_matched
+    exact_zero = pred_valid & (pred_eta == 0.0) & (pred_phi == 0.0)
+
+    def _safe_ratio(num: int, den: int) -> float:
+        return float(num) / float(den) if den > 0 else 0.0
+
+    n_pred = int(pred_valid.sum())
+    n_extra = int(is_extra.sum())
+    n_matched = int(is_matched.sum())
+    n_zero = int(zero_peak.sum())
+    n_zero_extra = int(zero_peak_extra.sum())
+    n_zero_matched = int(zero_peak_matched.sum())
+    n_exact_zero = int(exact_zero.sum())
+
+    evt_zero = zero_peak.sum(axis=1)
+    evt_zero_extra = zero_peak_extra.sum(axis=1)
+    evt_zero_matched = zero_peak_matched.sum(axis=1)
+
+    incidence = data.get("pflow_incidence_filtered")
+    if incidence is None:
+        incidence = data.get("pflow_incidence")
+
+    has_inc = incidence is not None and incidence.ndim == 3
+    if has_inc:
+        inc_sum = incidence.sum(axis=-1)
+        inc_max = incidence.max(axis=-1)
+
+    fig, axes = plt.subplots(3, 3, figsize=(16, 14))
+
+    eta_bins = np.linspace(-0.3, 0.3, 80)
+    axes[0, 0].hist(pred_eta[is_matched], bins=eta_bins, histtype="step", linewidth=1.8, label="Matched")
+    axes[0, 0].hist(pred_eta[is_extra], bins=eta_bins, histtype="step", linewidth=1.8, label="Extra/Residual")
+    axes[0, 0].set_title("Pred eta near zero (split by matched/extra)")
+    axes[0, 0].set_xlabel("eta")
+    axes[0, 0].set_ylabel("Count")
+    axes[0, 0].legend()
+
+    phi_bins = np.linspace(-0.3, 0.3, 80)
+    axes[0, 1].hist(pred_phi[is_matched], bins=phi_bins, histtype="step", linewidth=1.8, label="Matched")
+    axes[0, 1].hist(pred_phi[is_extra], bins=phi_bins, histtype="step", linewidth=1.8, label="Extra/Residual")
+    axes[0, 1].set_title("Pred phi near zero (split by matched/extra)")
+    axes[0, 1].set_xlabel("phi [rad]")
+    axes[0, 1].set_ylabel("Count")
+    axes[0, 1].legend()
+
+    class_ids = np.arange(NUM_CLASSES)
+    zp_cls_extra = pred_cls[zero_peak_extra]
+    zp_cls_matched = pred_cls[zero_peak_matched]
+    counts_extra = np.array([(zp_cls_extra == k).sum() for k in class_ids])
+    counts_matched = np.array([(zp_cls_matched == k).sum() for k in class_ids])
+    axes[0, 2].bar(class_ids - 0.2, counts_matched, width=0.4, label="Matched")
+    axes[0, 2].bar(class_ids + 0.2, counts_extra, width=0.4, label="Extra/Residual")
+    axes[0, 2].set_xticks(class_ids)
+    axes[0, 2].set_xticklabels(CLASS_LABELS, rotation=30)
+    axes[0, 2].set_title("Zero-peak class composition")
+    axes[0, 2].set_ylabel("Count")
+    axes[0, 2].legend()
+
+    valid_pt = pred_pt[pred_valid]
+    pt_hi = float(np.percentile(valid_pt, 99.5)) if valid_pt.size > 0 else 1.0
+    pt_bins = np.linspace(0.0, max(1.0, pt_hi), 80)
+    axes[1, 0].hist(pred_pt[zero_peak_matched], bins=pt_bins, histtype="step", linewidth=1.8, label="Matched")
+    axes[1, 0].hist(pred_pt[zero_peak_extra], bins=pt_bins, histtype="step", linewidth=1.8, label="Extra/Residual")
+    axes[1, 0].set_title("Zero-peak pt distribution")
+    axes[1, 0].set_xlabel("pt [GeV]")
+    axes[1, 0].set_ylabel("Count")
+    axes[1, 0].set_yscale("log")
+    axes[1, 0].legend()
+
+    max_evt_zero = int(max(evt_zero.max(), 1)) if evt_zero.size > 0 else 1
+    ev_bins = np.arange(0, max_evt_zero + 2) - 0.5
+    axes[1, 1].hist(evt_zero, bins=ev_bins, histtype="step", linewidth=1.8, label="All zero-peak")
+    axes[1, 1].hist(evt_zero_matched, bins=ev_bins, histtype="step", linewidth=1.8, label="Matched zero-peak")
+    axes[1, 1].hist(evt_zero_extra, bins=ev_bins, histtype="step", linewidth=1.8, label="Extra zero-peak")
+    axes[1, 1].set_title("Zero-peak particles per event")
+    axes[1, 1].set_xlabel("Count / event")
+    axes[1, 1].set_ylabel("Events")
+    axes[1, 1].legend()
+
+    axes[1, 2].scatter(pred_phi[zero_peak_matched], pred_eta[zero_peak_matched], s=8, alpha=0.35, label="Matched")
+    axes[1, 2].scatter(pred_phi[zero_peak_extra], pred_eta[zero_peak_extra], s=8, alpha=0.35, label="Extra/Residual")
+    axes[1, 2].axvline(0.0, color="k", linewidth=1.0, alpha=0.7)
+    axes[1, 2].axhline(0.0, color="k", linewidth=1.0, alpha=0.7)
+    axes[1, 2].set_xlim(-phi_zero_width * 1.2, phi_zero_width * 1.2)
+    axes[1, 2].set_ylim(-eta_zero_width * 1.2, eta_zero_width * 1.2)
+    axes[1, 2].set_title("Zero-peak eta-phi cloud")
+    axes[1, 2].set_xlabel("phi [rad]")
+    axes[1, 2].set_ylabel("eta")
+    axes[1, 2].legend()
+
+    if has_inc:
+        axes[2, 0].hist(inc_max[is_extra], bins=np.linspace(0, 1, 80), histtype="step", linewidth=1.8, label="All extra")
+        axes[2, 0].hist(inc_max[zero_peak_extra], bins=np.linspace(0, 1, 80), histtype="step", linewidth=1.8, label="Zero-peak extra")
+        axes[2, 0].set_title("Max incidence: extra vs zero-peak extra")
+        axes[2, 0].set_xlabel("max incidence")
+        axes[2, 0].set_ylabel("Count")
+        axes[2, 0].legend()
+    else:
+        axes[2, 0].text(0.5, 0.5, "pflow_incidence unavailable", ha="center", va="center", transform=axes[2, 0].transAxes)
+        axes[2, 0].set_title("Max incidence diagnostics")
+
+    if has_inc:
+        x_hi = np.percentile(inc_sum[is_extra], 99.5) if is_extra.any() else 1.0
+        s_bins = np.linspace(0, max(1.0, float(x_hi)), 80)
+        axes[2, 1].hist(inc_sum[is_extra], bins=s_bins, histtype="step", linewidth=1.8, label="All extra")
+        axes[2, 1].hist(inc_sum[zero_peak_extra], bins=s_bins, histtype="step", linewidth=1.8, label="Zero-peak extra")
+        axes[2, 1].set_title("Sum incidence: extra vs zero-peak extra")
+        axes[2, 1].set_xlabel("sum incidence")
+        axes[2, 1].set_ylabel("Count")
+        axes[2, 1].legend()
+    else:
+        axes[2, 1].text(0.5, 0.5, "pflow_incidence unavailable", ha="center", va="center", transform=axes[2, 1].transAxes)
+        axes[2, 1].set_title("Sum incidence diagnostics")
+
+    summary_lines = [
+        f"n_pred_valid={n_pred}",
+        f"n_extra={n_extra} ({_safe_ratio(n_extra, n_pred):.3%})",
+        f"n_matched={n_matched}",
+        f"n_zero_peak={n_zero}",
+        f"n_zero_peak_extra={n_zero_extra} ({_safe_ratio(n_zero_extra, n_zero):.3%} of zero peak)",
+        f"n_zero_peak_matched={n_zero_matched}",
+        f"n_exact_eta_phi_zero={n_exact_zero}",
+        f"window: |eta|<{eta_zero_width}, |phi|<{phi_zero_width}",
+    ]
+    axes[2, 2].axis("off")
+    axes[2, 2].text(0.02, 0.98, "\n".join(summary_lines), va="top", ha="left", family="monospace")
+    axes[2, 2].set_title("Zero-bin summary")
+
+    fig.suptitle("Diagnostics for eta/phi zero-bin peak (excluding invalid/padded particles)")
+    fig.tight_layout()
+    return fig
+
+
+def plot_fp_neu_hadron_diagnostics(
+    data: dict,
+    ind_threshold: float = 0.5,
+    incidence_threshold: float = 1e-3,
+    neu_had_class: int = 3,
+) -> plt.Figure:
+    """Diagnose false-positive neutral-hadron predictions.
+
+    FP Neu Had definition:
+    - predicted-valid and predicted class == ``neu_had_class``
+    - NOT (truth-valid and truth class == ``neu_had_class``)
+    """
+
+    pred_cls = data["pflow_class"].astype(np.int64)
+    truth_cls = data["truth_class"].astype(np.int64)
+    pred_valid = data["pflow_indicator"] > ind_threshold
+    truth_valid = data["truth_indicator"] > ind_threshold
+
+    pred_pt = data["pflow_ptetaphi"][..., 0]
+    pred_eta = data["pflow_ptetaphi"][..., 1]
+    pred_phi = normalize_phi(data["pflow_ptetaphi"][..., 2])
+
+    is_pred_neu = pred_valid & (pred_cls == int(neu_had_class))
+    is_truth_neu = truth_valid & (truth_cls == int(neu_had_class))
+    is_fp_neu = is_pred_neu & (~is_truth_neu)
+    is_tp_neu = is_pred_neu & is_truth_neu
+
+    n_pred_neu = int(is_pred_neu.sum())
+    n_fp = int(is_fp_neu.sum())
+    n_tp = int(is_tp_neu.sum())
+    fp_rate = (100.0 * n_fp / n_pred_neu) if n_pred_neu > 0 else 0.0
+
+    fig, axes = plt.subplots(3, 3, figsize=(16, 14))
+
+    # -- Truth-source composition for FP neutral hadrons --
+    fp_truth_cls = truth_cls[is_fp_neu]
+    fp_truth_valid = truth_valid[is_fp_neu]
+    valid_truth_cls = fp_truth_cls[(fp_truth_cls >= 0) & (fp_truth_cls < NUM_CLASSES)]
+    counts = np.bincount(valid_truth_cls, minlength=NUM_CLASSES)
+
+    x = np.arange(NUM_CLASSES)
+    axes[0, 0].bar(x, counts)
+    axes[0, 0].set_xticks(x)
+    axes[0, 0].set_xticklabels(CLASS_LABELS, rotation=25)
+    axes[0, 0].set_ylabel("Count")
+    axes[0, 0].set_title("Truth class composition inside FP Neu Had")
+
+    n_fp_truth_invalid = int((~fp_truth_valid).sum()) if fp_truth_valid.size > 0 else 0
+    axes[0, 0].text(
+        0.02,
+        0.98,
+        (
+            f"FP count: {n_fp}\n"
+            f"truth-valid among FP: {n_fp - n_fp_truth_invalid}\n"
+            f"truth-invalid among FP: {n_fp_truth_invalid}"
+        ),
+        transform=axes[0, 0].transAxes,
+        va="top",
+        ha="left",
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+    )
+
+    # -- Event-level concentration --
+    fp_evt = is_fp_neu.sum(axis=1)
+    tp_evt = is_tp_neu.sum(axis=1)
+    fp_evt_max = int(fp_evt.max()) if fp_evt.size > 0 else 0
+    tp_evt_max = int(tp_evt.max()) if tp_evt.size > 0 else 0
+    max_evt = int(max(fp_evt_max, tp_evt_max, 1))
+    evt_bins = np.arange(0, max_evt + 2) - 0.5
+    axes[0, 1].hist(tp_evt, bins=evt_bins, histtype="step", linewidth=1.8, label="TP Neu Had / event")
+    axes[0, 1].hist(fp_evt, bins=evt_bins, histtype="step", linewidth=1.8, label="FP Neu Had / event")
+    axes[0, 1].set_xlabel("Count / event")
+    axes[0, 1].set_ylabel("Events")
+    axes[0, 1].set_title("Event-level FP concentration")
+    axes[0, 1].legend()
+
+    pred_evt = is_pred_neu.sum(axis=1)
+    fp_frac_evt = np.divide(fp_evt, pred_evt, out=np.zeros_like(fp_evt, dtype=np.float64), where=pred_evt > 0)
+    frac_bins = np.linspace(0.0, 1.0, 31)
+    axes[0, 2].hist(fp_frac_evt[pred_evt > 0], bins=frac_bins, histtype="stepfilled", alpha=0.65)
+    axes[0, 2].set_xlabel("FP fraction in predicted Neu Had (per event)")
+    axes[0, 2].set_ylabel("Events")
+    axes[0, 2].set_title("Per-event FP fraction")
+
+    # -- Kinematics: FP vs TP predicted neutral hadrons --
+    pred_neu_pt = pred_pt[is_pred_neu]
+    if pred_neu_pt.size > 0:
+        pt_hi = float(np.percentile(pred_neu_pt, 99.5))
+    else:
+        pt_hi = 1.0
+    pt_bins = np.linspace(0.0, max(1.0, pt_hi), 70)
+    axes[1, 0].hist(pred_pt[is_tp_neu], bins=pt_bins, histtype="step", linewidth=1.8, label="TP Neu Had")
+    axes[1, 0].hist(pred_pt[is_fp_neu], bins=pt_bins, histtype="step", linewidth=1.8, label="FP Neu Had")
+    axes[1, 0].set_xlabel("pred pt [GeV]")
+    axes[1, 0].set_ylabel("Count")
+    axes[1, 0].set_title("Predicted pt: FP vs TP Neu Had")
+    axes[1, 0].set_yscale("log")
+    axes[1, 0].legend()
+
+    eta_bins = np.linspace(-4.0, 4.0, 80)
+    axes[1, 1].hist(pred_eta[is_tp_neu], bins=eta_bins, histtype="step", linewidth=1.8, label="TP Neu Had")
+    axes[1, 1].hist(pred_eta[is_fp_neu], bins=eta_bins, histtype="step", linewidth=1.8, label="FP Neu Had")
+    axes[1, 1].set_xlabel("pred eta")
+    axes[1, 1].set_ylabel("Count")
+    axes[1, 1].set_title("Predicted eta: FP vs TP Neu Had")
+    axes[1, 1].legend()
+
+    phi_bins = np.linspace(-np.pi, np.pi, 80)
+    axes[1, 2].hist(pred_phi[is_tp_neu], bins=phi_bins, histtype="step", linewidth=1.8, label="TP Neu Had")
+    axes[1, 2].hist(pred_phi[is_fp_neu], bins=phi_bins, histtype="step", linewidth=1.8, label="FP Neu Had")
+    axes[1, 2].set_xlabel("pred phi [rad]")
+    axes[1, 2].set_ylabel("Count")
+    axes[1, 2].set_title("Predicted phi: FP vs TP Neu Had")
+    axes[1, 2].legend()
+
+    # -- Incidence signatures --
+    incidence = data.get("pflow_incidence_filtered")
+    if incidence is None:
+        incidence = data.get("pflow_incidence")
+    has_inc = incidence is not None and incidence.ndim == 3
+
+    if has_inc:
+        ev_fp, obj_fp = np.where(is_fp_neu)
+        ev_tp, obj_tp = np.where(is_tp_neu)
+        inc_fp = incidence[ev_fp, obj_fp, :] if ev_fp.size > 0 else np.zeros((0, incidence.shape[-1]))
+        inc_tp = incidence[ev_tp, obj_tp, :] if ev_tp.size > 0 else np.zeros((0, incidence.shape[-1]))
+
+        max_fp = inc_fp.max(axis=1) if inc_fp.size > 0 else np.array([])
+        max_tp = inc_tp.max(axis=1) if inc_tp.size > 0 else np.array([])
+        axes[2, 0].hist(max_tp, bins=np.linspace(0.0, 1.0, 70), histtype="step", linewidth=1.8, label="TP Neu Had")
+        axes[2, 0].hist(max_fp, bins=np.linspace(0.0, 1.0, 70), histtype="step", linewidth=1.8, label="FP Neu Had")
+        axes[2, 0].set_xlabel("max incidence")
+        axes[2, 0].set_ylabel("Particles")
+        axes[2, 0].set_title("Max incidence signature")
+        axes[2, 0].legend()
+
+        sum_fp = inc_fp.sum(axis=1) if inc_fp.size > 0 else np.array([])
+        sum_tp = inc_tp.sum(axis=1) if inc_tp.size > 0 else np.array([])
+        x_hi = float(np.percentile(np.concatenate([sum_fp, sum_tp]), 99.5)) if (sum_fp.size + sum_tp.size) > 0 else 1.0
+        sum_bins = np.linspace(0.0, max(1.0, x_hi), 70)
+        axes[2, 1].hist(sum_tp, bins=sum_bins, histtype="step", linewidth=1.8, label="TP Neu Had")
+        axes[2, 1].hist(sum_fp, bins=sum_bins, histtype="step", linewidth=1.8, label="FP Neu Had")
+        axes[2, 1].set_xlabel("sum incidence")
+        axes[2, 1].set_ylabel("Particles")
+        axes[2, 1].set_title("Incidence sum signature")
+        axes[2, 1].legend()
+
+        nlinks_fp = (inc_fp > float(incidence_threshold)).sum(axis=1) if inc_fp.size > 0 else np.array([])
+        nlinks_tp = (inc_tp > float(incidence_threshold)).sum(axis=1) if inc_tp.size > 0 else np.array([])
+        nlinks_fp_max = int(nlinks_fp.max()) if nlinks_fp.size > 0 else 0
+        nlinks_tp_max = int(nlinks_tp.max()) if nlinks_tp.size > 0 else 0
+        max_links = int(max(nlinks_fp_max, nlinks_tp_max, 1))
+        link_bins = np.arange(0, max_links + 2) - 0.5
+        axes[2, 2].hist(nlinks_tp, bins=link_bins, histtype="step", linewidth=1.8, label="TP Neu Had")
+        axes[2, 2].hist(nlinks_fp, bins=link_bins, histtype="step", linewidth=1.8, label="FP Neu Had")
+        axes[2, 2].set_xlabel(f"# links (> {incidence_threshold:g})")
+        axes[2, 2].set_ylabel("Particles")
+        axes[2, 2].set_title("Incidence occupancy")
+        axes[2, 2].legend()
+    else:
+        for k in range(3):
+            axes[2, k].text(0.5, 0.5, "Incidence data unavailable", ha="center", va="center", transform=axes[2, k].transAxes)
+            axes[2, k].set_title("Incidence diagnostics")
+
+    fig.suptitle(
+        (
+            "FP neutral-hadron diagnostics | "
+            f"pred_neu={n_pred_neu}, fp={n_fp} ({fp_rate:.2f}%), tp={n_tp}"
+        ),
+        y=1.02,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def plot_fp_neu_hadron_node_source(
+    data: dict,
+    ind_threshold: float = 0.5,
+    neu_had_class: int = 3,
+) -> plt.Figure:
+    """Node-source diagnostics for FP vs TP predicted neutral hadrons.
+
+    Uses incidence row weights to compare:
+    - track vs cluster weight fractions,
+    - dominant link type (track/cluster),
+    - weighted node-pt and node-energy per predicted particle.
+    """
+
+    pred_cls = data["pflow_class"].astype(np.int64)
+    truth_cls = data["truth_class"].astype(np.int64)
+    pred_valid = data["pflow_indicator"] > ind_threshold
+    truth_valid = data["truth_indicator"] > ind_threshold
+
+    is_pred_neu = pred_valid & (pred_cls == int(neu_had_class))
+    is_truth_neu = truth_valid & (truth_cls == int(neu_had_class))
+    is_fp_neu = is_pred_neu & (~is_truth_neu)
+    is_tp_neu = is_pred_neu & is_truth_neu
+
+    incidence = data.get("pflow_incidence_filtered")
+    if incidence is None:
+        incidence = data.get("pflow_incidence")
+    reco_is_track = data.get("reco_is_track")
+    node_pt = data.get("node_pt")
+    node_e = data.get("node_e")
+    reco_node_indices = data.get("reco_node_indices")
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+
+    has_inc = incidence is not None and incidence.ndim == 3
+    if not has_inc:
+        for ax in axes.ravel():
+            ax.text(0.5, 0.5, "Incidence data unavailable", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+        fig.suptitle("FP neutral-hadron node-source diagnostics")
+        fig.tight_layout()
+        return fig
+
+    inc_nodes = int(incidence.shape[-1])
+
+    def _align_node_space(arr: np.ndarray | None, fill_value: float = 0.0) -> np.ndarray | None:
+        """Align per-node arrays to incidence node space.
+
+        In pileup-reco H5, incidence may live in filtered node space (e.g. 1400),
+        while node features can still be in full node space (e.g. 5500).
+        When available, reco_node_indices maps filtered->full and is used to gather
+        the matching node features.
+        """
+        if arr is None or arr.ndim != 2:
+            return arr
+        if arr.shape[1] == inc_nodes:
+            return arr
+
+        if (
+            reco_node_indices is not None
+            and isinstance(reco_node_indices, np.ndarray)
+            and reco_node_indices.ndim == 2
+            and reco_node_indices.shape[1] == inc_nodes
+            and reco_node_indices.shape[0] == arr.shape[0]
+        ):
+            idx = reco_node_indices.astype(np.int64, copy=False)
+            max_idx = arr.shape[1] - 1
+            idx_clip = np.clip(idx, 0, max_idx)
+            out = np.take_along_axis(arr, idx_clip, axis=1)
+            invalid = (idx < 0) | (idx > max_idx)
+            if invalid.any():
+                out = out.copy()
+                out[invalid] = fill_value
+            return out
+
+        # Fallback for unexpected layouts: deterministic crop/pad to incidence width.
+        if arr.shape[1] > inc_nodes:
+            return arr[:, :inc_nodes]
+        pad = np.full((arr.shape[0], inc_nodes - arr.shape[1]), fill_value, dtype=arr.dtype)
+        return np.concatenate([arr, pad], axis=1)
+
+    reco_is_track = _align_node_space(reco_is_track, fill_value=0.0)
+    node_pt = _align_node_space(node_pt, fill_value=0.0)
+    node_e = _align_node_space(node_e, fill_value=0.0)
+
+    ev_fp, obj_fp = np.where(is_fp_neu)
+    ev_tp, obj_tp = np.where(is_tp_neu)
+    inc_fp = incidence[ev_fp, obj_fp, :] if ev_fp.size > 0 else np.zeros((0, incidence.shape[-1]))
+    inc_tp = incidence[ev_tp, obj_tp, :] if ev_tp.size > 0 else np.zeros((0, incidence.shape[-1]))
+
+    sum_fp = inc_fp.sum(axis=1) if inc_fp.size > 0 else np.array([])
+    sum_tp = inc_tp.sum(axis=1) if inc_tp.size > 0 else np.array([])
+
+    if reco_is_track is not None and reco_is_track.ndim == 2:
+        trk_fp = reco_is_track[ev_fp, :] if ev_fp.size > 0 else np.zeros((0, incidence.shape[-1]), dtype=bool)
+        trk_tp = reco_is_track[ev_tp, :] if ev_tp.size > 0 else np.zeros((0, incidence.shape[-1]), dtype=bool)
+        trk_fp = trk_fp.astype(bool, copy=False)
+        trk_tp = trk_tp.astype(bool, copy=False)
+
+        track_w_fp = (inc_fp * trk_fp).sum(axis=1) / np.clip(sum_fp, 1e-6, None) if inc_fp.size > 0 else np.array([])
+        track_w_tp = (inc_tp * trk_tp).sum(axis=1) / np.clip(sum_tp, 1e-6, None) if inc_tp.size > 0 else np.array([])
+        cluster_w_fp = 1.0 - track_w_fp
+        cluster_w_tp = 1.0 - track_w_tp
+
+        bins01 = np.linspace(0.0, 1.0, 50)
+        axes[0, 0].hist(track_w_tp, bins=bins01, histtype="step", linewidth=1.8, label="TP Neu Had")
+        axes[0, 0].hist(track_w_fp, bins=bins01, histtype="step", linewidth=1.8, label="FP Neu Had")
+        axes[0, 0].set_title("Track weight fraction")
+        axes[0, 0].set_xlabel("sum(incidence on tracks) / sum(incidence)")
+        axes[0, 0].set_ylabel("Particles")
+        axes[0, 0].legend()
+
+        axes[0, 1].hist(cluster_w_tp, bins=bins01, histtype="step", linewidth=1.8, label="TP Neu Had")
+        axes[0, 1].hist(cluster_w_fp, bins=bins01, histtype="step", linewidth=1.8, label="FP Neu Had")
+        axes[0, 1].set_title("Cluster weight fraction")
+        axes[0, 1].set_xlabel("sum(incidence on clusters) / sum(incidence)")
+        axes[0, 1].set_ylabel("Particles")
+        axes[0, 1].legend()
+
+        # Dominant link type
+        dom_fp = (trk_fp[np.arange(len(inc_fp)), np.argmax(inc_fp, axis=1)] > 0).astype(np.int64) if len(inc_fp) > 0 else np.array([], dtype=np.int64)
+        dom_tp = (trk_tp[np.arange(len(inc_tp)), np.argmax(inc_tp, axis=1)] > 0).astype(np.int64) if len(inc_tp) > 0 else np.array([], dtype=np.int64)
+        # 0=cluster, 1=track
+        vals_fp = np.bincount(dom_fp, minlength=2)
+        vals_tp = np.bincount(dom_tp, minlength=2)
+        xx = np.arange(2)
+        ww = 0.36
+        axes[0, 2].bar(xx - ww / 2, vals_tp, width=ww, label="TP Neu Had")
+        axes[0, 2].bar(xx + ww / 2, vals_fp, width=ww, label="FP Neu Had")
+        axes[0, 2].set_xticks(xx)
+        axes[0, 2].set_xticklabels(["Dominant cluster", "Dominant track"])
+        axes[0, 2].set_ylabel("Particles")
+        axes[0, 2].set_title("Dominant incidence link type")
+        axes[0, 2].legend()
+    else:
+        for k in range(3):
+            axes[0, k].text(0.5, 0.5, "reco_is_track unavailable", ha="center", va="center", transform=axes[0, k].transAxes)
+            axes[0, k].set_title("Track/cluster source")
+
+    # Weighted node features
+    if node_pt is not None and node_pt.ndim == 2:
+        node_pt_fp = node_pt[ev_fp, :] if ev_fp.size > 0 else np.zeros((0, incidence.shape[-1]))
+        node_pt_tp = node_pt[ev_tp, :] if ev_tp.size > 0 else np.zeros((0, incidence.shape[-1]))
+        wpt_fp = (inc_fp * node_pt_fp).sum(axis=1) / np.clip(sum_fp, 1e-6, None) if inc_fp.size > 0 else np.array([])
+        wpt_tp = (inc_tp * node_pt_tp).sum(axis=1) / np.clip(sum_tp, 1e-6, None) if inc_tp.size > 0 else np.array([])
+        pt_hi = float(np.percentile(np.concatenate([wpt_fp, wpt_tp]), 99.5)) if (wpt_fp.size + wpt_tp.size) > 0 else 1.0
+        pt_bins = np.linspace(0.0, max(1.0, pt_hi), 60)
+        axes[1, 0].hist(wpt_tp, bins=pt_bins, histtype="step", linewidth=1.8, label="TP Neu Had")
+        axes[1, 0].hist(wpt_fp, bins=pt_bins, histtype="step", linewidth=1.8, label="FP Neu Had")
+        axes[1, 0].set_xlabel("weighted node pt [GeV]")
+        axes[1, 0].set_ylabel("Particles")
+        axes[1, 0].set_title("Incidence-weighted node pt")
+        axes[1, 0].legend()
+    else:
+        axes[1, 0].text(0.5, 0.5, "node_pt unavailable", ha="center", va="center", transform=axes[1, 0].transAxes)
+        axes[1, 0].set_title("Incidence-weighted node pt")
+
+    if node_e is not None and node_e.ndim == 2:
+        node_e_fp = node_e[ev_fp, :] if ev_fp.size > 0 else np.zeros((0, incidence.shape[-1]))
+        node_e_tp = node_e[ev_tp, :] if ev_tp.size > 0 else np.zeros((0, incidence.shape[-1]))
+        we_fp = (inc_fp * node_e_fp).sum(axis=1) / np.clip(sum_fp, 1e-6, None) if inc_fp.size > 0 else np.array([])
+        we_tp = (inc_tp * node_e_tp).sum(axis=1) / np.clip(sum_tp, 1e-6, None) if inc_tp.size > 0 else np.array([])
+        e_hi = float(np.percentile(np.concatenate([we_fp, we_tp]), 99.5)) if (we_fp.size + we_tp.size) > 0 else 1.0
+        e_bins = np.linspace(0.0, max(1.0, e_hi), 60)
+        axes[1, 1].hist(we_tp, bins=e_bins, histtype="step", linewidth=1.8, label="TP Neu Had")
+        axes[1, 1].hist(we_fp, bins=e_bins, histtype="step", linewidth=1.8, label="FP Neu Had")
+        axes[1, 1].set_xlabel("weighted node energy [GeV]")
+        axes[1, 1].set_ylabel("Particles")
+        axes[1, 1].set_title("Incidence-weighted node energy")
+        axes[1, 1].legend()
+    else:
+        axes[1, 1].text(0.5, 0.5, "node_e unavailable", ha="center", va="center", transform=axes[1, 1].transAxes)
+        axes[1, 1].set_title("Incidence-weighted node energy")
+
+    n_fp = int(is_fp_neu.sum())
+    n_tp = int(is_tp_neu.sum())
+    n_pred = int(is_pred_neu.sum())
+    rate = (100.0 * n_fp / n_pred) if n_pred > 0 else 0.0
+    axes[1, 2].axis("off")
+    axes[1, 2].text(
+        0.03,
+        0.97,
+        (
+            f"pred Neu Had: {n_pred}\n"
+            f"FP Neu Had:   {n_fp} ({rate:.2f}%)\n"
+            f"TP Neu Had:   {n_tp}\n"
+            f"ind_threshold={ind_threshold}"
+        ),
+        transform=axes[1, 2].transAxes,
+        ha="left",
+        va="top",
+        family="monospace",
+    )
+    axes[1, 2].set_title("Summary")
+
+    fig.suptitle("FP neutral-hadron node-source diagnostics")
+    fig.tight_layout()
+    return fig
+
+
+def plot_class_histogram_all_events(
+    data: dict,
+    ind_threshold: float = 0.5,
+) -> plt.Figure:
+    """Truth vs prediction class histogram across all events and all query slots.
+
+    Includes the null class explicitly and also provides a valid-only comparison.
+    """
+
+    pred_cls = data["pflow_class"].astype(np.int64)
+    truth_cls = data["truth_class"].astype(np.int64)
+
+    pred_flat = pred_cls.reshape(-1)
+    truth_flat = truth_cls.reshape(-1)
+
+    class_ids = np.arange(NUM_CLASSES, dtype=np.int64)
+    pred_counts_all = np.array([(pred_flat == c).sum() for c in class_ids], dtype=np.int64)
+    truth_counts_all = np.array([(truth_flat == c).sum() for c in class_ids], dtype=np.int64)
+
+    pred_valid = (data["pflow_indicator"] > ind_threshold).reshape(-1)
+    truth_valid = (data["truth_indicator"] > ind_threshold).reshape(-1)
+    pred_counts_valid = np.array([(pred_flat[pred_valid] == c).sum() for c in class_ids], dtype=np.int64)
+    truth_counts_valid = np.array([(truth_flat[truth_valid] == c).sum() for c in class_ids], dtype=np.int64)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    x = np.arange(NUM_CLASSES)
+    w = 0.38
+
+    axes[0].bar(x - w / 2, truth_counts_all, width=w, label="Truth")
+    axes[0].bar(x + w / 2, pred_counts_all, width=w, label="Pred")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(CLASS_LABELS, rotation=25)
+    axes[0].set_ylabel("Count")
+    axes[0].set_title("Class histogram (all events, all slots, includes null)")
+    axes[0].legend()
+
+    axes[1].bar(x - w / 2, truth_counts_valid, width=w, label="Truth valid")
+    axes[1].bar(x + w / 2, pred_counts_valid, width=w, label="Pred valid")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(CLASS_LABELS, rotation=25)
+    axes[1].set_ylabel("Count")
+    axes[1].set_title("Class histogram (valid slots only)")
+    axes[1].legend()
+
     fig.tight_layout()
     return fig
 
@@ -983,6 +1649,138 @@ def cluster_jets(
     return jets
 
 
+def cluster_calo_jets(
+    data: dict,
+    jet_R: float = 0.7,
+    min_constituents: int = 3,
+    min_pt: float = 10.0,
+) -> dict | None:
+    """Cluster jets from raw calorimeter clusters (valid non-track nodes).
+
+    For calo clusters, transverse momentum is derived from raw cluster energy:
+    pt = E / cosh(eta).
+    """
+    try:
+        import fastjet  # noqa: F401
+    except ImportError as e:
+        raise ImportError("fastjet is required for jet clustering") from e
+
+    from tqdm import tqdm
+
+    required = ("node_valid", "node_is_track", "node_eta", "node_phi", "node_e")
+    if any(data.get(k) is None for k in required):
+        return None
+
+    node_valid = np.asarray(data["node_valid"]).astype(bool)
+    node_is_track = np.asarray(data["node_is_track"]).astype(bool)
+    node_eta = np.asarray(data["node_eta"]).astype(np.float32)
+    node_phi = np.asarray(data["node_phi"]).astype(np.float32)
+
+    if node_valid.ndim != 2 or node_is_track.ndim != 2 or node_eta.ndim != 2 or node_phi.ndim != 2:
+        return None
+
+    node_e = np.asarray(data["node_e"]).astype(np.float32)
+    node_pt = node_e / np.cosh(np.clip(node_eta, -10.0, 10.0))
+
+    if node_pt.ndim != 2 or node_e.ndim != 2:
+        return None
+
+    valid_cluster = (
+        node_valid
+        & (~node_is_track)
+        & np.isfinite(node_pt)
+        & np.isfinite(node_eta)
+        & np.isfinite(node_phi)
+        & (node_pt > 0)
+    )
+
+    n_events = node_valid.shape[0]
+    pt_l, eta_l, phi_l, m_l, nc_l = [], [], [], [], []
+    for i in tqdm(range(n_events), desc="Jets (calo)"):
+        ptetaphi = np.stack([node_pt[i], node_eta[i], node_phi[i]], axis=-1)
+        out = _cluster_jets_single(
+            ptetaphi,
+            valid_cluster[i],
+            0.5,
+            jet_R,
+            min_constituents,
+            min_pt,
+        )
+        pt_l.append(out[0]); eta_l.append(out[1]); phi_l.append(out[2])
+        m_l.append(out[3]);  nc_l.append(out[4])
+
+    return {
+        "calo_jet_pt": np.array(pt_l, dtype=object),
+        "calo_jet_eta": np.array(eta_l, dtype=object),
+        "calo_jet_phi": np.array(phi_l, dtype=object),
+        "calo_jet_mass": np.array(m_l, dtype=object),
+        "calo_jet_nconst": np.array(nc_l, dtype=object),
+    }
+
+
+def cluster_calo_hs_jets(
+    data: dict,
+    jet_R: float = 0.7,
+    min_constituents: int = 3,
+    min_pt: float = 10.0,
+) -> dict | None:
+    """Cluster calo jets using truth pileup-subtracted cluster energy (calo_hs_energy)."""
+    try:
+        import fastjet  # noqa: F401
+    except ImportError as e:
+        raise ImportError("fastjet is required for jet clustering") from e
+
+    from tqdm import tqdm
+
+    required = ("node_valid", "node_is_track", "node_eta", "node_phi", "calo_hs_energy")
+    if any(data.get(k) is None for k in required):
+        return None
+
+    node_valid = np.asarray(data["node_valid"]).astype(bool)
+    node_is_track = np.asarray(data["node_is_track"]).astype(bool)
+    node_eta = np.asarray(data["node_eta"]).astype(np.float32)
+    node_phi = np.asarray(data["node_phi"]).astype(np.float32)
+    hs_e = np.asarray(data["calo_hs_energy"]).astype(np.float32)
+
+    if node_valid.ndim != 2 or node_is_track.ndim != 2 or node_eta.ndim != 2 or node_phi.ndim != 2 or hs_e.ndim != 2:
+        return None
+
+    hs_pt = hs_e / np.cosh(np.clip(node_eta, -10.0, 10.0))
+
+    valid_cluster_hs = (
+        node_valid
+        & (~node_is_track)
+        & np.isfinite(hs_pt)
+        & np.isfinite(node_eta)
+        & np.isfinite(node_phi)
+        & (hs_e > 0)
+        & (hs_pt > 0)
+    )
+
+    n_events = node_valid.shape[0]
+    pt_l, eta_l, phi_l, m_l, nc_l = [], [], [], [], []
+    for i in tqdm(range(n_events), desc="Jets (calo-hs)"):
+        ptetaphi = np.stack([hs_pt[i], node_eta[i], node_phi[i]], axis=-1)
+        out = _cluster_jets_single(
+            ptetaphi,
+            valid_cluster_hs[i],
+            0.5,
+            jet_R,
+            min_constituents,
+            min_pt,
+        )
+        pt_l.append(out[0]); eta_l.append(out[1]); phi_l.append(out[2])
+        m_l.append(out[3]);  nc_l.append(out[4])
+
+    return {
+        "calo_hs_jet_pt": np.array(pt_l, dtype=object),
+        "calo_hs_jet_eta": np.array(eta_l, dtype=object),
+        "calo_hs_jet_phi": np.array(phi_l, dtype=object),
+        "calo_hs_jet_mass": np.array(m_l, dtype=object),
+        "calo_hs_jet_nconst": np.array(nc_l, dtype=object),
+    }
+
+
 def match_jets(
     pred_pt: np.ndarray,
     pred_eta: np.ndarray,
@@ -1043,20 +1841,36 @@ def get_jet_residuals(
     pred_pt: np.ndarray,
     pred_eta: np.ndarray,
     pred_phi: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute Δpt/pt, Δeta, Δphi residuals for matched jet pairs."""
-    res_pt, res_eta, res_phi = [], [], []
+) -> dict[str, np.ndarray]:
+    """Compute matched-jet residuals: Δpt, Δpt/pt_truth, Δη, Δφ."""
+    res_dpt, res_dpt_rel, res_eta, res_phi, res_truth_pt = [], [], [], [], []
     for i in range(len(truth_ix)):
         ti, pi = truth_ix[i], pred_ix[i]
         if len(ti) == 0:
             continue
         tp = truth_pt[i][ti]
-        res_pt.append((pred_pt[i][pi] - tp) / np.clip(tp, 1e-8, None))
+        dpt = pred_pt[i][pi] - tp
+        res_dpt.append(dpt)
+        res_dpt_rel.append(dpt / np.clip(tp, 1e-8, None))
         res_eta.append(pred_eta[i][pi] - truth_eta[i][ti])
         res_phi.append(normalize_phi(pred_phi[i][pi] - truth_phi[i][ti]))
-    if not res_pt:
-        return np.array([]), np.array([]), np.array([])
-    return np.concatenate(res_pt), np.concatenate(res_eta), np.concatenate(res_phi)
+        res_truth_pt.append(tp)
+    if not res_dpt:
+        empty = np.array([])
+        return {
+            "dpt": empty,
+            "dpt_over_truth": empty,
+            "deta": empty,
+            "dphi": empty,
+            "truth_pt": empty,
+        }
+    return {
+        "dpt": np.concatenate(res_dpt),
+        "dpt_over_truth": np.concatenate(res_dpt_rel),
+        "deta": np.concatenate(res_eta),
+        "dphi": np.concatenate(res_phi),
+        "truth_pt": np.concatenate(res_truth_pt),
+    }
 
 
 def plot_jet_resolution(
@@ -1064,8 +1878,28 @@ def plot_jet_resolution(
     data: dict,
     dr_cut: float = 0.4,
 ) -> plt.Figure:
-    """2×2 resolution grid: Δeta, Δphi, N_constituents, Δpt/pt."""
+    """6-panel jet resolution view including residuals plus jet-energy spectrum."""
     from scipy.stats import iqr
+
+    def _concat_nonempty(arrs: np.ndarray) -> np.ndarray:
+        chunks = [a for a in arrs if len(a) > 0]
+        return np.concatenate(chunks) if chunks else np.array([])
+
+    def _concat_jet_energy(prefix: str) -> np.ndarray:
+        e_chunks = []
+        for pt, eta, mass in zip(
+            jets[f"{prefix}_jet_pt"],
+            jets[f"{prefix}_jet_eta"],
+            jets[f"{prefix}_jet_mass"],
+        ):
+            if len(pt) == 0:
+                continue
+            e2 = (pt * np.cosh(eta)) ** 2 + np.maximum(mass, 0.0) ** 2
+            e = np.sqrt(np.clip(e2, 0.0, None))
+            e = e[np.isfinite(e) & (e > 0)]
+            if len(e) > 0:
+                e_chunks.append(e)
+        return np.concatenate(e_chunks) if e_chunks else np.array([])
 
     n_pflow = np.array([len(e) for e in jets["pflow_jet_pt"]])
     n_truth = np.array([len(e) for e in jets["truth_jet_pt"]])
@@ -1081,8 +1915,10 @@ def plot_jet_resolution(
         jets["truth_jet_pt"][mask], jets["truth_jet_eta"][mask], jets["truth_jet_phi"][mask],
         jets["pflow_jet_pt"][mask], jets["pflow_jet_eta"][mask], jets["pflow_jet_phi"][mask],
     )
-    pf_nc  = np.concatenate([e for e in jets["pflow_jet_nconst"] if len(e) > 0])
-    tr_nc  = np.concatenate([e for e in jets["truth_jet_nconst"] if len(e) > 0])
+    pf_nc  = _concat_nonempty(jets["pflow_jet_nconst"])
+    tr_nc  = _concat_nonempty(jets["truth_jet_nconst"])
+    pf_e = _concat_jet_energy("pflow")
+    tr_e = _concat_jet_energy("truth")
 
     has_proxy = _has_proxy(data) and "proxy_jet_pt" in jets
     if has_proxy:
@@ -1098,17 +1934,20 @@ def plot_jet_resolution(
             jets["truth_jet_pt"][mask_pr], jets["truth_jet_eta"][mask_pr], jets["truth_jet_phi"][mask_pr],
             jets["proxy_jet_pt"][mask_pr], jets["proxy_jet_eta"][mask_pr], jets["proxy_jet_phi"][mask_pr],
         )
-        pr_nc = np.concatenate([e for e in jets["proxy_jet_nconst"] if len(e) > 0])
+        pr_nc = _concat_nonempty(jets["proxy_jet_nconst"])
+        pr_e = _concat_jet_energy("proxy")
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
     configs = [
-        (pf_res[1], r"Jet $\Delta\eta$",          np.linspace(-0.2, 0.2, 50)),
-        (pf_res[2], r"Jet $\Delta\phi$",           np.linspace(-0.2, 0.2, 50)),
-        (pf_nc,     "Jet # Constituents",           None),
-        (pf_res[0], r"Jet $p_T$ residual",         np.linspace(-1.0, 4.0, 110)),
+        (pf_res["deta"], r"Jet $\Delta\eta$", np.linspace(-0.2, 0.2, 50), True, False, "deta"),
+        (pf_res["dphi"], r"Jet $\Delta\phi$", np.linspace(-0.2, 0.2, 50), True, False, "dphi"),
+        (pf_nc, "Jet # Constituents", None, True, False, "nconst"),
+        (pf_res["dpt"], r"Jet absolute $\Delta p_T = p_T^{\mathrm{pred}} - p_T^{\mathrm{truth}}$ [GeV]", None, True, False, "dpt"),
+        (pf_res["dpt_over_truth"], r"Jet relative $\Delta p_T = (p_T^{\mathrm{pred}} - p_T^{\mathrm{truth}}) / p_T^{\mathrm{truth}}$", np.linspace(-1.0, 4.0, 110), False, True, "dpt_over_truth"),
+        (pf_e, "Jet energy [GeV]", None, False, True, "energy"),
     ]
 
-    for idx, (d, xlabel, bins) in enumerate(configs):
+    for idx, (d, xlabel, bins, hist_density, use_log_y, key) in enumerate(configs):
         ax = axes[idx // 2, idx % 2]
         if len(d) == 0:
             ax.text(0.5, 0.5, "no matched jets", ha="center", va="center",
@@ -1116,34 +1955,529 @@ def plot_jet_resolution(
             ax.set_xlabel(xlabel)
             continue
 
-        b = bins if bins is not None else np.arange(d.min() - 0.5, d.max() + 1.5)
-        hist_density = idx != 3
+        if bins is not None:
+            b = bins
+        elif key == "nconst":
+            b = np.arange(d.min() - 0.5, d.max() + 1.5)
+        elif key == "dpt":
+            lo, hi = np.percentile(d, [0.5, 99.5])
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = float(np.nanmin(d)), float(np.nanmax(d))
+            if hi <= lo:
+                hi = lo + 1e-6
+            b = np.linspace(lo, hi, 90)
+        elif key == "energy":
+            pos = d[np.isfinite(d) & (d > 0)]
+            if len(pos) > 1:
+                lo, hi = np.percentile(pos, [0.5, 99.5])
+                lo = max(float(lo), 1e-3)
+                hi = max(float(hi), lo * 1.05)
+                b = np.linspace(lo, hi, 80)
+            else:
+                b = 80
+        else:
+            lo, hi = float(np.nanmin(d)), float(np.nanmax(d))
+            if hi <= lo:
+                hi = lo + 1e-6
+            b = np.linspace(lo, hi, 90)
+
         ax.hist(d, bins=b, histtype="stepfilled", alpha=0.5, density=hist_density,
                 label=rf"PFlow  $\mu$={np.nanmean(d):.3f}, IQR={iqr(d):.3f}")
 
         if has_proxy:
-            pr_d = [pr_res[1], pr_res[2], pr_nc, pr_res[0]][idx]
+            pr_d = {
+                "deta": pr_res["deta"],
+                "dphi": pr_res["dphi"],
+                "nconst": pr_nc,
+                "dpt": pr_res["dpt"],
+                "dpt_over_truth": pr_res["dpt_over_truth"],
+                "energy": pr_e,
+            }[key]
             if len(pr_d) > 0:
                 ax.hist(pr_d, bins=b, histtype="step", density=hist_density,
                         label=rf"Proxy  $\mu$={np.nanmean(pr_d):.3f}, IQR={iqr(pr_d):.3f}")
 
-        if idx == 2 and len(tr_nc) > 0:
+        if key == "nconst" and len(tr_nc) > 0:
             ax.hist(tr_nc, bins=b, histtype="stepfilled", alpha=0.4, color="orange", density=True,
-                    label=rf"Truth  $\mu$={np.nanmean(tr_nc):.3f}, IQR={iqr(tr_nc):.3f}")
+                    label=rf"Target  $\mu$={np.nanmean(tr_nc):.3f}, IQR={iqr(tr_nc):.3f}")
 
-        if idx == 3:
+        if key == "energy" and len(tr_e) > 0:
+            ax.hist(tr_e, bins=b, histtype="stepfilled", alpha=0.4, color="orange", density=False,
+                    label=rf"Target  $\mu$={np.nanmean(tr_e):.3f}, IQR={iqr(tr_e):.3f}")
+
+        if use_log_y:
             ax.set_yscale("log")
         ylo, yhi = ax.get_ylim()
-        if idx == 3:
+        if use_log_y:
             ylo = max(ylo, 1e-4)
         ax.set_ylim(ylo, yhi * 1.35)
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("Count" if idx == 3 else "Density")
+        ax.set_ylabel("Count" if not hist_density else "Density")
         ax.legend(fontsize=8, loc="upper right")
 
     fig.suptitle("Jet resolution")
     fig.tight_layout()
     return fig
+
+
+def plot_jet_resolution_with_calo(
+    jets: dict,
+    data: dict,
+    dr_cut: float = 0.4,
+    jet_R: float = 0.7,
+    compare_jets: dict | None = None,
+    compare_label: str = "True-pileup-mask-reconstruction",
+) -> plt.Figure | None:
+    """Copy of jet-resolution plot with additional calo-cluster jet residual overlays."""
+    from scipy.stats import iqr
+
+    def _concat_nonempty(arrs: np.ndarray) -> np.ndarray:
+        chunks = [a for a in arrs if len(a) > 0]
+        return np.concatenate(chunks) if chunks else np.array([])
+
+    def _concat_jet_energy(jet_dict: dict, prefix: str) -> np.ndarray:
+        e_chunks = []
+        for pt, eta, mass in zip(
+            jet_dict[f"{prefix}_jet_pt"],
+            jet_dict[f"{prefix}_jet_eta"],
+            jet_dict[f"{prefix}_jet_mass"],
+        ):
+            if len(pt) == 0:
+                continue
+            e2 = (pt * np.cosh(eta)) ** 2 + np.maximum(mass, 0.0) ** 2
+            e = np.sqrt(np.clip(e2, 0.0, None))
+            e = e[np.isfinite(e) & (e > 0)]
+            if len(e) > 0:
+                e_chunks.append(e)
+        return np.concatenate(e_chunks) if e_chunks else np.array([])
+
+    calo_jets = cluster_calo_jets(
+        data,
+        jet_R=jet_R,
+        min_constituents=3,
+        min_pt=10.0,
+    )
+    if calo_jets is None:
+        print("  jet_resolution_with_calo skipped: raw node_metadata fields missing")
+        return None
+
+    calo_hs_jets = cluster_calo_hs_jets(
+        data,
+        jet_R=jet_R,
+        min_constituents=3,
+        min_pt=10.0,
+    )
+
+    n_pflow = np.array([len(e) for e in jets["pflow_jet_pt"]])
+    n_truth = np.array([len(e) for e in jets["truth_jet_pt"]])
+    mask = (n_pflow > 0) & (n_truth > 0)
+
+    tr_pf, pf_ix, _ = match_jets(
+        jets["pflow_jet_pt"][mask], jets["pflow_jet_eta"][mask], jets["pflow_jet_phi"][mask],
+        jets["truth_jet_pt"][mask], jets["truth_jet_eta"][mask], jets["truth_jet_phi"][mask],
+        dr_cut=dr_cut,
+    )
+    pf_res = get_jet_residuals(
+        tr_pf,
+        pf_ix,
+        jets["truth_jet_pt"][mask],
+        jets["truth_jet_eta"][mask],
+        jets["truth_jet_phi"][mask],
+        jets["pflow_jet_pt"][mask],
+        jets["pflow_jet_eta"][mask],
+        jets["pflow_jet_phi"][mask],
+    )
+    pf_nc = _concat_nonempty(jets["pflow_jet_nconst"])
+    tr_nc = _concat_nonempty(jets["truth_jet_nconst"])
+    pf_e = _concat_jet_energy(jets, "pflow")
+    tr_e = _concat_jet_energy(jets, "truth")
+
+    has_proxy = _has_proxy(data) and "proxy_jet_pt" in jets
+    pr_res = {"deta": np.array([]), "dphi": np.array([]), "dpt": np.array([]), "dpt_over_truth": np.array([])}
+    pr_nc = np.array([])
+    pr_e = np.array([])
+    if has_proxy:
+        n_proxy = np.array([len(e) for e in jets["proxy_jet_pt"]])
+        mask_pr = mask & (n_proxy > 0)
+        tr_pr, pr_ix, _ = match_jets(
+            jets["proxy_jet_pt"][mask_pr], jets["proxy_jet_eta"][mask_pr], jets["proxy_jet_phi"][mask_pr],
+            jets["truth_jet_pt"][mask_pr], jets["truth_jet_eta"][mask_pr], jets["truth_jet_phi"][mask_pr],
+            dr_cut=dr_cut,
+        )
+        pr_res = get_jet_residuals(
+            tr_pr,
+            pr_ix,
+            jets["truth_jet_pt"][mask_pr],
+            jets["truth_jet_eta"][mask_pr],
+            jets["truth_jet_phi"][mask_pr],
+            jets["proxy_jet_pt"][mask_pr],
+            jets["proxy_jet_eta"][mask_pr],
+            jets["proxy_jet_phi"][mask_pr],
+        )
+        pr_nc = _concat_nonempty(jets["proxy_jet_nconst"])
+        pr_e = _concat_jet_energy(jets, "proxy")
+
+    dbg_res = {"deta": np.array([]), "dphi": np.array([]), "dpt": np.array([]), "dpt_over_truth": np.array([])}
+    dbg_nc = np.array([])
+    dbg_e = np.array([])
+    has_compare = compare_jets is not None and "pflow_jet_pt" in compare_jets and "truth_jet_pt" in compare_jets
+    if has_compare:
+        n_dbg = np.array([len(e) for e in compare_jets["pflow_jet_pt"]])
+        n_dbg_truth = np.array([len(e) for e in compare_jets["truth_jet_pt"]])
+        mask_dbg = (n_dbg > 0) & (n_dbg_truth > 0)
+        tr_dbg, dbg_ix, _ = match_jets(
+            compare_jets["pflow_jet_pt"][mask_dbg],
+            compare_jets["pflow_jet_eta"][mask_dbg],
+            compare_jets["pflow_jet_phi"][mask_dbg],
+            compare_jets["truth_jet_pt"][mask_dbg],
+            compare_jets["truth_jet_eta"][mask_dbg],
+            compare_jets["truth_jet_phi"][mask_dbg],
+            dr_cut=dr_cut,
+        )
+        dbg_res = get_jet_residuals(
+            tr_dbg,
+            dbg_ix,
+            compare_jets["truth_jet_pt"][mask_dbg],
+            compare_jets["truth_jet_eta"][mask_dbg],
+            compare_jets["truth_jet_phi"][mask_dbg],
+            compare_jets["pflow_jet_pt"][mask_dbg],
+            compare_jets["pflow_jet_eta"][mask_dbg],
+            compare_jets["pflow_jet_phi"][mask_dbg],
+        )
+        dbg_nc = _concat_nonempty(compare_jets["pflow_jet_nconst"])
+        dbg_e = _concat_jet_energy(compare_jets, "pflow")
+
+    n_calo = np.array([len(e) for e in calo_jets["calo_jet_pt"]])
+    mask_calo = (n_calo > 0) & (n_truth > 0)
+    tr_ca, ca_ix, _ = match_jets(
+        calo_jets["calo_jet_pt"][mask_calo], calo_jets["calo_jet_eta"][mask_calo], calo_jets["calo_jet_phi"][mask_calo],
+        jets["truth_jet_pt"][mask_calo], jets["truth_jet_eta"][mask_calo], jets["truth_jet_phi"][mask_calo],
+        dr_cut=dr_cut,
+    )
+    ca_res = get_jet_residuals(
+        tr_ca,
+        ca_ix,
+        jets["truth_jet_pt"][mask_calo],
+        jets["truth_jet_eta"][mask_calo],
+        jets["truth_jet_phi"][mask_calo],
+        calo_jets["calo_jet_pt"][mask_calo],
+        calo_jets["calo_jet_eta"][mask_calo],
+        calo_jets["calo_jet_phi"][mask_calo],
+    )
+    ca_nc = _concat_nonempty(calo_jets["calo_jet_nconst"])
+    ca_e = _concat_jet_energy(calo_jets, "calo")
+
+    ca_hs_res = {"deta": np.array([]), "dphi": np.array([]), "dpt": np.array([]), "dpt_over_truth": np.array([])}
+    ca_hs_nc = np.array([])
+    ca_hs_e = np.array([])
+    if calo_hs_jets is not None:
+        n_calo_hs = np.array([len(e) for e in calo_hs_jets["calo_hs_jet_pt"]])
+        mask_calo_hs = (n_calo_hs > 0) & (n_truth > 0)
+        tr_cha, cha_ix, _ = match_jets(
+            calo_hs_jets["calo_hs_jet_pt"][mask_calo_hs],
+            calo_hs_jets["calo_hs_jet_eta"][mask_calo_hs],
+            calo_hs_jets["calo_hs_jet_phi"][mask_calo_hs],
+            jets["truth_jet_pt"][mask_calo_hs],
+            jets["truth_jet_eta"][mask_calo_hs],
+            jets["truth_jet_phi"][mask_calo_hs],
+            dr_cut=dr_cut,
+        )
+        ca_hs_res = get_jet_residuals(
+            tr_cha,
+            cha_ix,
+            jets["truth_jet_pt"][mask_calo_hs],
+            jets["truth_jet_eta"][mask_calo_hs],
+            jets["truth_jet_phi"][mask_calo_hs],
+            calo_hs_jets["calo_hs_jet_pt"][mask_calo_hs],
+            calo_hs_jets["calo_hs_jet_eta"][mask_calo_hs],
+            calo_hs_jets["calo_hs_jet_phi"][mask_calo_hs],
+        )
+        ca_hs_nc = _concat_nonempty(calo_hs_jets["calo_hs_jet_nconst"])
+        ca_hs_e = _concat_jet_energy(calo_hs_jets, "calo_hs")
+
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+    configs = [
+        (pf_res["deta"], r"Jet $\Delta\eta$", np.linspace(-0.2, 0.2, 50), True, False, "deta"),
+        (pf_res["dphi"], r"Jet $\Delta\phi$", np.linspace(-0.2, 0.2, 50), True, False, "dphi"),
+        (pf_nc, "Jet # Constituents", None, True, False, "nconst"),
+        (pf_res["dpt"], r"Jet absolute $\Delta p_T = p_T^{\mathrm{pred}} - p_T^{\mathrm{truth}}$ [GeV]", None, True, False, "dpt"),
+        (pf_res["dpt_over_truth"], r"Jet relative $\Delta p_T = (p_T^{\mathrm{pred}} - p_T^{\mathrm{truth}}) / p_T^{\mathrm{truth}}$", np.linspace(-1.0, 4.0, 110), False, True, "dpt_over_truth"),
+        (pf_e, "Jet energy [GeV]", None, False, True, "energy"),
+    ]
+
+    for idx, (d, xlabel, bins, hist_density, use_log_y, key) in enumerate(configs):
+        ax = axes[idx // 2, idx % 2]
+        if len(d) == 0:
+            ax.text(0.5, 0.5, "no matched jets", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xlabel(xlabel)
+            continue
+
+        if bins is not None:
+            b = bins
+        elif key == "nconst":
+            b = np.arange(d.min() - 0.5, d.max() + 1.5)
+        elif key == "dpt":
+            lo, hi = np.percentile(d, [0.5, 99.5])
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = float(np.nanmin(d)), float(np.nanmax(d))
+            if hi <= lo:
+                hi = lo + 1e-6
+            b = np.linspace(lo, hi, 90)
+        elif key == "energy":
+            pos = d[np.isfinite(d) & (d > 0)]
+            if len(pos) > 1:
+                lo, hi = np.percentile(pos, [0.5, 99.5])
+                lo = max(float(lo), 1e-3)
+                hi = max(float(hi), lo * 1.05)
+                b = np.linspace(lo, hi, 80)
+            else:
+                b = 80
+        else:
+            lo, hi = float(np.nanmin(d)), float(np.nanmax(d))
+            if hi <= lo:
+                hi = lo + 1e-6
+            b = np.linspace(lo, hi, 90)
+
+        ax.hist(d, bins=b, histtype="stepfilled", alpha=0.5, density=hist_density,
+                label=rf"PFlow  $\mu$={np.nanmean(d):.3f}, IQR={iqr(d):.3f}")
+
+        if has_proxy:
+            pr_d = {
+                "deta": pr_res["deta"],
+                "dphi": pr_res["dphi"],
+                "nconst": pr_nc,
+                "dpt": pr_res["dpt"],
+                "dpt_over_truth": pr_res["dpt_over_truth"],
+                "energy": pr_e,
+            }[key]
+            if len(pr_d) > 0:
+                ax.hist(pr_d, bins=b, histtype="step", density=hist_density,
+                        label=rf"Proxy  $\mu$={np.nanmean(pr_d):.3f}, IQR={iqr(pr_d):.3f}")
+
+        if has_compare:
+            dbg_d = {
+                "deta": dbg_res["deta"],
+                "dphi": dbg_res["dphi"],
+                "nconst": dbg_nc,
+                "dpt": dbg_res["dpt"],
+                "dpt_over_truth": dbg_res["dpt_over_truth"],
+                "energy": dbg_e,
+            }[key]
+            if len(dbg_d) > 0:
+                ax.hist(
+                    dbg_d,
+                    bins=b,
+                    histtype="step",
+                    linestyle=":",
+                    linewidth=2.0,
+                    density=hist_density,
+                    label=f"{compare_label}  mean={np.nanmean(dbg_d):.3f}, IQR={iqr(dbg_d):.3f}",
+                )
+
+        ca_d = {
+            "deta": ca_res["deta"],
+            "dphi": ca_res["dphi"],
+            "nconst": ca_nc,
+            "dpt": ca_res["dpt"],
+            "dpt_over_truth": ca_res["dpt_over_truth"],
+            "energy": ca_e,
+        }[key]
+        if len(ca_d) > 0:
+            ax.hist(ca_d, bins=b, histtype="step", linewidth=1.8, density=hist_density,
+                    label=rf"Calo  $\mu$={np.nanmean(ca_d):.3f}, IQR={iqr(ca_d):.3f}")
+
+        ca_hs_d = {
+            "deta": ca_hs_res["deta"],
+            "dphi": ca_hs_res["dphi"],
+            "nconst": ca_hs_nc,
+            "dpt": ca_hs_res["dpt"],
+            "dpt_over_truth": ca_hs_res["dpt_over_truth"],
+            "energy": ca_hs_e,
+        }[key]
+        if len(ca_hs_d) > 0:
+            ax.hist(ca_hs_d, bins=b, histtype="step", linestyle="--", linewidth=1.8, density=hist_density,
+                    label=rf"Calo-HS  $\mu$={np.nanmean(ca_hs_d):.3f}, IQR={iqr(ca_hs_d):.3f}")
+
+        if key == "nconst" and len(tr_nc) > 0:
+            ax.hist(tr_nc, bins=b, histtype="stepfilled", alpha=0.4, color="orange", density=True,
+                    label=rf"Target  $\mu$={np.nanmean(tr_nc):.3f}, IQR={iqr(tr_nc):.3f}")
+
+        if key == "energy" and len(tr_e) > 0:
+            ax.hist(tr_e, bins=b, histtype="stepfilled", alpha=0.4, color="orange", density=False,
+                    label=rf"Target  $\mu$={np.nanmean(tr_e):.3f}, IQR={iqr(tr_e):.3f}")
+
+        if use_log_y:
+            ax.set_yscale("log")
+        ylo, yhi = ax.get_ylim()
+        if use_log_y:
+            ylo = max(ylo, 1e-4)
+        ax.set_ylim(ylo, yhi * 1.35)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Count" if not hist_density else "Density")
+        ax.legend(fontsize=8, loc="upper right")
+
+    fig.suptitle("Jet resolution (with calo clusters)")
+    fig.tight_layout()
+    return fig
+
+
+def plot_jet_resolution_by_truth_pt_bin(
+    jets: dict,
+    data: dict,
+    dr_cut: float = 0.4,
+    pt_bins: tuple[float, ...] = JET_RESOLUTION_PT_BINS,
+) -> dict[str, plt.Figure]:
+    """Jet residual plots split by matched truth-jet pt bins."""
+    from scipy.stats import iqr
+
+    pt_edges = np.asarray(pt_bins, dtype=np.float64)
+    if pt_edges.ndim != 1 or len(pt_edges) < 2:
+        raise ValueError("pt_bins must be a 1D array with at least two edges")
+
+    n_pflow = np.array([len(e) for e in jets["pflow_jet_pt"]])
+    n_truth = np.array([len(e) for e in jets["truth_jet_pt"]])
+    mask = (n_pflow > 0) & (n_truth > 0)
+
+    tr_pf, pf_ix, _ = match_jets(
+        jets["pflow_jet_pt"][mask], jets["pflow_jet_eta"][mask], jets["pflow_jet_phi"][mask],
+        jets["truth_jet_pt"][mask], jets["truth_jet_eta"][mask], jets["truth_jet_phi"][mask],
+        dr_cut=dr_cut,
+    )
+    pf_res = get_jet_residuals(
+        tr_pf,
+        pf_ix,
+        jets["truth_jet_pt"][mask],
+        jets["truth_jet_eta"][mask],
+        jets["truth_jet_phi"][mask],
+        jets["pflow_jet_pt"][mask],
+        jets["pflow_jet_eta"][mask],
+        jets["pflow_jet_phi"][mask],
+    )
+
+    has_proxy = _has_proxy(data) and "proxy_jet_pt" in jets
+    pr_res = {
+        "dpt": np.array([]),
+        "dpt_over_truth": np.array([]),
+        "deta": np.array([]),
+        "dphi": np.array([]),
+        "truth_pt": np.array([]),
+    }
+    if has_proxy:
+        n_proxy = np.array([len(e) for e in jets["proxy_jet_pt"]])
+        mask_pr = mask & (n_proxy > 0)
+        tr_pr, pr_ix, _ = match_jets(
+            jets["proxy_jet_pt"][mask_pr], jets["proxy_jet_eta"][mask_pr], jets["proxy_jet_phi"][mask_pr],
+            jets["truth_jet_pt"][mask_pr], jets["truth_jet_eta"][mask_pr], jets["truth_jet_phi"][mask_pr],
+            dr_cut=dr_cut,
+        )
+        pr_res = get_jet_residuals(
+            tr_pr,
+            pr_ix,
+            jets["truth_jet_pt"][mask_pr],
+            jets["truth_jet_eta"][mask_pr],
+            jets["truth_jet_phi"][mask_pr],
+            jets["proxy_jet_pt"][mask_pr],
+            jets["proxy_jet_eta"][mask_pr],
+            jets["proxy_jet_phi"][mask_pr],
+        )
+
+    def _fmt_edge(x: float) -> str:
+        return "inf" if np.isinf(x) else f"{x:g}".replace("-", "m").replace(".", "p")
+
+    def _pt_label(lo: float, hi: float) -> str:
+        if np.isinf(hi):
+            return f"[{lo:g}, inf)"
+        return f"[{lo:g}, {hi:g})"
+
+    def _in_bin(values: np.ndarray, lo: float, hi: float) -> np.ndarray:
+        m = values >= lo
+        if np.isfinite(hi):
+            m &= values < hi
+        return m
+
+    def _res_bins(values: np.ndarray, key: str):
+        vals = values[np.isfinite(values)]
+        if vals.size == 0:
+            return np.linspace(-1.0, 1.0, 80)
+        if key == "deta":
+            return np.linspace(-0.2, 0.2, 50)
+        if key == "dphi":
+            return np.linspace(-0.2, 0.2, 50)
+        if key == "dpt_over_truth":
+            return np.linspace(-1.0, 4.0, 110)
+        lo, hi = np.percentile(vals, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+        if hi <= lo:
+            hi = lo + 1e-6
+        return np.linspace(lo, hi, 90)
+
+    configs = [
+        ("deta", "Jet deta", True, False),
+        ("dphi", "Jet dphi", True, False),
+        ("dpt", "Jet absolute dpt = pred_pt - truth_pt [GeV]", True, False),
+        ("dpt_over_truth", "Jet relative dpt = (pred_pt - truth_pt) / truth_pt", False, True),
+    ]
+
+    figs: dict[str, plt.Figure] = {}
+    for i in range(len(pt_edges) - 1):
+        lo = float(pt_edges[i])
+        hi = float(pt_edges[i + 1])
+
+        pf_bin = _in_bin(pf_res["truth_pt"], lo, hi)
+        pr_bin = _in_bin(pr_res["truth_pt"], lo, hi)
+
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+        axes_flat = axes.flatten()
+
+        for j, (key, xlabel, hist_density, use_log_y) in enumerate(configs):
+            ax = axes_flat[j]
+            pf_vals = pf_res[key][pf_bin]
+            pr_vals = pr_res[key][pr_bin]
+
+            if len(pf_vals) == 0 and (not has_proxy or len(pr_vals) == 0):
+                ax.text(0.5, 0.5, "no matched jets in pt bin", ha="center", va="center", transform=ax.transAxes)
+                ax.set_xlabel(xlabel)
+                continue
+
+            all_vals = np.concatenate([pf_vals, pr_vals]) if len(pr_vals) > 0 else pf_vals
+            bins = _res_bins(all_vals, key)
+
+            if len(pf_vals) > 0:
+                ax.hist(
+                    pf_vals,
+                    bins=bins,
+                    histtype="stepfilled",
+                    alpha=0.5,
+                    density=hist_density,
+                    label=f"PFlow mean={np.nanmean(pf_vals):.3f}, IQR={iqr(pf_vals):.3f}",
+                )
+            if has_proxy and len(pr_vals) > 0:
+                ax.hist(
+                    pr_vals,
+                    bins=bins,
+                    histtype="step",
+                    density=hist_density,
+                    label=f"Proxy mean={np.nanmean(pr_vals):.3f}, IQR={iqr(pr_vals):.3f}",
+                )
+
+            if use_log_y:
+                ax.set_yscale("log")
+            ylo, yhi = ax.get_ylim()
+            if use_log_y:
+                ylo = max(ylo, 1e-4)
+            ax.set_ylim(ylo, yhi * 1.35)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel("Count" if not hist_density else "Density")
+            ax.legend(fontsize=8, loc="upper right")
+
+        fig.suptitle(f"Jet residuals by truth-jet pt bin {_pt_label(lo, hi)}")
+        fig.tight_layout()
+
+        key = f"reco_analysis/jet_resolution_truth_pt_{_fmt_edge(lo)}_to_{_fmt_edge(hi)}"
+        figs[key] = fig
+
+    return figs
 
 
 def plot_jet_multiplicity(jets: dict, data: dict) -> plt.Figure:
@@ -1580,6 +2914,89 @@ def plot_incidence_track_match(
 # Top-level orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
 
+def run_zero_bin_analysis(
+    data: dict,
+    ind_threshold: float = 0.5,
+    eta_zero_width: float = 0.05,
+    phi_zero_width: float = 0.05,
+) -> dict[str, plt.Figure]:
+    """Run targeted diagnostics for the eta/phi zero-bin issue.
+
+    Returns a compact figure dictionary similar to ``run_reco_analysis``.
+    """
+    import time
+
+    figs: dict[str, plt.Figure] = {}
+
+    def _plot(name: str, fn, *args, **kw):
+        t0 = time.perf_counter()
+        result = fn(*args, **kw)
+        if result is not None:
+            figs[name] = result
+            print(f"  {name:<50s} {time.perf_counter() - t0:.2f}s")
+        else:
+            print(f"  {name:<50s} skipped (data unavailable)")
+
+    print("Zero-bin focused plots…")
+    _plot(
+        "reco_analysis_zero_bin/zero_bin_diagnostics",
+        plot_zero_bin_diagnostics,
+        data,
+        ind_threshold,
+        eta_zero_width,
+        phi_zero_width,
+    )
+    _plot(
+        "reco_analysis_zero_bin/class_hist_all_events",
+        plot_class_histogram_all_events,
+        data,
+        ind_threshold,
+    )
+
+    print(f"Done — {len(figs)} zero-bin plots generated.")
+    return figs
+
+
+def run_fp_neu_hadron_analysis(
+    data: dict,
+    ind_threshold: float = 0.5,
+    incidence_threshold: float = 1e-3,
+    neu_had_class: int = 3,
+) -> dict[str, plt.Figure]:
+    """Run focused diagnostics to investigate FP neutral-hadron source."""
+    import time
+
+    figs: dict[str, plt.Figure] = {}
+
+    def _plot(name: str, fn, *args, **kw):
+        t0 = time.perf_counter()
+        result = fn(*args, **kw)
+        if result is not None:
+            figs[name] = result
+            print(f"  {name:<50s} {time.perf_counter() - t0:.2f}s")
+        else:
+            print(f"  {name:<50s} skipped (data unavailable)")
+
+    print("FP Neu Had focused plots…")
+    _plot(
+        "reco_analysis_fp_neuhad/fp_neuhad_diagnostics",
+        plot_fp_neu_hadron_diagnostics,
+        data,
+        ind_threshold,
+        incidence_threshold,
+        neu_had_class,
+    )
+    _plot(
+        "reco_analysis_fp_neuhad/fp_neuhad_node_source",
+        plot_fp_neu_hadron_node_source,
+        data,
+        ind_threshold,
+        neu_had_class,
+    )
+
+    print(f"Done — {len(figs)} FP Neu Had plots generated.")
+    return figs
+
 def run_reco_analysis(
     data: dict,
     ind_threshold: float = 0.5,
@@ -1587,6 +3004,8 @@ def run_reco_analysis(
     jet_R: float = 0.7,
     dr_cut: float = 0.4,
     event_display_indices: list[int] | None = None,
+    compare_data: dict | None = None,
+    compare_label: str = "True-pileup-mask-reconstruction",
 ) -> dict[str, plt.Figure]:
     """Run all reco analysis plots; return a dict of named Figures.
 
@@ -1598,6 +3017,8 @@ def run_reco_analysis(
     jet_R : jet-clustering radius
     dr_cut : ΔR threshold for jet matching
     event_display_indices : list of event indices for event displays (default: [0])
+    compare_data : optional second dataset to overlay on jet-resolution-with-calo
+    compare_label : legend label for compare_data overlay
 
     Returns
     -------
@@ -1631,13 +3052,35 @@ def run_reco_analysis(
     _plot("reco_analysis/incidence_track_match", plot_incidence_track_match, data, 0)
 
     jets = None
+    compare_jets = None
     if do_jets:
         try:
             print("Clustering jets…")
             jets = cluster_jets(data, ind_threshold=ind_threshold, jet_R=jet_R)
+            if compare_data is not None:
+                print("Clustering compare jets…")
+                compare_jets = cluster_jets(compare_data, ind_threshold=ind_threshold, jet_R=jet_R)
             _plot("reco_analysis/jet_multiplicity", plot_jet_multiplicity, jets, data)
             print("Jet resolution…")
             _plot("reco_analysis/jet_resolution",   plot_jet_resolution,   jets, data, dr_cut)
+            _plot(
+                "reco_analysis/jet_resolution_with_calo",
+                plot_jet_resolution_with_calo,
+                jets,
+                data,
+                dr_cut,
+                jet_R,
+                compare_jets,
+                compare_label,
+            )
+            t0 = time.perf_counter()
+            jet_pt_bin_figs = plot_jet_resolution_by_truth_pt_bin(jets, data, dr_cut=dr_cut)
+            figs.update(jet_pt_bin_figs)
+            print(
+                f"  reco_analysis/jet_resolution_truth_pt_*"
+                f" ({len(jet_pt_bin_figs)} bins)"
+                f" {time.perf_counter() - t0:.2f}s"
+            )
         except ImportError:
             print("  fastjet not available — skipping jet analysis")
 

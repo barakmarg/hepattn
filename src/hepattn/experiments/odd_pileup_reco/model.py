@@ -57,6 +57,7 @@ class TwoStreamMaskFormer(nn.Module):
         calo_pred_threshold: float = 0.2,
         reco_calo_noise_mean: int = 300,
         reco_calo_noise_std: float = 50.0,
+        reco_debug_use_truth_masks: bool = False,
     ):
         super().__init__()
 
@@ -98,6 +99,8 @@ class TwoStreamMaskFormer(nn.Module):
         self.calo_pred_threshold = calo_pred_threshold
         self.reco_calo_noise_mean = reco_calo_noise_mean
         self.reco_calo_noise_std = reco_calo_noise_std
+        # Debug-only toggle: in inference, use truth masks for Stream C filtering.
+        self.reco_debug_use_truth_masks = reco_debug_use_truth_masks
 
         if self.reco_decoder is not None:
             self.reco_decoder.tasks = self.reco_tasks
@@ -267,8 +270,9 @@ class TwoStreamMaskFormer(nn.Module):
             node_valid = torch.ones(batch_size, x["key_embed"].shape[1], dtype=torch.bool, device=device)
 
         # --- Determine HS masks ---
+        # Keep this explicit for easier debug-time reasoning.
         if self.training and self.teacher_forcing and targets is not None:
-            # Teacher forcing: truth masks
+            # Training teacher-forcing path: truth masks + sampled predicted residual PU.
             reco_track_mask = targets["tracks_mask"].bool() & is_track
 
             calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
@@ -279,13 +283,10 @@ class TwoStreamMaskFormer(nn.Module):
                 & ~is_track & node_valid
             )
 
-            # Sample additional predicted-mask nodes to teach the reco to handle residual PU
             pred_calo_logits = calo_outputs["final"]["calo_mask"]["calo_node_logit"]  # (B, 1, N)
             pred_calo_mask = (pred_calo_logits.squeeze(1).sigmoid() >= self.calo_pred_threshold) & ~is_track & node_valid
-            # Extra predicted nodes not already in truth
             extra_pred = pred_calo_mask & ~truth_calo_mask
 
-            # Sample extra noise nodes — fixed k for torch.compile compatibility
             N_nodes = x["key_embed"].shape[1]
             n_sample = min(self.reco_calo_noise_mean, N_nodes)
             noise_scores = torch.where(
@@ -296,11 +297,24 @@ class TwoStreamMaskFormer(nn.Module):
             _, sample_idx = noise_scores.topk(n_sample, dim=-1)
             sampled_extra = torch.zeros_like(extra_pred)
             sampled_extra.scatter_(1, sample_idx, True)
-            sampled_extra = sampled_extra & extra_pred  # masks out non-extra nodes
+            sampled_extra = sampled_extra & extra_pred
 
             reco_calo_mask = truth_calo_mask | sampled_extra
+
+        elif (not self.training) and self.reco_debug_use_truth_masks and targets is not None:
+            # Debug inference path: strict oracle truth masks only.
+            reco_track_mask = targets["tracks_mask"].bool() & is_track
+            print("Using debug truth masks for reconstruction calo selection!!")
+            calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
+            calo_hs_energy = targets["calo_hard_scatter_energy"]
+            reco_calo_mask = (
+                (calo_hs_frac > self.calo_hs_frac_threshold)
+                & (calo_hs_energy > self.calo_hs_energy_threshold)
+                & ~is_track & node_valid
+            )
+
         else:
-            # Inference: use predicted masks
+            # Default inference path: predicted masks.
             track_logits = track_outputs["final"]["mask"]["pflow_node_logit"]
             reco_track_mask = (track_logits.squeeze(1).sigmoid() >= 0.5) & is_track
 
