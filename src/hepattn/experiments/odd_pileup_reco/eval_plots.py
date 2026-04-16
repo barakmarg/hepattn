@@ -1062,6 +1062,82 @@ def make_data_plots(dataset_or_loader) -> dict[str, plt.Figure]:
     _plot("data/eta_window_analysis",    PhysicsPlotter.plot_eta_window_analysis,    stats)
     _plot("data/phi_window_analysis",    PhysicsPlotter.plot_phi_window_analysis,    stats)
 
+    # ── Truth particle class histogram (including null/pileup) ──
+    # Shows two bars per class: raw PDG class vs. after trackless reclassification.
+    # Trackless routing: charged hadron (0) → neutral hadron (3),
+    #                    electron (1) → photon (4), muon (2) → neutral hadron (3).
+    if hasattr(dataset, "full_data_array") and "particle_class" in dataset.full_data_array:
+        t0 = time.perf_counter()
+        try:
+            num_objects = getattr(dataset, "num_objects", 400)
+
+            classes_raw = dataset.full_data_array["particle_class"].numpy().copy()
+
+            # Apply trackless reclassification using particle_has_track
+            classes_routed = classes_raw.copy()
+            if "particle_has_track" in dataset.full_data_array:
+                has_track = dataset.full_data_array["particle_has_track"].numpy().astype(bool)
+                trackless = ~has_track
+                trackless_chhad_e = trackless & (classes_routed < 2)   # cls 0→3, cls 1→4
+                trackless_muon    = trackless & (classes_routed == 2)   # cls 2→3
+                classes_routed[trackless_chhad_e] += 3
+                classes_routed[trackless_muon] = 3
+
+            # Null slot counts (same for both: null is not affected by trackless routing)
+            n_particles_per_event = np.diff(dataset.particle_cumsum).astype(np.int64)
+            n_null = int(np.maximum(0, num_objects - 1 - n_particles_per_event).sum())
+            n_null += dataset.num_events  # pileup tokens (1 per event)
+
+            counts_raw    = np.bincount(np.clip(classes_raw,    0, 5), minlength=6)
+            counts_routed = np.bincount(np.clip(classes_routed, 0, 5), minlength=6)
+            counts_raw[5]    += n_null
+            counts_routed[5] += n_null
+
+            class_names = [
+                "Charged Hadron\n(cls 0)",
+                "Electron\n(cls 1)",
+                "Muon\n(cls 2)",
+                "Neutral Hadron\n(cls 3)",
+                "Photon\n(cls 4)",
+                "Null / Pileup\n(cls 5)",
+            ]
+            colors_raw    = ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b2", "#937860"]
+            colors_routed = ["#a8c4e0", "#f0c4a0", "#a8d4b4", "#e8a4a4", "#c4b8d8", "#c8b8a8"]
+
+            x = np.arange(6)
+            w = 0.42
+            fig_cls, ax_cls = plt.subplots(figsize=(11, 5))
+
+            bars_raw    = ax_cls.bar(x - w/2, counts_raw,    width=w, color=colors_raw,
+                                     edgecolor="white", linewidth=0.5, alpha=0.95, label="Raw PDG class")
+            bars_routed = ax_cls.bar(x + w/2, counts_routed, width=w, color=colors_routed,
+                                     edgecolor="grey",  linewidth=0.5, alpha=0.95, label="After trackless routing")
+
+            for bar, count in zip(bars_raw, counts_raw):
+                if count > 0:
+                    ax_cls.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.08,
+                                f"{count:,}", ha="center", va="bottom", fontsize=7, color="#333333")
+            for bar, count in zip(bars_routed, counts_routed):
+                if count > 0:
+                    ax_cls.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.08,
+                                f"{count:,}", ha="center", va="bottom", fontsize=7, color="#555555")
+
+            ax_cls.set_xticks(x)
+            ax_cls.set_xticklabels(class_names, fontsize=10)
+            ax_cls.set_ylabel("Count")
+            ax_cls.set_title(
+                f"Truth particle class distribution  |  {dataset.num_events} events"
+                f"  |  {len(classes_raw):,} real particles  |  {num_objects} query slots"
+            )
+            ax_cls.set_yscale("log")
+            ax_cls.grid(True, alpha=0.25, axis="y")
+            ax_cls.legend(loc="upper right")
+            fig_cls.tight_layout()
+            figs["data/truth_particle_class_dist"] = fig_cls
+            print(f"  {'data/truth_particle_class_dist':<40s} {time.perf_counter() - t0:.2f}s")
+        except Exception as exc:
+            print(f"  data/truth_particle_class_dist skipped: {exc}")
+
     # ── HS mask energy efficiency vs threshold ──
     if ("deps_hard_scatter_energy_deps_in_cluster" in dataset.full_data_array
             and "deps_cluster_idx" in dataset.full_data_array

@@ -265,8 +265,18 @@ def _load_reco(f: h5py.File, event_sel: EventSelector) -> dict:
             reco_data["node_e"] = _read_struct_field(nm, "node_e", np.float32, event_sel)
         if "calo_hs_energy" in nm.dtype.names:
             reco_data["calo_hs_energy"] = _read_struct_field(nm, "calo_hs_energy", np.float32, event_sel)
+        if "calo_hs_frac" in nm.dtype.names:
+            reco_data["calo_hs_frac"] = _read_struct_field(nm, "calo_hs_frac", np.float32, event_sel)
         if "node_pt" in nm.dtype.names:
             reco_data["node_pt"] = _read_struct_field(nm, "node_pt", np.float32, event_sel)
+
+    # Calo mask probabilities in full node space (Stream B output)
+    if "calo_mask" in f:
+        calo_prob = _drop_unit_axes_except_first(
+            f["calo_mask"]["calo_prob"][event_sel].astype(np.float32)
+        )
+        if calo_prob.ndim == 2:
+            reco_data["calo_prob"] = calo_prob
 
     return reco_data
 

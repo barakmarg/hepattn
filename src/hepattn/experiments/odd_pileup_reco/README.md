@@ -1,8 +1,8 @@
 # TwoStreamMaskFormer — Architecture Walkthrough
 
-This document is a deep-dive into `TwoStreamMaskFormer` ([model.py](model.py)), comparing it line-by-line to the original
-`MaskFormer` ([../../models/maskformer.py](../../models/maskformer.py)). All code excerpts are lifted verbatim from those
-two files.
+This document is a deep-dive into `TwoStreamMaskFormer` ([model.py](model.py)), comparing it to the original
+`MaskFormer` ([../../models/maskformer.py](../../models/maskformer.py)) and the experiment-local custom copy
+([maskformer.py](maskformer.py)). Code excerpts are adapted from those files for clarity.
 
 ---
 
@@ -88,7 +88,7 @@ Input nodes (tracks + calo, ~5500 total including pileup)
   │     • Classification (6 classes: 0-4 real, 5 null)            │
   │     • Hit mask (BCE + Dice)                                  │
   │     • Incidence regression (KL-div)                          │
-  │     • Incidence-based regression (pt, eta, phi, e)           │
+  │     • Incidence-based regression (e, pt, eta, sinphi, cosphi)│
   │       (excluded for pileup token — no meaningful kinematics) │
   └──────────────────────────────────────────────────────────────┘
 ```
@@ -136,13 +136,15 @@ class TwoStreamMaskFormer(nn.Module):
         track_tasks: nn.ModuleList,
         calo_decoder: nn.Module,             # Stream B decoder (different type!)
         calo_tasks: nn.ModuleList,
+        dim: int,
+        max_hs_tracks: int = 200,
+        num_latent_queries: int = 1,         # config sets 16
+        teacher_forcing: bool = True,
+        # --- Stream C (reconstruction) ---
         reco_decoder: MaskFormerDecoder | None = None,  # Stream C (optional)
         reco_tasks: nn.ModuleList | None = None,
         reco_matcher: nn.Module | None = None,
-        dim: int = 128,
-        max_hs_tracks: int = 200,
-        num_latent_queries: int = 1,
-        teacher_forcing: bool = True,
+        reco_debug_use_truth_masks: bool = False,  # debug: oracle truth masks at inference
         ...
     ):
         # THREE separate decoders, each with their own tasks
@@ -288,24 +290,29 @@ hybrid_queries, query_valid = self._build_hybrid_queries(
 )
 ```
 
-`_build_hybrid_queries` packs the queries into a padded tensor of fixed size `(B, num_latent_queries + max_hs_tracks, D)`:
+`_build_hybrid_queries` packs the queries into a padded tensor of fixed size `(B, num_latent_queries + max_hs_tracks, D)`. The implementation is fully vectorized (no per-batch loop):
 
 ```python
 # model.py
 def _build_hybrid_queries(self, node_embed, hs_mask, batch_size):
-    Q = self.max_hs_tracks + NL  # fixed-size padded tensor (NL = num_latent_queries)
+    D = node_embed.shape[-1]
+    NL = self.num_latent_queries
+    Q = self.max_hs_tracks + NL
+
     queries = torch.zeros(batch_size, Q, D, ...)
     valid   = torch.zeros(batch_size, Q, ...)
 
-    queries[:, :NL, :] = self.calo_latent_queries  # first NL slots: learnable latents
-    valid[:, :NL] = True
+    # Vectorized: argsort pushes True entries to front, gather extracts them
+    sort_idx = torch.argsort(hs_mask.long(), dim=-1, descending=True, stable=True)
+    track_indices = sort_idx[:, :self.max_hs_tracks]
+    track_valid = hs_mask.gather(1, track_indices)
+    idx_3d = track_indices.unsqueeze(-1).expand(-1, -1, D)
+    track_embeds = node_embed.gather(1, idx_3d)
 
-    for b in range(batch_size):
-        track_indices = hs_mask[b].nonzero(as_tuple=True)[0]
-        n = min(len(track_indices), self.max_hs_tracks)
-        if n > 0:
-            queries[b, NL : NL + n, :] = node_embed[b, track_indices[:n], :]
-            valid[b, NL : NL + n] = True
+    queries[:, :NL, :] = self.calo_latent_queries  # first NL slots: learnable latents
+    queries[:, NL:, :] = track_embeds               # remaining: HS track embeddings
+    valid[:, :NL] = True
+    valid[:, NL:] = track_valid                      # padded tracks marked invalid
 
     return queries, valid
 ```
@@ -367,19 +374,23 @@ if self.training and self.teacher_forcing and targets is not None:
         & ~is_track & node_valid
     )
 
-    # Sample ~N(reco_calo_noise_mean, reco_calo_noise_std) predicted-but-wrong nodes
-    # to make Stream C robust to imperfect pileup removal at inference time
-    extra_pred = pred_calo_mask & ~truth_calo_mask   # predicted HS but truth says pileup
-    n_extra = int(max(0, torch.normal(mean=..., std=...).item()))
-    # ... random sample n_extra of extra_pred per batch element ...
+    # Vectorized noise injection (see Section 5 for details)
+    extra_pred = pred_calo_mask & ~truth_calo_mask
+    # ... topk random sampling of up to reco_calo_noise_mean extra nodes ...
     reco_calo_mask = truth_calo_mask | sampled_extra
+
+elif (not self.training) and self.reco_debug_use_truth_masks and targets is not None:
+    # Debug inference: strict oracle truth masks only
+    reco_track_mask = targets["tracks_mask"].bool() & is_track
+    reco_calo_mask = (truth thresholds only, no predictions)
+
 else:
-    # Inference: use predicted masks from Streams A and B
+    # Default inference: use predicted masks from Streams A and B
     reco_track_mask = (track_logits.sigmoid() >= 0.5) & is_track
     reco_calo_mask  = (calo_logits.sigmoid() >= self.calo_pred_threshold) & ~is_track
 ```
 
-The original `MaskFormer` runs on all input nodes unconditionally. This filtering step reduces the sequence length by ~4× before Stream C, which has a quadratic attention cost.
+The original `MaskFormer` runs on all input nodes unconditionally. This filtering step reduces the sequence length by ~4x before Stream C, which has a quadratic attention cost. The three-way branch handles training (teacher forcing + noise), debug inference (oracle truth), and standard inference (predicted masks).
 
 #### Step 2: Top-k calo selection
 
@@ -399,26 +410,26 @@ reco_node_mask = reco_track_mask | reco_calo_topk  # final HS node mask
 
 #### Step 3: Skip connection + gather filtered nodes
 
+The gather is fully vectorized using `argsort` + `gather` (no per-batch loop):
+
 ```python
 # model.py
 # Skip connection: sum of final encoder output with the saved initial output
 # This gives Stream C access to both local and global information
 reco_embed = x["key_embed"] + initial_encoder_embed  # (B, N, D)
 
-# Repack variable-length HS nodes into a fixed-size padded tensor
-filtered_embed = torch.zeros(batch_size, max_rn, D, ...)
-filtered_valid  = torch.zeros(batch_size, max_rn, dtype=torch.bool, ...)
-reco_node_indices = torch.zeros(batch_size, max_rn, dtype=torch.long, ...)
+# Vectorized gather: argsort pushes True entries to front, gather extracts top max_rn
+sort_idx = torch.argsort(reco_node_mask.long(), dim=-1, descending=True, stable=True)
+reco_node_indices = sort_idx[:, :max_rn]
+filtered_valid = reco_node_mask.gather(1, reco_node_indices)
 
-for b in range(batch_size):
-    indices = reco_node_mask[b].nonzero(as_tuple=True)[0]
-    n = min(len(indices), max_rn)
-    if n > 0:
-        filtered_embed[b, :n]     = reco_embed[b, indices[:n]]
-        filtered_valid[b, :n]     = True
-        reco_node_indices[b, :n]  = indices[:n]   # saved for loss reindexing
-        for k in raw_keys:
-            filtered_raw[k][b, :n] = x[k][b][indices[:n]]
+idx_3d = reco_node_indices.unsqueeze(-1).expand(-1, -1, D)
+filtered_embed = reco_embed.gather(1, idx_3d)
+filtered_is_track = is_track.float().gather(1, reco_node_indices)
+
+# Raw variables gathered the same way
+for k in raw_keys:
+    filtered_raw[k] = x[k].gather(1, reco_node_indices)
 
 self._reco_node_indices    = reco_node_indices  # used in _build_reco_targets
 self._reco_filtered_valid  = filtered_valid
@@ -455,9 +466,9 @@ for task in self.tasks:
     outputs["final"][task.name] = task(x)  # classification, mask, incidence, regression
 ```
 
-**The `reco_model` is a custom `MaskFormer`** (copied to [maskformer.py](maskformer.py)) with two modifications to `loss()`:
+**The `reco_model` is a custom `MaskFormer`** (copied to [maskformer.py](maskformer.py)) with three modifications to `loss()` and one to `predict()`:
 1. **Pileup exclusion from matcher**: Query 0 and target 0 are sliced out before matching. The cost matrix is `cost[:, 1:, 1:]` — only non-pileup queries vs non-pileup targets. After matching, indices are shifted +1 and query 0 is prepended (fixed assignment to target 0).
-2. **Classification exclusion**: `ObjectClassificationTask` sets target position 0 to -100 (`F.cross_entropy` ignore_index), so query 0 receives no classification gradient.
+2. **Classification exclusion**: Target class at position 0 is set to -100 (`F.cross_entropy` ignore_index), so query 0 receives no classification gradient.
 3. **Regression exclusion**: `IncidenceBasedRegressionTask` uses a cloned valid mask with position 0 set to False (pileup has no meaningful kinematics).
 4. **Inference**: Query 0 is hardcoded as always valid in `predict()`, bypassing null-class filtering.
 
@@ -469,34 +480,34 @@ The rest of the complexity lives in the filtering + packaging that prepares its 
 
 | Stage | Track mask | Calo mask |
 |---|---|---|
-| **Training** | Ground truth `targets["tracks_mask"]` | Ground truth HS calo + ~N(300, 50) sampled predicted-but-wrong nodes |
+| **Training** | Ground truth `targets["tracks_mask"]` | Ground truth HS calo + up to `reco_calo_noise_mean` randomly sampled predicted-but-wrong nodes |
 | **Inference** | Stream A predicted sigmoid ≥ 0.5 | Stream B predicted sigmoid ≥ `calo_pred_threshold=0.2` |
+| **Debug inference** (`reco_debug_use_truth_masks=True`) | Ground truth `targets["tracks_mask"]` | Ground truth HS calo only (no noise, no predictions) |
 
-The noise sampling during training is essential for robustness:
+The noise sampling during training is essential for robustness. The implementation is fully vectorized using random scores + `topk`:
 
 ```python
 # model.py
 # Extra predicted nodes not in truth — pileup that Stream B incorrectly predicted as HS
 extra_pred = pred_calo_mask & ~truth_calo_mask
 
-# Sample a random number of them to inject into Stream C's inputs
-n_extra = int(max(0, torch.normal(
-    mean=torch.tensor(float(self.reco_calo_noise_mean)),   # ~300
-    std=torch.tensor(self.reco_calo_noise_std),            # 50
-).item()))
-
+# Vectorized sampling: assign random scores to eligible nodes, take top-k
+N_nodes = x["key_embed"].shape[1]
+n_sample = min(self.reco_calo_noise_mean, N_nodes)  # deterministic cap (not sampled from N())
+noise_scores = torch.where(
+    extra_pred,
+    torch.rand(batch_size, N_nodes, device=device),        # random priority for eligible nodes
+    torch.full((batch_size, N_nodes), -1.0, device=device), # ineligible → always lose
+)
+_, sample_idx = noise_scores.topk(n_sample, dim=-1)
 sampled_extra = torch.zeros_like(extra_pred)
-for b in range(batch_size):
-    extra_indices = extra_pred[b].nonzero(as_tuple=True)[0]
-    if len(extra_indices) > 0 and n_extra > 0:
-        k = min(n_extra, len(extra_indices))
-        perm = torch.randperm(len(extra_indices), device=device)[:k]
-        sampled_extra[b, extra_indices[perm]] = True
+sampled_extra.scatter_(1, sample_idx, True)
+sampled_extra = sampled_extra & extra_pred  # AND to keep only eligible nodes
 
 reco_calo_mask = truth_calo_mask | sampled_extra
 ```
 
-Without this, Stream C trains only on clean HS nodes and would degrade at inference time when Stream B makes imperfect predictions. The sampled noise teaches Stream C to be robust to ~300 residual pileup nodes.
+Without this, Stream C trains only on clean HS nodes and would degrade at inference time when Stream B makes imperfect predictions. The sampled noise teaches Stream C to be robust to residual pileup nodes (up to `reco_calo_noise_mean` per event).
 
 The original `MaskFormer` has no teacher forcing concept — it processes all nodes equally in all stages.
 
@@ -506,7 +517,7 @@ The original `MaskFormer` has no teacher forcing concept — it processes all no
 
 ### Custom `MaskFormer.loss()` ([maskformer.py](maskformer.py))
 
-The experiment uses a custom copy of `MaskFormer` with two changes in `loss()`:
+The experiment uses a custom copy of `MaskFormer` with three changes in `loss()`:
 
 **1. Pileup exclusion from matcher** — Query 0 and target 0 are removed before matching:
 
@@ -514,7 +525,7 @@ The experiment uses a custom copy of `MaskFormer` with two changes in `loss()`:
 # maskformer.py (experiment-local)
 # Exclude pileup from matching entirely
 cost_no_pu = cost[:, 1:, 1:]  # queries[1:] vs targets[1:]
-valid_no_pu = targets[valid_key][:, 1:]
+valid_no_pu = targets[f"{self.target_object}_valid"][:, 1:]
 
 pred_idxs_no_pu = self.matcher(cost_no_pu, valid_no_pu)
 
@@ -522,21 +533,29 @@ pred_idxs_no_pu = self.matcher(cost_no_pu, valid_no_pu)
 pred_idxs = torch.cat([zeros, pred_idxs_no_pu + 1], dim=1)
 ```
 
-**2. Regression exclusion for pileup** — In the loss loop, `IncidenceBasedRegressionTask` temporarily masks position 0:
+**2. Classification exclusion for pileup** — Target class at position 0 is set to -100 so `F.cross_entropy` ignores it:
 
 ```python
 # maskformer.py (experiment-local)
-for task in self.tasks:
-    if isinstance(task, IncidenceBasedRegressionTask):
-        saved = targets[valid_key][:, 0].clone()
-        targets[valid_key][:, 0] = False     # exclude pileup from regression
-        losses[layer_name][task.name] = task.loss(...)
-        targets[valid_key][:, 0] = saved     # restore
-    else:
-        losses[layer_name][task.name] = task.loss(...)
+if isinstance(task, ObjectClassificationTask):
+    masked_class = targets[class_key].clone()
+    masked_class[:, 0] = -100  # ignore_index for cross-entropy
+    masked_targets = {**targets, class_key: masked_class}
+    losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], masked_targets)
 ```
 
-All other tasks (classification, mask, incidence KL) include the pileup token at position 0.
+**3. Regression exclusion for pileup** — `IncidenceBasedRegressionTask` uses a cloned valid mask with position 0 set to False:
+
+```python
+# maskformer.py (experiment-local)
+if isinstance(task, IncidenceBasedRegressionTask):
+    masked_valid = targets[valid_key].clone()
+    masked_valid[:, 0] = False               # exclude pileup from regression
+    masked_targets = {**targets, valid_key: masked_valid}
+    losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], masked_targets)
+```
+
+All other tasks (mask, incidence KL) include the pileup token at position 0. Classification and regression are excluded as shown above.
 
 ### `TwoStreamMaskFormer.loss()`
 
@@ -580,20 +599,36 @@ def loss(self, outputs, targets):
 def _build_reco_targets(self, targets):
     indices = self._reco_node_indices    # (B, 1400) — stored during forward()
 
-    for key in ["node_valid", "node_incidence"]:
+    # Copy scalar particle-level targets as-is
+    for key, val in targets.items():
+        if key.startswith("reco_particle_"):
+            suffix = key[len("reco_particle_"):]
+            reco_targets[f"{self.reco_target_object}_{suffix}"] = val
+
+    # Reindex node-level 3D targets: (B, num_objects, max_nodes) → (B, num_objects, max_reco_nodes)
+    for key in ["node_valid", "incidence"]:
         src_key = f"{self.reco_target_object}_{key}"
         if src_key in reco_targets and reco_targets[src_key].dim() == 3:
             num_objects = reco_targets[src_key].shape[1]
             idx_expanded = indices.unsqueeze(1).expand(-1, num_objects, -1)  # view, zero-copy
             reco_targets[src_key] = torch.gather(reco_targets[src_key], 2, idx_expanded)
             # (B, 400, 5500) → (B, 400, 1400) in one GPU kernel
+
+    # 2D node_valid mask from filtered space
+    reco_targets["node_valid"] = self._reco_filtered_valid
+
+    # node_is_track reindexed to filtered space
+    if "node_is_track" in targets:
+        reco_targets["node_is_track"] = torch.gather(targets["node_is_track"], 1, indices)
 ```
 
 ---
 
 ## 7. Prediction
 
-### Original `MaskFormer.predict()`
+### Custom `MaskFormer.predict()` ([maskformer.py](maskformer.py))
+
+The experiment-local `MaskFormer.predict()` adds special handling for query 0 (the pileup sink):
 
 ```python
 # maskformer.py
@@ -605,6 +640,12 @@ def predict(self, outputs):
             if layer_name != "final" and not task.has_intermediate_loss:
                 continue
             preds[layer_name][task.name] = task.predict(layer_outputs[task.name])
+
+            # Query 0 (pileup sink) is always valid — bypass null filtering
+            if isinstance(task, ObjectClassificationTask):
+                valid_key = task.output_object + "_valid"
+                if valid_key in preds[layer_name][task.name]:
+                    preds[layer_name][task.name][valid_key][:, 0] = True
     return preds
 ```
 
@@ -722,23 +763,44 @@ Trackless charged particles are reclassified to their neutral counterpart (charg
 
 ## 10. Config Key Differences
 
-**Stream C specific config in [configs/base.yaml](configs/base.yaml):**
+**Key model-level config in [configs/base.yaml](configs/base.yaml):**
 
 ```yaml
 model:
   model:
     class_path: hepattn.experiments.odd_pileup_reco.model.TwoStreamMaskFormer
     init_args:
-      # Noise injection parameters (training only)
-      reco_calo_noise_mean: 300    # ~N(300, 50) extra pileup nodes per event
-      reco_calo_noise_std: 50.0
-      max_reco_calo_nodes: 1200    # Top-k calo filter
-      max_reco_nodes: 1400         # Padded sequence length for Stream C
-      num_reco_queries: 400        # Max reconstructed particles
-      reco_target_object: reco_particle
-      calo_pred_threshold: 0.2     # Stream B threshold for inference filtering
+      dim: &dim 128
+      max_hs_tracks: 190             # max HS tracks for hybrid queries
+      num_latent_queries: 16         # learnable latent queries for Stream B
       teacher_forcing: true
 
+      # Noise injection parameters (training only)
+      reco_calo_noise_mean: 300      # up to 300 extra pileup nodes per event
+      reco_calo_noise_std: 50.0
+      max_reco_calo_nodes: 1200      # Top-k calo filter
+      max_reco_nodes: 1400           # Padded sequence length for Stream C
+      num_reco_queries: 400          # Max reconstructed particles
+      reco_target_object: reco_particle
+      calo_pred_threshold: 0.2       # Stream B threshold for inference filtering
+```
+
+**Stream A tasks** include an `ObjectHitMaskTask` (HS track classification) and an `ObjectRegressionTask` (vertex z regression):
+
+```yaml
+      track_tasks:
+        - class_path: hepattn.models.task.ObjectHitMaskTask  # HS track mask
+        - class_path: hepattn.models.task.ObjectRegressionTask
+          init_args:
+            fields: [vz]             # vertex z regression
+            loss: smooth_l1
+```
+
+**Stream B** uses the `CaloFlashCrossAttentionDecoder` with a `CaloNodeMaskTask` (node-level HS/PU classifier with Tversky loss).
+
+**Stream C reconstruction config:**
+
+```yaml
       reco_decoder:
         class_path: hepattn.models.decoder.MaskFormerDecoder
         init_args:
@@ -756,6 +818,7 @@ model:
         class_path: hepattn.models.matcher.Matcher
         init_args:
           default_solver: scipy
+          adaptive_solver: false
           parallel_solver: true
           n_jobs: 16
 
@@ -796,8 +859,8 @@ Compare to the original `odd` experiment where `dim=256` and `input_size=518`. H
 | Decoder | `self.decoder(x, ...)` | A: `track_decoder`, B: `calo_decoder`, C: `reco_model.decoder` |
 | Tasks | `self.tasks` | A: `track_tasks`, B: `calo_tasks`, C: inside `reco_model` |
 | Hungarian matching | inside `self.matcher` | only for Stream C; query 0 excluded from matcher (pileup), rest matched normally |
-| Loss | `self.loss(outputs, targets)` | A+B: direct, C: custom `reco_model.loss()` (pileup: class+mask+incidence only; residual: class only) |
+| Loss | `self.loss(outputs, targets)` | A+B: direct, C: custom `reco_model.loss()` (pileup: mask+incidence only; class+regression excluded) |
 | Predict | `self.predict(outputs)` | A+B: direct, C: `self.reco_model.predict(reco_layer_outputs)` |
 | Gradient isolation | none | `node_embed.detach()` before Bridge |
 | Skip connection | none | `x["key_embed"] + initial_encoder_embed` for C |
-| Noise robustness | none | ~N(300,50) extra predicted calo nodes injected into C during training |
+| Noise robustness | none | up to `reco_calo_noise_mean` extra predicted calo nodes injected into C during training |

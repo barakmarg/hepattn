@@ -714,8 +714,9 @@ class ODDDatasetPileup(Dataset):
             padded[1:n_particles + 1] = val[:n_particles]
             particle_data[key] = padded
 
-        # Pileup token at position 0: dummy class 0 (ignored in loss via ignore_index=-100)
-        particle_data["class"][0] = 0
+        # Pileup token at position 0: null class (ignored in loss via ignore_index=-100,
+        # but null class improves Hungarian matching cost vs the old charged-hadron dummy).
+        particle_data["class"][0] = 5
         particle_data["is_charged"][0] = 0
 
         # --- Incidence matrix (num_objects x n_nodes) ---
@@ -723,13 +724,18 @@ class ODDDatasetPileup(Dataset):
         incidence_matrix = np.zeros((self.num_objects, n_nodes))
         indicator = torch.zeros(self.num_objects)
 
-        # Tracks: only valid HS track→particle assignments go to rows 1..n_particles.
-        # PU tracks (track_particle_idx == -1) are left unassigned (all-zero column).
+        # Tracks: valid HS track→particle assignments go to rows 1..n_particles.
+        # PU tracks (track_particle_idx == -1) are absorbed by row 0 (pileup token).
         track_idx = np.arange(len(t_particle_idx), dtype=np.int64)
         t_pidx_np = t_particle_idx.numpy() if isinstance(t_particle_idx, torch.Tensor) else np.asarray(t_particle_idx)
         valid_track_assoc = (t_pidx_np >= 0) & (t_pidx_np < n_particles)
         if np.any(valid_track_assoc):
             incidence_matrix[t_pidx_np[valid_track_assoc] + 1, track_idx[valid_track_assoc]] = 1.0
+        # PU tracks (-1 sentinel) go to row 0 so their incidence column sums to 1.0
+        # after normalisation — providing valid KL-Divergence gradient signal.
+        pu_track_assoc = (t_pidx_np == -1)
+        if np.any(pu_track_assoc):
+            incidence_matrix[0, track_idx[pu_track_assoc]] = 1.0
 
         # Cluster deposits from raw_deps (HS particle → cluster), shifted +1
         d_particle_idx_np = get_t("raw_deps_particle_idx", rd_start, rd_end).numpy()

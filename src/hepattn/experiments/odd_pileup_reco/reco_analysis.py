@@ -132,6 +132,8 @@ def load_pflow_data(
         node_phi = None
         node_e = None
         calo_hs_energy = None
+        calo_hs_frac = None
+        calo_prob = None
         node_pt = None
         if "reco_node_indices" in f:
             idx_ds = f["reco_node_indices"]
@@ -178,10 +180,19 @@ def load_pflow_data(
                 calo_hs_energy = nm["calo_hs_energy"][sel].astype(np.float32)
                 if calo_hs_energy.ndim == 3 and calo_hs_energy.shape[-1] == 1:
                     calo_hs_energy = calo_hs_energy[..., 0]
+            if "calo_hs_frac" in nm.dtype.names:
+                calo_hs_frac = nm["calo_hs_frac"][sel].astype(np.float32)
+                if calo_hs_frac.ndim == 3 and calo_hs_frac.shape[-1] == 1:
+                    calo_hs_frac = calo_hs_frac[..., 0]
             if "node_pt" in nm.dtype.names:
                 node_pt = nm["node_pt"][sel].astype(np.float32)
                 if node_pt.ndim == 3 and node_pt.shape[-1] == 1:
                     node_pt = node_pt[..., 0]
+        if "calo_mask" in f:
+            _cp = f["calo_mask"]["calo_prob"][sel].astype(np.float32)
+            _cp = np.squeeze(_cp, axis=tuple(i for i in range(1, _cp.ndim) if i != 0 and _cp.shape[i] == 1))
+            if _cp.ndim == 2:
+                calo_prob = _cp
 
         # -- Incidence --
         pflow_incidence = truth_incidence = pflow_incidence_filtered = None
@@ -231,6 +242,8 @@ def load_pflow_data(
         "node_phi": node_phi,
         "node_e": node_e,
         "calo_hs_energy": calo_hs_energy,
+        "calo_hs_frac": calo_hs_frac,
+        "calo_prob": calo_prob,
         "node_pt": node_pt,
     }
 
@@ -270,6 +283,8 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
     node_phi = reco_data.get("node_phi")
     node_e = reco_data.get("node_e")
     calo_hs_energy = reco_data.get("calo_hs_energy")
+    calo_hs_frac = reco_data.get("calo_hs_frac")
+    calo_prob = reco_data.get("calo_prob")
     node_pt = reco_data.get("node_pt")
 
     return {
@@ -294,6 +309,8 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
         "node_phi": node_phi,
         "node_e": node_e,
         "calo_hs_energy": calo_hs_energy,
+        "calo_hs_frac": calo_hs_frac,
+        "calo_prob": calo_prob,
         "node_pt": node_pt,
     }
 
@@ -2997,6 +3014,157 @@ def run_fp_neu_hadron_analysis(
     print(f"Done — {len(figs)} FP Neu Had plots generated.")
     return figs
 
+def plot_calo_mask_energy_purity(
+    data: dict,
+    calo_hs_frac_threshold: float = 0.05,
+    calo_hs_energy_threshold: float = 0.15,
+    calo_pred_threshold: float = 0.2,
+    max_reco_calo_nodes: int = 1200,
+    reco_calo_noise_mean: int = 300,
+) -> plt.Figure | None:
+    """Per-event HS energy purity of truth / training / pred calo masks fed into Stream C.
+
+    Mirrors the model's reco-node selection logic for three scenarios:
+
+    Truth path (oracle upper bound)
+        truth_calo_mask = (calo_hs_frac > frac_thr) & (calo_hs_energy > e_thr)
+                          & ~is_track & node_valid
+        → topK by node_e (max_reco_calo_nodes) within that mask
+
+    Training path (teacher-forcing, matches what Stream C sees during training)
+        extra_pred  = pred_calo_mask & ~truth_calo_mask  (FP nodes from Stream B)
+        sampled_pu  = random sample of reco_calo_noise_mean nodes from extra_pred
+        training_mask = truth_calo_mask | sampled_pu
+        → topK by node_e within that mask
+
+    Pred path (inference, matches what Stream C sees at test time)
+        pred_calo_mask = sigmoid(calo_prob) >= pred_thr & ~is_track & node_valid
+        → topK by node_e (already applied by model; captured in reco_node_indices
+          non-track entries)
+
+    For each event computes:
+        ratio = sum(calo_hs_energy × mask) / sum(node_e × mask)
+
+    Closer to 1 = the reconstruction pipeline input is dominated by HS energy.
+    """
+    required = {"node_e", "calo_hs_energy", "calo_hs_frac", "node_is_track", "node_valid"}
+    if not required.issubset({k for k, v in data.items() if v is not None}):
+        return None
+
+    node_e         = np.asarray(data["node_e"],         dtype=np.float64)  # (N, 5500)
+    calo_hs_energy = np.asarray(data["calo_hs_energy"], dtype=np.float64)  # (N, 5500)
+    calo_hs_frac   = np.asarray(data["calo_hs_frac"],   dtype=np.float64)  # (N, 5500)
+    node_is_track  = np.asarray(data["node_is_track"],  dtype=bool)        # (N, 5500)
+    node_valid     = np.asarray(data["node_valid"],     dtype=bool)        # (N, 5500)
+
+    N      = node_e.shape[0]
+    arange = np.arange(N)[:, None]
+
+    # ── Shared helper: topK purity ─────────────────────────────────────────
+    def _topk_purity(mask2d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Given a (N, M) bool mask, take topK by energy and return (hs_sum, total_sum)."""
+        e_masked  = np.where(mask2d, node_e, 0.0)
+        topk_idx  = np.argsort(-e_masked, axis=1)[:, :max_reco_calo_nodes]
+        topk_e    = node_e[arange, topk_idx]
+        topk_hs_e = calo_hs_energy[arange, topk_idx]
+        topk_ok   = mask2d[arange, topk_idx]          # only count truly masked nodes
+        return (topk_hs_e * topk_ok).sum(axis=1), (topk_e * topk_ok).sum(axis=1)
+
+    def _ratio_vals(hs_sum: np.ndarray, total_sum: np.ndarray):
+        valid = total_sum > 0
+        ratio = np.where(valid, hs_sum / np.where(valid, total_sum, 1.0), np.nan)
+        return ratio[valid], valid
+
+    # ── Truth mask ─────────────────────────────────────────────────────────
+    truth_calo_mask = (
+        (calo_hs_frac   > calo_hs_frac_threshold)
+        & (calo_hs_energy > calo_hs_energy_threshold)
+        & ~node_is_track
+        & node_valid
+    )  # (N, 5500)
+
+    truth_vals, valid_truth = _ratio_vals(*_topk_purity(truth_calo_mask))
+
+    # ── Training mask (truth + sampled FP PU, mirrors teacher-forcing) ────
+    train_vals = None
+    calo_prob_arr = data.get("calo_prob")
+    if calo_prob_arr is not None:
+        calo_prob_arr = np.asarray(calo_prob_arr, dtype=np.float64)         # (N, 5500)
+        pred_calo_mask = (
+            (calo_prob_arr >= calo_pred_threshold)
+            & ~node_is_track
+            & node_valid
+        )  # (N, 5500)
+        extra_pred = pred_calo_mask & ~truth_calo_mask                      # FP nodes
+
+        # Random sample reco_calo_noise_mean nodes per event from extra_pred
+        rng = np.random.default_rng(seed=0)
+        noise_scores = np.where(extra_pred, rng.random((N, node_e.shape[1])), -1.0)
+        sample_idx   = np.argsort(-noise_scores, axis=1)[:, :reco_calo_noise_mean]
+        sampled_extra = np.zeros_like(extra_pred)
+        np.put_along_axis(sampled_extra, sample_idx, True, axis=1)
+        sampled_extra &= extra_pred                                          # guard
+
+        training_mask = truth_calo_mask | sampled_extra
+        train_vals, _ = _ratio_vals(*_topk_purity(training_mask))
+
+    # ── Pred mask (topK already applied by model → reco_node_indices) ─────
+    reco_node_indices = data.get("reco_node_indices")
+    reco_is_track     = data.get("reco_is_track")
+
+    pred_vals = None
+    if reco_node_indices is not None and reco_is_track is not None:
+        reco_node_indices = np.asarray(reco_node_indices, dtype=np.int64)  # (N, 1400)
+        reco_is_track     = np.asarray(reco_is_track,     dtype=bool)      # (N, 1400)
+
+        n_full   = node_e.shape[1]
+        safe_idx = np.clip(reco_node_indices, 0, n_full - 1)
+
+        reco_e    = node_e[arange, safe_idx].copy()            # (N, 1400)
+        reco_hs_e = calo_hs_energy[arange, safe_idx].copy()   # (N, 1400)
+
+        invalid = (reco_node_indices < 0) | (reco_node_indices >= n_full)
+        reco_e[invalid]    = 0.0
+        reco_hs_e[invalid] = 0.0
+
+        pred_calo      = ~reco_is_track
+        pred_hs_sum    = (reco_hs_e * pred_calo).sum(axis=1)
+        pred_total_sum = (reco_e    * pred_calo).sum(axis=1)
+        pred_vals, _   = _ratio_vals(pred_hs_sum, pred_total_sum)
+
+    bins = np.linspace(0.0, 1.0, 51)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.hist(
+        truth_vals, bins=bins, histtype="step", linewidth=2.2, density=True,
+        color="#4c72b0",
+        label=f"Truth mask + topK          n={valid_truth.sum()}  mean={truth_vals.mean():.3f}  median={np.median(truth_vals):.3f}",
+    )
+    if train_vals is not None:
+        ax.hist(
+            train_vals, bins=bins, histtype="step", linewidth=2.2, density=True,
+            color="#55a868",
+            label=f"Training mask + topK       n={train_vals.size}  mean={train_vals.mean():.3f}  median={np.median(train_vals):.3f}",
+        )
+    if pred_vals is not None:
+        ax.hist(
+            pred_vals, bins=bins, histtype="step", linewidth=2.2, density=True,
+            color="#dd8452",
+            label=f"Pred mask + topK (inference) n={pred_vals.size}  mean={pred_vals.mean():.3f}  median={np.median(pred_vals):.3f}",
+        )
+    ax.set_xlabel(r"$\sum$(HS energy) / $\sum$(total energy)  of selected calo nodes  [per event]", fontsize=11)
+    ax.set_ylabel("Density")
+    ax.set_title(
+        "Stream B pileup removal: HS energy purity of reconstruction pipeline input\n"
+        f"(frac thr={calo_hs_frac_threshold}, E thr={calo_hs_energy_threshold} GeV, "
+        f"pred thr={calo_pred_threshold}, topK={max_reco_calo_nodes}, noise={reco_calo_noise_mean})"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
 def run_reco_analysis(
     data: dict,
     ind_threshold: float = 0.5,
@@ -3036,6 +3204,9 @@ def run_reco_analysis(
             print(f"  {name:<50s} {time.perf_counter() - t0:.2f}s")
         else:
             print(f"  {name:<50s} skipped (data unavailable)")
+
+    print("Calo mask purity…")
+    _plot("reco_analysis/calo_mask_hs_energy_purity", plot_calo_mask_energy_purity, data)
 
     print("Particle-level plots…")
     _plot("reco_analysis/class_distribution",   plot_class_distribution,   data, ind_threshold)
