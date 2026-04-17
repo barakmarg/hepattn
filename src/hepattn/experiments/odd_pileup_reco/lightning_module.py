@@ -8,6 +8,12 @@ import torchmetrics as tm
 from torch import nn
 
 from hepattn.experiments.odd_pileup_maskformer.plots import PhysicsPlotter
+from hepattn.experiments.odd_pileup_reco.reco_analysis import (
+    cluster_jets,
+    plot_class_distribution,
+    plot_jet_resolution_with_calo,
+    pflow_data_from_eval_dicts,
+)
 from hepattn.models.wrapper import ModelWrapper
 
 
@@ -67,6 +73,9 @@ class ODDPFlowTwoStream(ModelWrapper):
         # Accumulation buffers for end-of-epoch physics plots
         self._val_track_data: dict[str, list] = defaultdict(list)
         self._val_cluster_data: dict[str, list] = defaultdict(list)
+        self._val_reco_data: dict[str, list] = defaultdict(list)
+        self._val_jet_data: dict[str, list] = defaultdict(list)
+        self._val_jet_event_count: int = 0
 
     # ------------------------------------------------------------------
     # Override training/validation steps to pass targets to forward
@@ -135,16 +144,23 @@ class ODDPFlowTwoStream(ModelWrapper):
     def on_validation_epoch_start(self) -> None:
         self._val_track_data = defaultdict(list)
         self._val_cluster_data = defaultdict(list)
+        self._val_reco_data = defaultdict(list)
+        self._val_jet_data = defaultdict(list)
+        self._val_jet_event_count = 0
         self._val_event_counter = 0
 
     def on_validation_epoch_end(self) -> None:
-        if not self._val_track_data and not self._val_cluster_data:
+        if not self._val_track_data and not self._val_cluster_data and not self._val_reco_data and not self._val_jet_data:
             return
 
         track = {k: np.concatenate(v) for k, v in self._val_track_data.items()}
         cluster = {k: np.concatenate(v) for k, v in self._val_cluster_data.items()}
+        reco = {k: np.concatenate(v) for k, v in self._val_reco_data.items()}
 
         figs = {}
+
+        if reco.get("pflow_class") is not None and len(reco["pflow_class"]) > 0:
+            figs["reco/class_distribution"] = plot_class_distribution(reco)
         if cluster.get("evt_pred_neutral_e") is not None and len(cluster.get("evt_pred_neutral_e", [])) > 0:
             figs["calo/hs_energy_residual_by_type"] = PhysicsPlotter.plot_hs_energy_residual_by_type(
                 cluster["evt_pred_neutral_e"], cluster["evt_truth_neutral_e"],
@@ -181,6 +197,57 @@ class ODDPFlowTwoStream(ModelWrapper):
             figs["track/pt_dist"] = PhysicsPlotter.plot_track_pt_distribution(
                 track["probs"], track["truth"], track["pt"]
             )
+
+        # Jet resolution with calo (first 1000 validation events)
+        if self._val_jet_data.get("node_valid"):
+            jet = {k: np.concatenate(v) for k, v in self._val_jet_data.items()}
+
+            # Inverse-transform particle kinematics from scaled → physical space
+            scaler = None
+            try:
+                scaler = self.trainer.datamodule.scaler
+            except AttributeError:
+                pass
+            if scaler is not None:
+                for _field in ("pt", "eta", "sinphi", "cosphi"):
+                    _tr = scaler.transforms[_field]
+                    for _prefix in ("pred", "truth"):
+                        _key = f"{_prefix}_{_field}"
+                        if _key in jet:
+                            _arr = jet[_key].astype(np.float32)
+                            _nan = np.isnan(_arr)
+                            _t = torch.from_numpy(np.where(_nan, 0.0, _arr))
+                            _out = _tr.inverse_transform(_t).numpy()
+                            _out[_nan] = np.nan
+                            jet[_key] = _out
+
+            # Build data dict for reco_analysis clustering functions
+            _jet_reco = {
+                "truth_class": jet.get("truth_class"),
+                "pred_class":  jet.get("pred_class"),
+                "truth_pt":    jet.get("truth_pt"),
+                "truth_eta":   jet.get("truth_eta"),
+                "truth_sinphi": jet.get("truth_sinphi"),
+                "truth_cosphi": jet.get("truth_cosphi"),
+                "pred_pt":     jet.get("pred_pt"),
+                "pred_eta":    jet.get("pred_eta"),
+                "pred_sinphi": jet.get("pred_sinphi"),
+                "pred_cosphi": jet.get("pred_cosphi"),
+                "node_valid":    jet.get("node_valid"),
+                "node_is_track": jet.get("node_is_track"),
+                "node_eta":      jet.get("node_eta"),
+                "node_phi":      jet.get("node_phi"),
+                "node_e":        jet.get("node_e"),
+                "calo_hs_energy": jet.get("calo_hs_energy"),
+            }
+            try:
+                _data = pflow_data_from_eval_dicts(_jet_reco)
+                _jets = cluster_jets(_data)
+                _fig = plot_jet_resolution_with_calo(_jets, _data, compare_jets=None)
+                if _fig is not None:
+                    figs["reco/jet_resolution_with_calo"] = _fig
+            except Exception as _e:
+                print(f"Jet resolution plot failed: {_e}")
 
         # Log to CometML
         if self.logger is not None and hasattr(self.logger, "experiment"):
@@ -316,6 +383,40 @@ class ODDPFlowTwoStream(ModelWrapper):
                 self.log(f"{stage}/reco_obj_class_accuracy_micro", self.obj_accuracy_micro, **kwargs)
                 self.obj_accuracy_macro(particle_class_preds.view(-1), particle_class_labels.view(-1))
                 self.log(f"{stage}/reco_obj_class_accuracy_macro", self.obj_accuracy_macro, **kwargs)
+
+                if stage == "val":
+                    self._val_reco_data["pflow_class"].append(particle_class_preds.detach().cpu().numpy())
+                    self._val_reco_data["truth_class"].append(particle_class_labels.detach().cpu().numpy())
+
+                    # Accumulate jet resolution data (first 1000 events only)
+                    _MAX_JET_EVENTS = 1000
+                    if self._val_jet_event_count < _MAX_JET_EVENTS:
+                        _take = min(particle_class_preds.shape[0], _MAX_JET_EVENTS - self._val_jet_event_count)
+                        self._val_jet_data["pred_class"].append(particle_class_preds[:_take].detach().cpu().numpy())
+                        self._val_jet_data["truth_class"].append(particle_class_labels[:_take].cpu().numpy())
+                        # Particle kinematics (scaled — inverse-transformed at epoch end)
+                        if "regression" in reco_final:
+                            reco_obj = self.model.reco_target_object
+                            for _field in ("pt", "eta", "sinphi", "cosphi"):
+                                _pk = f"reco_pflow_{_field}"
+                                _tk = f"{reco_obj}_{_field}"
+                                if _pk in reco_final["regression"]:
+                                    self._val_jet_data[f"pred_{_field}"].append(
+                                        reco_final["regression"][_pk][:_take].detach().cpu().numpy()
+                                    )
+                                if _tk in labels:
+                                    self._val_jet_data[f"truth_{_field}"].append(
+                                        labels[_tk][:_take].cpu().numpy()
+                                    )
+                        # Node-level data (physical space — no transform needed)
+                        for _nk in ("node_valid", "node_is_track", "node_eta", "node_phi", "node_e"):
+                            if _nk in labels:
+                                self._val_jet_data[_nk].append(labels[_nk][:_take].cpu().numpy())
+                        if "calo_hard_scatter_energy" in labels:
+                            self._val_jet_data["calo_hs_energy"].append(
+                                labels["calo_hard_scatter_energy"][:_take].cpu().numpy()
+                            )
+                        self._val_jet_event_count += _take
 
                 truth_valid = particle_class_labels < 5
                 pred_valid = particle_class_preds < 5
