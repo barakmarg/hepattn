@@ -10,6 +10,7 @@ from torch import nn
 from hepattn.experiments.odd_pileup_maskformer.plots import PhysicsPlotter
 from hepattn.experiments.odd_pileup_reco.reco_analysis import (
     cluster_jets,
+    plot_calo_mask_energy_purity,
     plot_class_distribution,
     plot_jet_resolution_with_calo,
     pflow_data_from_eval_dicts,
@@ -240,6 +241,21 @@ class ODDPFlowTwoStream(ModelWrapper):
                 "node_e":        jet.get("node_e"),
                 "calo_hs_energy": jet.get("calo_hs_energy"),
             }
+            # Calo mask energy purity plot
+            _purity_data = {
+                "node_e":        jet.get("node_e"),
+                "calo_hs_energy": jet.get("calo_hs_energy"),
+                "calo_hs_frac":  jet.get("calo_hs_frac"),
+                "node_is_track": jet.get("node_is_track"),
+                "node_valid":    jet.get("node_valid"),
+                "calo_prob":     jet.get("calo_prob"),
+                "reco_node_indices": jet.get("reco_node_indices"),
+                "reco_is_track":     jet.get("reco_is_track"),
+            }
+            _purity_fig = plot_calo_mask_energy_purity(_purity_data)
+            if _purity_fig is not None:
+                figs["reco_analysis/calo_mask_hs_energy_purity"] = _purity_fig
+
             try:
                 _data = pflow_data_from_eval_dicts(_jet_reco)
                 _jets = cluster_jets(_data)
@@ -416,6 +432,24 @@ class ODDPFlowTwoStream(ModelWrapper):
                             self._val_jet_data["calo_hs_energy"].append(
                                 labels["calo_hard_scatter_energy"][:_take].cpu().numpy()
                             )
+                        if "calo_hard_scatter_energy_frac" in labels:
+                            self._val_jet_data["calo_hs_frac"].append(
+                                labels["calo_hard_scatter_energy_frac"][:_take].cpu().numpy()
+                            )
+                        # calo_prob: full node-space sigmoid probs from Stream B
+                        _calo_final = preds.get("calo_final", {})
+                        if "calo_mask" in _calo_final and "calo_node_prob" in _calo_final["calo_mask"]:
+                            self._val_jet_data["calo_prob"].append(
+                                _calo_final["calo_mask"]["calo_node_prob"][:_take].detach().cpu().numpy()
+                            )
+                        # reco_node_indices / reco_is_track for pred-path purity
+                        if hasattr(self.model, "_reco_node_indices"):
+                            _rni = self.model._reco_node_indices[:_take]  # (take, 1400)
+                            self._val_jet_data["reco_node_indices"].append(_rni.cpu().numpy())
+                            _is_track_full = labels["node_is_track"][:_take]  # (take, 5500)
+                            _safe = _rni.clamp(0, _is_track_full.shape[1] - 1)
+                            _rit = _is_track_full.gather(1, _safe)  # (take, 1400)
+                            self._val_jet_data["reco_is_track"].append(_rit.cpu().numpy())
                         self._val_jet_event_count += _take
 
                 truth_valid = particle_class_labels < 5
