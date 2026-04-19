@@ -418,29 +418,33 @@ class ODDPFlowTwoStream(ModelWrapper):
                                 _tk = f"{reco_obj}_{_field}"
                                 if _pk in reco_final["regression"]:
                                     self._val_jet_data[f"pred_{_field}"].append(
-                                        reco_final["regression"][_pk][:_take].detach().cpu().numpy()
+                                        reco_final["regression"][_pk][:_take].detach().float().cpu().numpy()
                                     )
                                 if _tk in labels:
                                     self._val_jet_data[f"truth_{_field}"].append(
-                                        labels[_tk][:_take].cpu().numpy()
+                                        labels[_tk][:_take].float().cpu().numpy()
                                     )
-                        # Node-level data (physical space — no transform needed)
-                        for _nk in ("node_valid", "node_is_track", "node_eta", "node_phi", "node_e"):
+                        # Node-level data (physical space — no transform needed).
+                        # node_valid/node_is_track are bool, rest may be bf16 under AMP.
+                        for _nk in ("node_valid", "node_is_track"):
                             if _nk in labels:
                                 self._val_jet_data[_nk].append(labels[_nk][:_take].cpu().numpy())
+                        for _nk in ("node_eta", "node_phi", "node_e"):
+                            if _nk in labels:
+                                self._val_jet_data[_nk].append(labels[_nk][:_take].float().cpu().numpy())
                         if "calo_hard_scatter_energy" in labels:
                             self._val_jet_data["calo_hs_energy"].append(
-                                labels["calo_hard_scatter_energy"][:_take].cpu().numpy()
+                                labels["calo_hard_scatter_energy"][:_take].float().cpu().numpy()
                             )
                         if "calo_hard_scatter_energy_frac" in labels:
                             self._val_jet_data["calo_hs_frac"].append(
-                                labels["calo_hard_scatter_energy_frac"][:_take].cpu().numpy()
+                                labels["calo_hard_scatter_energy_frac"][:_take].float().cpu().numpy()
                             )
                         # calo_prob: full node-space sigmoid probs from Stream B
                         _calo_final = preds.get("calo_final", {})
                         if "calo_mask" in _calo_final and "calo_node_prob" in _calo_final["calo_mask"]:
                             self._val_jet_data["calo_prob"].append(
-                                _calo_final["calo_mask"]["calo_node_prob"][:_take].detach().cpu().numpy()
+                                _calo_final["calo_mask"]["calo_node_prob"][:_take].detach().float().cpu().numpy()
                             )
                         # reco_node_indices / reco_is_track for pred-path purity
                         if hasattr(self.model, "_reco_node_indices"):

@@ -47,9 +47,9 @@ data:
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: -1
-  num_test: -1
-  num_val: -1
+  num_train: 40000
+  num_test: 4000
+  num_val: 4000
 
   batch_size: 64
   incidence_cutval: 0.01
@@ -253,9 +253,9 @@ model:
                     activation:
                       class_path: torch.nn.SiLU
                 null_weight: 0.05
-                pred_threshold: 0.2
+                pred_threshold: 0.3
                 hs_energy_threshold: 0.15
-                hs_frac_threshold: 0.05
+                hs_frac_threshold: 0.10
                 has_intermediate_loss: false
 
       # =====================================================================
@@ -265,10 +265,10 @@ model:
       max_reco_nodes: 1400
       num_reco_queries: *num_reco_particles
       reco_target_object: reco_particle
-      calo_hs_frac_threshold: 0.05
+      calo_hs_frac_threshold: 0.10
       calo_hs_energy_threshold: 0.15
-      calo_pred_threshold: 0.2
-      reco_calo_noise_mean: 300
+      calo_pred_threshold: 0.3
+      reco_calo_noise_mean: 250
       reco_calo_noise_std: 50.0
       reco_track_noise_mean: 15
 
