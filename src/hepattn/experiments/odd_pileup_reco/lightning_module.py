@@ -79,7 +79,6 @@ class ODDPFlowTwoStream(ModelWrapper):
         self._val_cluster_data: dict[str, list] = defaultdict(list)
         self._val_reco_data: dict[str, list] = defaultdict(list)
         self._val_jet_data: dict[str, list] = defaultdict(list)
-        self._val_jet_event_count: int = 0
 
     # ------------------------------------------------------------------
     # Override training/validation steps to pass targets to forward
@@ -150,7 +149,6 @@ class ODDPFlowTwoStream(ModelWrapper):
         self._val_cluster_data = defaultdict(list)
         self._val_reco_data = defaultdict(list)
         self._val_jet_data = defaultdict(list)
-        self._val_jet_event_count = 0
         self._val_event_counter = 0
 
     def on_validation_epoch_end(self) -> None:
@@ -202,16 +200,28 @@ class ODDPFlowTwoStream(ModelWrapper):
                 track["probs"], track["truth"], track["pt"]
             )
 
-        # Jet resolution with calo (first 1000 validation events)
+        # Particle-level reco plots (all validation events) + jet clustering (first 1000)
         if self._val_jet_data.get("node_valid"):
             jet = {k: np.concatenate(v) for k, v in self._val_jet_data.items()}
 
-            # Inverse-transform particle kinematics from scaled → physical space
+            # Obtain a FeatureScaler to inverse-transform particle kinematics.
+            # The scaler lives on val_dset/test_dset/train_dset, NOT on the datamodule
+            # itself — so check those, and fall back to rebuilding from scale_dict_path.
             scaler = None
-            try:
-                scaler = self.trainer.datamodule.scaler
-            except AttributeError:
-                pass
+            dm = getattr(self.trainer, "datamodule", None)
+            if dm is not None:
+                for _attr in ("val_dset", "test_dset", "train_dset"):
+                    _dset = getattr(dm, _attr, None)
+                    if _dset is not None and hasattr(_dset, "scaler"):
+                        scaler = _dset.scaler
+                        break
+                if scaler is None and getattr(dm, "scale_dict_path", ""):
+                    from hepattn.utils.scaling import FeatureScaler
+                    try:
+                        scaler = FeatureScaler(dm.scale_dict_path)
+                    except Exception as _e:
+                        print(f"Could not load FeatureScaler: {_e}")
+
             if scaler is not None:
                 for _field in ("pt", "eta", "sinphi", "cosphi"):
                     _tr = scaler.transforms[_field]
@@ -224,8 +234,25 @@ class ODDPFlowTwoStream(ModelWrapper):
                             _out = _tr.inverse_transform(_t).numpy()
                             _out[_nan] = np.nan
                             jet[_key] = _out
+            else:
+                print("WARNING: no FeatureScaler found — kinematic plots will show scaled (non-physical) values")
 
-            # Build data dict for reco_analysis clustering functions
+            # Calo mask energy purity plot (ALL events — cheap)
+            _purity_data = {
+                "node_e":        jet.get("node_e"),
+                "calo_hs_energy": jet.get("calo_hs_energy"),
+                "calo_hs_frac":  jet.get("calo_hs_frac"),
+                "node_is_track": jet.get("node_is_track"),
+                "node_valid":    jet.get("node_valid"),
+                "calo_prob":     jet.get("calo_prob"),
+                "reco_node_indices": jet.get("reco_node_indices"),
+                "reco_is_track":     jet.get("reco_is_track"),
+            }
+            _purity_fig = plot_calo_mask_energy_purity(_purity_data)
+            if _purity_fig is not None:
+                figs["reco_analysis/calo_mask_hs_energy_purity"] = _purity_fig
+
+            # Build particle-level data dict for feature + jet plots (ALL events).
             _jet_reco = {
                 "truth_class": jet.get("truth_class"),
                 "pred_class":  jet.get("pred_class"),
@@ -244,25 +271,9 @@ class ODDPFlowTwoStream(ModelWrapper):
                 "node_e":        jet.get("node_e"),
                 "calo_hs_energy": jet.get("calo_hs_energy"),
             }
-            # Calo mask energy purity plot
-            _purity_data = {
-                "node_e":        jet.get("node_e"),
-                "calo_hs_energy": jet.get("calo_hs_energy"),
-                "calo_hs_frac":  jet.get("calo_hs_frac"),
-                "node_is_track": jet.get("node_is_track"),
-                "node_valid":    jet.get("node_valid"),
-                "calo_prob":     jet.get("calo_prob"),
-                "reco_node_indices": jet.get("reco_node_indices"),
-                "reco_is_track":     jet.get("reco_is_track"),
-            }
-            _purity_fig = plot_calo_mask_energy_purity(_purity_data)
-            if _purity_fig is not None:
-                figs["reco_analysis/calo_mask_hs_energy_purity"] = _purity_fig
-
-            # Build particle-level data dict (used by feature plots and jet clustering).
             _data = pflow_data_from_eval_dicts(_jet_reco)
 
-            # Particle-level distribution plots (no fastjet needed).
+            # Particle-level distribution plots (ALL events, no fastjet needed).
             try:
                 figs["reco_analysis/feature_distributions"] = plot_feature_distributions(_data)
                 figs["reco_analysis/feature_scatter"]       = plot_feature_scatter(_data)
@@ -270,10 +281,15 @@ class ODDPFlowTwoStream(ModelWrapper):
             except Exception as _e:
                 print(f"Particle-level reco plots failed: {_e}")
 
-            # Jet resolution with calo (requires fastjet).
+            # Jet resolution with calo (expensive — cap to first 1000 events).
             try:
-                _jets = cluster_jets(_data)
-                _fig = plot_jet_resolution_with_calo(_jets, _data, compare_jets=None)
+                _MAX_JET = 1000
+                _data_small = {
+                    k: (v[:_MAX_JET] if hasattr(v, "__len__") else v)
+                    for k, v in _data.items()
+                }
+                _jets = cluster_jets(_data_small)
+                _fig = plot_jet_resolution_with_calo(_jets, _data_small, compare_jets=None)
                 if _fig is not None:
                     figs["reco/jet_resolution_with_calo"] = _fig
             except Exception as _e:
@@ -418,57 +434,53 @@ class ODDPFlowTwoStream(ModelWrapper):
                     self._val_reco_data["pflow_class"].append(particle_class_preds.detach().cpu().numpy())
                     self._val_reco_data["truth_class"].append(particle_class_labels.detach().cpu().numpy())
 
-                    # Accumulate jet resolution data (first 1000 events only)
-                    _MAX_JET_EVENTS = 1000
-                    if self._val_jet_event_count < _MAX_JET_EVENTS:
-                        _take = min(particle_class_preds.shape[0], _MAX_JET_EVENTS - self._val_jet_event_count)
-                        self._val_jet_data["pred_class"].append(particle_class_preds[:_take].detach().cpu().numpy())
-                        self._val_jet_data["truth_class"].append(particle_class_labels[:_take].cpu().numpy())
-                        # Particle kinematics (scaled — inverse-transformed at epoch end)
-                        if "regression" in reco_final:
-                            reco_obj = self.model.reco_target_object
-                            for _field in ("pt", "eta", "sinphi", "cosphi"):
-                                _pk = f"reco_pflow_{_field}"
-                                _tk = f"{reco_obj}_{_field}"
-                                if _pk in reco_final["regression"]:
-                                    self._val_jet_data[f"pred_{_field}"].append(
-                                        reco_final["regression"][_pk][:_take].detach().float().cpu().numpy()
-                                    )
-                                if _tk in labels:
-                                    self._val_jet_data[f"truth_{_field}"].append(
-                                        labels[_tk][:_take].float().cpu().numpy()
-                                    )
-                        # Node-level data (physical space — no transform needed).
-                        # node_valid/node_is_track are bool, rest may be bf16 under AMP.
-                        for _nk in ("node_valid", "node_is_track"):
-                            if _nk in labels:
-                                self._val_jet_data[_nk].append(labels[_nk][:_take].cpu().numpy())
-                        for _nk in ("node_eta", "node_phi", "node_e"):
-                            if _nk in labels:
-                                self._val_jet_data[_nk].append(labels[_nk][:_take].float().cpu().numpy())
-                        if "calo_hard_scatter_energy" in labels:
-                            self._val_jet_data["calo_hs_energy"].append(
-                                labels["calo_hard_scatter_energy"][:_take].float().cpu().numpy()
-                            )
-                        if "calo_hard_scatter_energy_frac" in labels:
-                            self._val_jet_data["calo_hs_frac"].append(
-                                labels["calo_hard_scatter_energy_frac"][:_take].float().cpu().numpy()
-                            )
-                        # calo_prob: full node-space sigmoid probs from Stream B
-                        _calo_final = preds.get("calo_final", {})
-                        if "calo_mask" in _calo_final and "calo_node_prob" in _calo_final["calo_mask"]:
-                            self._val_jet_data["calo_prob"].append(
-                                _calo_final["calo_mask"]["calo_node_prob"][:_take].detach().float().cpu().numpy()
-                            )
-                        # reco_node_indices / reco_is_track for pred-path purity
-                        if hasattr(self.model, "_reco_node_indices"):
-                            _rni = self.model._reco_node_indices[:_take]  # (take, 1400)
-                            self._val_jet_data["reco_node_indices"].append(_rni.cpu().numpy())
-                            _is_track_full = labels["node_is_track"][:_take]  # (take, 5500)
-                            _safe = _rni.clamp(0, _is_track_full.shape[1] - 1)
-                            _rit = _is_track_full.gather(1, _safe)  # (take, 1400)
-                            self._val_jet_data["reco_is_track"].append(_rit.cpu().numpy())
-                        self._val_jet_event_count += _take
+                    # Accumulate reco kinematics + node fields for ALL validation events.
+                    # Jet clustering (expensive) is capped at 1000 at epoch-end time, not here.
+                    self._val_jet_data["pred_class"].append(particle_class_preds.detach().cpu().numpy())
+                    self._val_jet_data["truth_class"].append(particle_class_labels.cpu().numpy())
+                    # Particle kinematics (scaled — inverse-transformed at epoch end)
+                    if "regression" in reco_final:
+                        reco_obj = self.model.reco_target_object
+                        for _field in ("pt", "eta", "sinphi", "cosphi"):
+                            _pk = f"reco_pflow_{_field}"
+                            _tk = f"{reco_obj}_{_field}"
+                            if _pk in reco_final["regression"]:
+                                self._val_jet_data[f"pred_{_field}"].append(
+                                    reco_final["regression"][_pk].detach().float().cpu().numpy()
+                                )
+                            if _tk in labels:
+                                self._val_jet_data[f"truth_{_field}"].append(
+                                    labels[_tk].float().cpu().numpy()
+                                )
+                    # Node-level data (physical space — no transform needed).
+                    for _nk in ("node_valid", "node_is_track"):
+                        if _nk in labels:
+                            self._val_jet_data[_nk].append(labels[_nk].cpu().numpy())
+                    for _nk in ("node_eta", "node_phi", "node_e"):
+                        if _nk in labels:
+                            self._val_jet_data[_nk].append(labels[_nk].float().cpu().numpy())
+                    if "calo_hard_scatter_energy" in labels:
+                        self._val_jet_data["calo_hs_energy"].append(
+                            labels["calo_hard_scatter_energy"].float().cpu().numpy()
+                        )
+                    if "calo_hard_scatter_energy_frac" in labels:
+                        self._val_jet_data["calo_hs_frac"].append(
+                            labels["calo_hard_scatter_energy_frac"].float().cpu().numpy()
+                        )
+                    # calo_prob: full node-space sigmoid probs from Stream B
+                    _calo_final = preds.get("calo_final", {})
+                    if "calo_mask" in _calo_final and "calo_node_prob" in _calo_final["calo_mask"]:
+                        self._val_jet_data["calo_prob"].append(
+                            _calo_final["calo_mask"]["calo_node_prob"].detach().float().cpu().numpy()
+                        )
+                    # reco_node_indices / reco_is_track for pred-path purity
+                    if hasattr(self.model, "_reco_node_indices"):
+                        _rni = self.model._reco_node_indices  # (B, 1400)
+                        self._val_jet_data["reco_node_indices"].append(_rni.cpu().numpy())
+                        _is_track_full = labels["node_is_track"]  # (B, 5500)
+                        _safe = _rni.clamp(0, _is_track_full.shape[1] - 1)
+                        _rit = _is_track_full.gather(1, _safe)  # (B, 1400)
+                        self._val_jet_data["reco_is_track"].append(_rit.cpu().numpy())
 
                 truth_valid = particle_class_labels < 5
                 pred_valid = particle_class_preds < 5

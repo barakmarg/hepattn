@@ -317,8 +317,8 @@ model:
                     activation: torch.nn.SiLU
                     output_size: 6
                     hidden_layers: [128, 64, 32]
-                null_weight: 0.8
-                loss_class_weights: [1.0, 3.0, 8.0, 1.5, 1.0]
+                null_weight: 0.75
+                loss_class_weights: [1.12, 6.2, 9.0, 1.3, 1.0]
                 mask_queries: false
                 has_intermediate_loss: true
 
