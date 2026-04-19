@@ -12,7 +12,10 @@ from hepattn.experiments.odd_pileup_reco.reco_analysis import (
     cluster_jets,
     plot_calo_mask_energy_purity,
     plot_class_distribution,
+    plot_feature_distributions,
+    plot_feature_scatter,
     plot_jet_resolution_with_calo,
+    plot_n_particles_by_pt_bin,
     pflow_data_from_eval_dicts,
 )
 from hepattn.models.wrapper import ModelWrapper
@@ -256,8 +259,19 @@ class ODDPFlowTwoStream(ModelWrapper):
             if _purity_fig is not None:
                 figs["reco_analysis/calo_mask_hs_energy_purity"] = _purity_fig
 
+            # Build particle-level data dict (used by feature plots and jet clustering).
+            _data = pflow_data_from_eval_dicts(_jet_reco)
+
+            # Particle-level distribution plots (no fastjet needed).
             try:
-                _data = pflow_data_from_eval_dicts(_jet_reco)
+                figs["reco_analysis/feature_distributions"] = plot_feature_distributions(_data)
+                figs["reco_analysis/feature_scatter"]       = plot_feature_scatter(_data)
+                figs["reco_analysis/n_particles_by_pt_bin"] = plot_n_particles_by_pt_bin(_data)
+            except Exception as _e:
+                print(f"Particle-level reco plots failed: {_e}")
+
+            # Jet resolution with calo (requires fastjet).
+            try:
                 _jets = cluster_jets(_data)
                 _fig = plot_jet_resolution_with_calo(_jets, _data, compare_jets=None)
                 if _fig is not None:
