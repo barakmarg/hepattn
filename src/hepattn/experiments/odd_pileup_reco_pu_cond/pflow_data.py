@@ -90,6 +90,11 @@ class ODDDatasetPileup(Dataset):
         files_list: list[Path] | None = None,
         hard_scatter_energy_threshold: float = 0.03,
         window_size: int = 512,
+        pu_levels: list[int] | None = None,
+        base_pu_level: int = 200,
+        pu_condition_min: float = 0.0,
+        pu_condition_max: float = 200.0,
+        pu_sampling_seed: int = 42,
     ):
         """
         Initialize ODD Dataset.
@@ -131,9 +136,17 @@ class ODDDatasetPileup(Dataset):
         self.is_inference = is_inference
         self.window_size = window_size
         self.hard_scatter_energy_threshold = hard_scatter_energy_threshold
+        self.pu_levels = [int(x) for x in (pu_levels if pu_levels is not None else [200, 120, 50, 0])]
+        self.base_pu_level = int(base_pu_level)
+        self.pu_condition_min = float(pu_condition_min)
+        self.pu_condition_max = float(pu_condition_max)
+        self.pu_sampling_seed = int(pu_sampling_seed)
+        if self.pu_condition_max <= self.pu_condition_min:
+            raise ValueError("pu_condition_max must be larger than pu_condition_min")
 
         print(f"Loading ODD dataset from {filepath} with {num_events} samples")
         print(f"Is inference: {self.is_inference}")
+        print(f"PU levels: {self.pu_levels} (base PU level: {self.base_pu_level})")
 
         # Load data from parquet
         self.load_data(filepath,num_events)
@@ -187,6 +200,10 @@ class ODDDatasetPileup(Dataset):
             "event_id": [],
             "hard_scatter_vz": [],
         }
+        accumulated_cluster_vertex_cluster_idx = []
+        accumulated_cluster_vertex_indices = []
+        accumulated_cluster_vertex_energies = []
+        accumulated_cluster_count = 0
         
         total_events_loaded = 0
         stats_total_events = 0
@@ -275,10 +292,28 @@ class ODDDatasetPileup(Dataset):
             df_particles = df_particles.filter(mask)
             df_deps = df_deps.filter(mask)
             df_raw_deps = df_raw_deps.filter(mask)
+
+            n_clusters_kept = n_clusters[mask]
+            cluster_event_offsets = np.cumsum([0, *n_clusters_kept[:-1].tolist()]).astype(np.int64) + accumulated_cluster_count
+            df_cluster_vertices_flat = (
+                df_clusters
+                .with_columns(pl.Series("_cluster_event_offset", cluster_event_offsets))
+                .select(
+                    (pl.int_ranges(0, pl.col("cluster_id").list.len()) + pl.col("_cluster_event_offset")).alias("cluster_idx"),
+                    "vertex_primary_indices",
+                    "vertex_primary_energies",
+                )
+                .explode(["cluster_idx", "vertex_primary_indices", "vertex_primary_energies"])
+                .explode(["vertex_primary_indices", "vertex_primary_energies"])
+            )
+            accumulated_cluster_vertex_cluster_idx.append(df_cluster_vertices_flat["cluster_idx"].to_torch())
+            accumulated_cluster_vertex_indices.append(df_cluster_vertices_flat["vertex_primary_indices"].to_torch())
+            accumulated_cluster_vertex_energies.append(df_cluster_vertices_flat["vertex_primary_energies"].to_torch())
+            accumulated_cluster_count += int(n_clusters_kept.sum())
             
             # Counts
             accumulated_counts["n_tracks"].append(n_tracks[mask])
-            accumulated_counts["n_clusters"].append(n_clusters[mask])
+            accumulated_counts["n_clusters"].append(n_clusters_kept)
             accumulated_counts["n_particles"].append(n_particles[mask])
             accumulated_counts["n_deps"].append(n_deps[mask])
             accumulated_counts["n_raw_deps"].append(n_raw_deps[mask])
@@ -363,6 +398,11 @@ class ODDDatasetPileup(Dataset):
         self.n_raw_deps = np.concatenate(accumulated_counts["n_raw_deps"])
         self.event_number = np.concatenate(accumulated_counts["event_id"])
         self.hard_scatter_vz = np.concatenate(accumulated_counts["hard_scatter_vz"]) # Original used pl.Series/DataFrame column behaviour
+        self._finalize_cluster_vertex_contributions(
+            accumulated_cluster_vertex_cluster_idx,
+            accumulated_cluster_vertex_indices,
+            accumulated_cluster_vertex_energies,
+        )
         print("event numbers 10:", self.event_number[:10]) # Show first 10 event numbers for debugging
         # Concatenate features
         for key, tensor_list in accumulated_data.items():
@@ -417,7 +457,9 @@ class ODDDatasetPileup(Dataset):
         self.raw_deps_cumsum = np.cumsum([0, *self.n_raw_deps.tolist()])
         
         self.n_nodes = self.n_tracks + self.n_clusters
+        self._build_pu_variants()
         print(f"Number of events after filtering: {self.num_events}")
+        print(f"Number of PU-conditioned samples: {len(self)}")
 
         # Print pileup vs hard scatter track statistics
         vertex_primary = self.full_data_array["track_majority_particle_vertex_primary"]
@@ -436,6 +478,94 @@ class ODDDatasetPileup(Dataset):
             print(f"Energy composition: Total deposited HS energy {total_deps_energy:.2e} | Total cluster energy {total_cluster_energy:.2e} | Ratio {deps_to_cluster_ratio:.4f}")
 
         self.print_deltaR_stats(window_size=self.window_size)
+
+    def _finalize_cluster_vertex_contributions(
+        self,
+        cluster_idx_chunks: list[torch.Tensor],
+        vertex_idx_chunks: list[torch.Tensor],
+        vertex_energy_chunks: list[torch.Tensor],
+    ) -> None:
+        """Finalize flat cluster-vertex contribution tensors produced by Polars."""
+        total_clusters = int(self.n_clusters.sum())
+        if cluster_idx_chunks:
+            self.cluster_vertex_cluster_idx = torch.cat(cluster_idx_chunks).long()
+            self.cluster_vertex_indices_flat = torch.cat(vertex_idx_chunks).long()
+            self.cluster_vertex_energies_flat = torch.cat(vertex_energy_chunks).float()
+        else:
+            self.cluster_vertex_cluster_idx = torch.empty(0, dtype=torch.long)
+            self.cluster_vertex_indices_flat = torch.empty(0, dtype=torch.long)
+            self.cluster_vertex_energies_flat = torch.empty(0, dtype=torch.float32)
+
+        contribution_counts = torch.bincount(self.cluster_vertex_cluster_idx, minlength=total_clusters)
+        self.cluster_vertex_offsets = torch.zeros(total_clusters + 1, dtype=torch.long)
+        self.cluster_vertex_offsets[1:] = torch.cumsum(contribution_counts, dim=0)
+
+    def _event_base_and_pu(self, idx: int) -> tuple[int, int, int]:
+        """Map expanded dataset index to the stored base event and PU variation."""
+        n_levels = len(self.pu_levels)
+        base_idx = int(idx) // n_levels
+        pu_idx = int(idx) % n_levels
+        return base_idx, pu_idx, self.pu_levels[pu_idx]
+
+    def _scale_pu_level(self, pu_level: int) -> float:
+        raw = torch.tensor([float(pu_level)], dtype=torch.float32)
+        return float(self.scaler.transforms["pu_level_condition"].transform(raw).item())
+
+    def _build_pu_variants(self) -> None:
+        """Precompute lightweight selected-vertex sets for each base event and PU level."""
+        rng = np.random.default_rng(self.pu_sampling_seed)
+        self.pu_selected_vertices: list[list[frozenset[int] | None]] = []
+
+        for evt_idx in range(self.num_events):
+            t_start, t_end = self.track_cumsum[evt_idx], self.track_cumsum[evt_idx + 1]
+            track_vertices = self.full_data_array["track_majority_particle_vertex_primary"][t_start:t_end]
+
+            c_start, c_end = self.cluster_cumsum[evt_idx], self.cluster_cumsum[evt_idx + 1]
+            cv_start = int(self.cluster_vertex_offsets[c_start])
+            cv_end = int(self.cluster_vertex_offsets[c_end])
+            cluster_vertices = self.cluster_vertex_indices_flat[cv_start:cv_end]
+
+            vertices_tensor = torch.cat([track_vertices.long(), cluster_vertices])
+            vertices_tensor = vertices_tensor[vertices_tensor > 0].unique()
+            vertices = vertices_tensor.cpu().numpy()
+
+            non_hs_vertices = np.sort(vertices[vertices != 1]).astype(np.int64)
+            event_variants: list[frozenset[int] | None] = []
+            for pu_level in self.pu_levels:
+                if pu_level >= self.base_pu_level:
+                    event_variants.append(None)
+                    continue
+
+                n_pick = int(rng.poisson(float(pu_level)))
+                n_pick = min(n_pick, len(non_hs_vertices))
+                if n_pick > 0:
+                    sampled = rng.choice(non_hs_vertices, size=n_pick, replace=False)
+                    selected = {1, *[int(v) for v in sampled]}
+                else:
+                    selected = {1}
+                event_variants.append(frozenset(selected))
+            self.pu_selected_vertices.append(event_variants)
+
+    def _recalculate_cluster_energy(self, base_idx: int, selected_vertices: frozenset[int] | None, original_c_e: torch.Tensor) -> torch.Tensor:
+        """Return original or selected-vertex cluster energy for one base event."""
+        if selected_vertices is None:
+            return original_c_e
+
+        c_start, c_end = self.cluster_cumsum[base_idx], self.cluster_cumsum[base_idx + 1]
+        cv_start = int(self.cluster_vertex_offsets[c_start])
+        cv_end = int(self.cluster_vertex_offsets[c_end])
+
+        flat_vertices = self.cluster_vertex_indices_flat[cv_start:cv_end]
+        flat_energies = self.cluster_vertex_energies_flat[cv_start:cv_end]
+        flat_cluster_idx = self.cluster_vertex_cluster_idx[cv_start:cv_end] - int(c_start)
+
+        selected_tensor = torch.tensor(sorted(selected_vertices), dtype=flat_vertices.dtype)
+        contribution_mask = torch.isin(flat_vertices, selected_tensor)
+
+        energies = torch.zeros_like(original_c_e)
+        if contribution_mask.any():
+            energies.scatter_add_(0, flat_cluster_idx[contribution_mask], flat_energies[contribution_mask])
+        return energies
 
     def print_deltaR_stats(self, n_sample: int = 100, window_size: int = 512) -> None:
         """Sample events and print delta R statistics within a Z-order sorted window.
@@ -499,7 +629,7 @@ class ODDDatasetPileup(Dataset):
             print(f"-------------------------------------------------------------------------")
 
     def __len__(self) -> int:
-        return int(self.num_events)
+        return int(self.num_events * len(self.pu_levels))
 
     def load_event(self, idx: int) -> dict[str, Any]:
         """
@@ -525,17 +655,20 @@ class ODDDatasetPileup(Dataset):
         """
         # 1. Calculate Slices
         # ---------------------------------------------------------------------
-        n_tracks = self.n_tracks[idx]
-        n_clusters = self.n_clusters[idx]
-        n_nodes = n_tracks + n_clusters
-        
-        n_particles = self.n_particles[idx]
+        base_idx, pu_idx, pu_level = self._event_base_and_pu(idx)
+        selected_vertices = self.pu_selected_vertices[base_idx][pu_idx]
+        pu_level_scaled = self._scale_pu_level(pu_level)
 
-        t_start, t_end = self.track_cumsum[idx], self.track_cumsum[idx+1]
-        c_start, c_end = self.cluster_cumsum[idx], self.cluster_cumsum[idx+1]
-        d_start, d_end = self.deps_cumsum[idx], self.deps_cumsum[idx+1]
-        p_start, p_end = self.particle_cumsum[idx], self.particle_cumsum[idx+1]
-        rd_start, rd_end = self.raw_deps_cumsum[idx], self.raw_deps_cumsum[idx+1]
+        n_tracks_original = self.n_tracks[base_idx]
+        n_clusters_original = self.n_clusters[base_idx]
+        
+        n_particles = self.n_particles[base_idx]
+
+        t_start, t_end = self.track_cumsum[base_idx], self.track_cumsum[base_idx+1]
+        c_start, c_end = self.cluster_cumsum[base_idx], self.cluster_cumsum[base_idx+1]
+        d_start, d_end = self.deps_cumsum[base_idx], self.deps_cumsum[base_idx+1]
+        p_start, p_end = self.particle_cumsum[base_idx], self.particle_cumsum[base_idx+1]
+        rd_start, rd_end = self.raw_deps_cumsum[base_idx], self.raw_deps_cumsum[base_idx+1]
 
         # 2. Extract & Pad Input Features
         # ---------------------------------------------------------------------
@@ -559,11 +692,39 @@ class ODDDatasetPileup(Dataset):
         t_tanlambda = get_t("track_tanlambda", t_start, t_end)
         t_omega = get_t("track_omega", t_start, t_end)
         t_vertex_primary = get_t("track_majority_particle_vertex_primary", t_start, t_end)
-        t_vertex_primary_mask = (t_vertex_primary == 1).float() # New mask for primary vertex tracks
         t_particle_idx = get_t("track_particle_idx", t_start, t_end).long()
 
+        if selected_vertices is None:
+            track_keep_mask = torch.ones(n_tracks_original, dtype=torch.bool)
+        else:
+            selected_tensor = torch.tensor(sorted(selected_vertices), dtype=t_vertex_primary.dtype)
+            track_keep_mask = torch.isin(t_vertex_primary, selected_tensor)
+
+        t_d0 = t_d0[track_keep_mask]
+        t_z0 = t_z0[track_keep_mask]
+        t_phi = t_phi[track_keep_mask]
+        t_pt = t_pt[track_keep_mask]
+        t_eta = t_eta[track_keep_mask]
+        t_sinphi = t_sinphi[track_keep_mask]
+        t_cosphi = t_cosphi[track_keep_mask]
+        t_eta_int = t_eta_int[track_keep_mask]
+        t_phi_int = t_phi_int[track_keep_mask]
+        t_cosphi_int = t_cosphi_int[track_keep_mask]
+        t_sinphi_int = t_sinphi_int[track_keep_mask]
+        t_tanlambda = t_tanlambda[track_keep_mask]
+        t_omega = t_omega[track_keep_mask]
+        t_vertex_primary = t_vertex_primary[track_keep_mask]
+        t_particle_idx = t_particle_idx[track_keep_mask]
+        t_vertex_primary_mask = (t_vertex_primary == 1).float() # New mask for primary vertex tracks
+
         # --- Clusters ---
-        c_e = get_t("cluster_e", c_start, c_end)
+        c_e_original = get_t("cluster_e", c_start, c_end)
+        c_e_reduced = self._recalculate_cluster_energy(base_idx, selected_vertices, c_e_original)
+        cluster_keep_mask = torch.ones(n_clusters_original, dtype=torch.bool) if selected_vertices is None else c_e_reduced > 0
+        old_to_new_cluster_idx = torch.full((n_clusters_original,), -1, dtype=torch.long)
+        old_to_new_cluster_idx[cluster_keep_mask] = torch.arange(int(cluster_keep_mask.sum()), dtype=torch.long)
+
+        c_e = c_e_reduced[cluster_keep_mask]
         c_eta = get_t("cluster_eta", c_start, c_end)
         c_phi = get_t("cluster_phi", c_start, c_end)
         c_sinphi = get_t("cluster_sinphi", c_start, c_end)
@@ -578,22 +739,51 @@ class ODDDatasetPileup(Dataset):
         c_energy_hits_std = get_t("energy_hits_std", c_start, c_end)
         c_max_hit_energy = get_t("max_hit_energy", c_start, c_end)
 
-        # --- Energy Deposits ---
-        d_cluster_idx = get_t("deps_cluster_idx", d_start, d_end).long()
-        d_energy_hard_scatter = get_t("deps_hard_scatter_energy_deps_in_cluster", d_start, d_end)
-        
-        d_energy_hard_scatter_frac = torch.zeros_like(c_e)
-        d_energy_hard_scatter_frac[d_cluster_idx] = d_energy_hard_scatter /(c_e[d_cluster_idx] + 1e-6)
-        d_energy_hard_scatter_energy = torch.zeros_like(c_e)
-        d_energy_hard_scatter_energy[d_cluster_idx] = d_energy_hard_scatter
+        c_eta = c_eta[cluster_keep_mask]
+        c_phi = c_phi[cluster_keep_mask]
+        c_sinphi = c_sinphi[cluster_keep_mask]
+        c_cosphi = c_cosphi[cluster_keep_mask]
+        c_rho = c_rho[cluster_keep_mask]
+        c_sigma_eta = c_sigma_eta[cluster_keep_mask]
+        c_sigma_phi = c_sigma_phi[cluster_keep_mask]
+        c_sigma_rho = c_sigma_rho[cluster_keep_mask]
+        c_hcal_fraction = c_hcal_fraction[cluster_keep_mask]
+        c_cluster_time = c_cluster_time[cluster_keep_mask]
+        c_number_of_hits = c_number_of_hits[cluster_keep_mask]
+        c_energy_hits_std = c_energy_hits_std[cluster_keep_mask]
+        c_max_hit_energy = c_max_hit_energy[cluster_keep_mask]
 
-        # --- Split HS energy by neutral (trackless) vs charged (tracked) particles ---
+        n_tracks = len(t_d0)
+        n_clusters = len(c_e)
+        n_nodes = n_tracks + n_clusters
+
+        # --- Energy Deposits ---
+        d_cluster_idx_original = get_t("deps_cluster_idx", d_start, d_end).long()
+        d_energy_hard_scatter = get_t("deps_hard_scatter_energy_deps_in_cluster", d_start, d_end)
         d_neutral = get_t("deps_hs_neutral_energy_in_cluster", d_start, d_end)
         d_charged = get_t("deps_hs_charged_energy_in_cluster", d_start, d_end)
+
+        d_valid_cluster = (d_cluster_idx_original >= 0) & (d_cluster_idx_original < n_clusters_original)
+        d_keep_mask = torch.zeros_like(d_valid_cluster, dtype=torch.bool)
+        if d_valid_cluster.any():
+            d_keep_mask[d_valid_cluster] = old_to_new_cluster_idx[d_cluster_idx_original[d_valid_cluster]] >= 0
+        d_cluster_idx = old_to_new_cluster_idx[d_cluster_idx_original[d_keep_mask]]
+        d_energy_hard_scatter = d_energy_hard_scatter[d_keep_mask]
+        d_neutral = d_neutral[d_keep_mask]
+        d_charged = d_charged[d_keep_mask]
+        
+        d_energy_hard_scatter_frac = torch.zeros_like(c_e)
+        d_energy_hard_scatter_energy = torch.zeros_like(c_e)
+        if len(d_cluster_idx) > 0:
+            d_energy_hard_scatter_frac[d_cluster_idx] = d_energy_hard_scatter /(c_e[d_cluster_idx] + 1e-6)
+            d_energy_hard_scatter_energy[d_cluster_idx] = d_energy_hard_scatter
+
+        # --- Split HS energy by neutral (trackless) vs charged (tracked) particles ---
         hs_neutral_energy = torch.zeros_like(c_e)
         hs_charged_energy = torch.zeros_like(c_e)
-        hs_neutral_energy[d_cluster_idx] = d_neutral
-        hs_charged_energy[d_cluster_idx] = d_charged
+        if len(d_cluster_idx) > 0:
+            hs_neutral_energy[d_cluster_idx] = d_neutral
+            hs_charged_energy[d_cluster_idx] = d_charged
 
         node_features = {
             # Common freatures
@@ -630,6 +820,7 @@ class ODDDatasetPileup(Dataset):
             # flags
             "is_track": torch.cat([torch.ones(n_tracks, dtype=torch.float32), torch.zeros(n_clusters, dtype=torch.float32),],-1,),
             "is_cluster": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), torch.ones(n_clusters, dtype=torch.float32),],-1,),
+            "pu_level_condition": torch.full((n_nodes,), float(pu_level_scaled), dtype=torch.float32),
         }
 
         # Raw features (for loss computation and analysis)
@@ -670,7 +861,7 @@ class ODDDatasetPileup(Dataset):
         node_inp_features = torch.stack(list(node_features.values()), dim=-1)
 
         # Hard scatter vertex token: single scalar (truth_vz_pt2_weighted for vertex_primary==1)
-        hs_vz_raw = torch.tensor([self.hard_scatter_vz[idx]], dtype=torch.float32)
+        hs_vz_raw = torch.tensor([self.hard_scatter_vz[base_idx]], dtype=torch.float32)
         hs_vz_scaled = self.scaler.transforms["truth_vz_pt2_weighted"].transform(hs_vz_raw)
         # Shape (1, 1): [n_vertex_tokens=1, n_features=1]
         vertex_token_features = hs_vz_scaled.unsqueeze(0)
@@ -738,10 +929,23 @@ class ODDDatasetPileup(Dataset):
             incidence_matrix[0, track_idx[pu_track_assoc]] = 1.0
 
         # Cluster deposits from raw_deps (HS particle → cluster), shifted +1
-        d_particle_idx_np = get_t("raw_deps_particle_idx", rd_start, rd_end).numpy()
-        d_cluster_idx_np = get_t("raw_deps_cluster_idx", rd_start, rd_end).numpy()
-        d_energy_np = get_t("raw_deps_total_energy_deps_in_cluster", rd_start, rd_end).numpy()
-        incidence_matrix[d_particle_idx_np + 1, d_cluster_idx_np + n_tracks] = d_energy_np
+        rd_particle_idx = get_t("raw_deps_particle_idx", rd_start, rd_end).long()
+        rd_cluster_idx_original = get_t("raw_deps_cluster_idx", rd_start, rd_end).long()
+        rd_energy = get_t("raw_deps_total_energy_deps_in_cluster", rd_start, rd_end)
+        rd_valid_cluster = (rd_cluster_idx_original >= 0) & (rd_cluster_idx_original < n_clusters_original)
+        rd_keep_mask = torch.zeros_like(rd_valid_cluster, dtype=torch.bool)
+        if rd_valid_cluster.any():
+            rd_keep_mask[rd_valid_cluster] = old_to_new_cluster_idx[rd_cluster_idx_original[rd_valid_cluster]] >= 0
+        rd_particle_idx = rd_particle_idx[rd_keep_mask]
+        rd_cluster_idx = old_to_new_cluster_idx[rd_cluster_idx_original[rd_keep_mask]]
+        rd_energy = rd_energy[rd_keep_mask]
+
+        d_particle_idx_np = rd_particle_idx.numpy()
+        d_cluster_idx_np = rd_cluster_idx.numpy()
+        d_energy_np = rd_energy.numpy()
+        valid_raw_dep = (d_particle_idx_np >= 0) & (d_particle_idx_np < n_particles) & (d_cluster_idx_np >= 0) & (d_cluster_idx_np < n_clusters)
+        if np.any(valid_raw_dep):
+            incidence_matrix[d_particle_idx_np[valid_raw_dep] + 1, d_cluster_idx_np[valid_raw_dep] + n_tracks] = d_energy_np[valid_raw_dep]
 
         # Pileup particle (row 0): PU cluster energy = total - HS (calo only, no tracks)
         pu_cluster_energy = c_e.numpy() - d_energy_hard_scatter_energy.numpy()
@@ -773,6 +977,9 @@ class ODDDatasetPileup(Dataset):
             "indicator_truth": indicator,
             "n_particles": n_particles,
             "trackless_particle_mask": trackless_particle_mask,
+            "base_event_idx": base_idx,
+            "pu_level": pu_level,
+            "pu_level_scaled": pu_level_scaled,
         }
 
     def __getitem__(self, idx: int) -> tuple[dict, dict]:
@@ -787,6 +994,7 @@ class ODDDatasetPileup(Dataset):
 
         # load event
         data_dict = self.load_event(idx)
+        base_event_idx = data_dict["base_event_idx"]
 
         inputs = {
             "node_features": data_dict["node_inp_features"],
@@ -800,18 +1008,13 @@ class ODDDatasetPileup(Dataset):
             "tracks_mask": data_dict["node_raw_features"]["track_vertex_primary_mask"],
             # Raw node features needed by IncidenceBasedRegressionTask
             "node_pt": data_dict["node_raw_features"]["node_pt"],
-            "node_sinphi": torch.cat([
-                torch.sin(self.full_data_array["track_phi"][self.track_cumsum[idx]:self.track_cumsum[idx+1]]),
-                torch.sin(self.full_data_array["cluster_phi"][self.cluster_cumsum[idx]:self.cluster_cumsum[idx+1]]),
-            ], -1),
-            "node_cosphi": torch.cat([
-                torch.cos(self.full_data_array["track_phi"][self.track_cumsum[idx]:self.track_cumsum[idx+1]]),
-                torch.cos(self.full_data_array["cluster_phi"][self.cluster_cumsum[idx]:self.cluster_cumsum[idx+1]]),
-            ], -1),
+            "node_sinphi": torch.sin(data_dict["node_raw_features"]["node_phi"]),
+            "node_cosphi": torch.cos(data_dict["node_raw_features"]["node_phi"]),
+            "pu_level": torch.tensor(data_dict["pu_level"], dtype=torch.float32),
+            "pu_level_scaled": torch.tensor(data_dict["pu_level_scaled"], dtype=torch.float32),
         }
-        # Pad sinphi/cosphi
-        inputs["node_sinphi"] = do_padding(inputs["node_sinphi"], self.max_nodes)
-        inputs["node_cosphi"] = do_padding(inputs["node_cosphi"], self.max_nodes)
+        inputs["node_sinphi"] = inputs["node_sinphi"] * data_dict["node_q_mask"].float()
+        inputs["node_cosphi"] = inputs["node_cosphi"] * data_dict["node_q_mask"].float()
 
         labels["tracks_mask"] = data_dict["node_raw_features"]["track_vertex_primary_mask"]
         labels["node_valid"] = data_dict["node_q_mask"].bool()
@@ -827,7 +1030,8 @@ class ODDDatasetPileup(Dataset):
         labels["calo_hs_neutral_energy"] = data_dict["node_raw_features"]["calo_hs_neutral_energy"]
         labels["calo_hs_charged_energy"] = data_dict["node_raw_features"]["calo_hs_charged_energy"]
 
-        labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
+        labels["event_number"] = torch.tensor(self.event_number[base_event_idx], dtype=torch.int64)
+        labels["pu_level"] = torch.tensor(data_dict["pu_level"], dtype=torch.float32)
 
         # MaskFormer targets (1 target object = 1 hard scatter vertex)
         labels["particle_valid"] = torch.tensor([True])  # shape (1,)
@@ -838,7 +1042,7 @@ class ODDDatasetPileup(Dataset):
         labels["particle_node_valid"] = particle_node_valid.unsqueeze(0).float()  # (1, max_nodes)
 
         # Vertex z regression target (truth hard-scatter vz)
-        labels["particle_vz"] = torch.tensor([self.hard_scatter_vz[idx]], dtype=torch.float32)
+        labels["particle_vz"] = torch.tensor([self.hard_scatter_vz[base_event_idx]], dtype=torch.float32)
 
         # Per-node is_track accessible as target for per-node tasks
         labels["node_is_track"] = data_dict["node_raw_features"]["is_track"]
@@ -1175,6 +1379,11 @@ class ODDDataModule(L.LightningDataModule):
         seed: int = 42,
         hard_scatter_energy_threshold: float = 0.03,
         window_size: int = 512,
+        pu_levels: list[int] | None = None,
+        base_pu_level: int = 200,
+        pu_condition_min: float = 0.0,
+        pu_condition_max: float = 200.0,
+        pu_sampling_seed: int = 42,
         **kwargs,
     ):
         super().__init__()
@@ -1213,6 +1422,11 @@ class ODDDataModule(L.LightningDataModule):
             "is_inference": is_inference,
             "hard_scatter_energy_threshold": hard_scatter_energy_threshold,
             "window_size": window_size,
+            "pu_levels": pu_levels,
+            "base_pu_level": base_pu_level,
+            "pu_condition_min": pu_condition_min,
+            "pu_condition_max": pu_condition_max,
+            "pu_sampling_seed": pu_sampling_seed,
         }
         self.dataset_kwargs.update(kwargs)
 

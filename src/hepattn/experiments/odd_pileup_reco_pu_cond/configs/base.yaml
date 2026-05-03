@@ -3,7 +3,7 @@
 # Stream B: Calo MaskFormer (hybrid queries from HS tracks + latent queries)
 # Stream C: Reconstruction (standard MaskFormerDecoder with Hungarian matching)
 
-name: odd_pflow_reco
+name: odd_pflow_reco_pu_cond
 seed_everything: 42
 
 # =============================================================================
@@ -36,13 +36,13 @@ data:
   valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
   test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
 
-  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu200
+  unify_path: /storage/agrp/barakma/PileupODD/data/_baseline_new2
   enable_split: true
   train_split: 0.9
   val_split: 0.1
   test_split: 0.1
   val_and_test_split_same: true
-  overtrain: false
+  overtrain: true
 
   num_workers: 4
   num_val_workers: 1
@@ -58,6 +58,11 @@ data:
   scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco_pu_cond/configs/odd_var_transform.yaml
   max_nodes: 5500
   window_size: 256
+  pu_levels: [200, 120, 50, 0]
+  base_pu_level: 200
+  pu_condition_min: 0.0
+  pu_condition_max: 200.0
+  pu_sampling_seed: 42
 
 # =============================================================================
 # Trainer Configuration
@@ -140,7 +145,7 @@ model:
                 net:
                   class_path: hepattn.models.Dense
                   init_args:
-                    input_size: 25
+                    input_size: 26
                     output_size: *dim
                 posenc:
                   class_path: hepattn.models.posenc.FourierPositionEncoder
