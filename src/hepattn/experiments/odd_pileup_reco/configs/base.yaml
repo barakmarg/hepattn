@@ -47,11 +47,11 @@ data:
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: 40000
-  num_test: 4000
-  num_val: 4000
+  num_train: -1
+  num_test: -1
+  num_val: -1
 
-  batch_size: 64
+  batch_size: 32
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
@@ -99,9 +99,9 @@ model:
   optimizer: AdamW
 
   lrs_config:
-    initial: 1.25e-6
-    max: 1.25e-4
-    end: 1.25e-6
+    initial: 6.25e-7
+    max: 6.25e-5
+    end: 6.25e-7
     pct_start: 0.05
     weight_decay: 0.01
     skip_scheduler: false
@@ -111,7 +111,7 @@ model:
   model:
     class_path: hepattn.experiments.odd_pileup_reco.model.TwoStreamMaskFormer
     init_args:
-      dim: &dim 128
+      dim: &dim 256
       target_object: particle
       max_hs_tracks: 190
       num_latent_queries: 16
@@ -317,8 +317,8 @@ model:
                     activation: torch.nn.SiLU
                     output_size: 6
                     hidden_layers: [128, 64, 32]
-                null_weight: 0.75
-                loss_class_weights: [1.12, 6.2, 9.0, 1.3, 1.0]
+                null_weight: 0.8
+                loss_class_weights: [1.0, 3.0, 8.0, 1.5, 1.0]
                 mask_queries: false
                 has_intermediate_loss: true
 
@@ -389,7 +389,7 @@ model:
                   class_path: hepattn.models.Dense
                   init_args:
                     # Input: 2*dim + num_raw_vars = 2*128 + 6 = 262
-                    input_size: 262
+                    input_size: 518
                     activation: torch.nn.SiLU
                     output_size: 5
                     hidden_layers: [256, 128, 64, 32]
