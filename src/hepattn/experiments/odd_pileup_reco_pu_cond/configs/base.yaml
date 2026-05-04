@@ -47,11 +47,11 @@ data:
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: -1
-  num_test: -1
-  num_val: -1
+  num_train: 80
+  num_test: 80
+  num_val: 80
 
-  batch_size: 32
+  batch_size: 16
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
@@ -80,7 +80,7 @@ trainer:
   logger:
     class_path: hepattn.experiments.odd_pileup_maskformer.logger_utils.FixedCometLogger
     init_args:
-      project: odd-pflow-reco
+      project: odd-pflow-reco-pu-cond
 
   callbacks:
     - class_path: hepattn.callbacks.Compile
