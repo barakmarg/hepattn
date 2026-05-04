@@ -32,6 +32,11 @@ def do_padding(tensor: torch.Tensor, max_len: int) -> torch.Tensor:
     return x
 
 
+def _wrap_phi(phi: torch.Tensor, dphi: float) -> torch.Tensor:
+    """Rotate phi by dphi and wrap into [-pi, pi)."""
+    return torch.remainder(phi + dphi + np.pi, 2 * np.pi) - np.pi
+
+
 def is_valid_file(path: str | Path) -> bool:
     """Check if file exists and is non-empty."""
     path = Path(path)
@@ -95,6 +100,7 @@ class ODDDatasetPileup(Dataset):
         pu_condition_min: float = 0.0,
         pu_condition_max: float = 200.0,
         pu_sampling_seed: int = 42,
+        is_train: bool = False,
     ):
         """
         Initialize ODD Dataset.
@@ -141,6 +147,8 @@ class ODDDatasetPileup(Dataset):
         self.pu_condition_min = float(pu_condition_min)
         self.pu_condition_max = float(pu_condition_max)
         self.pu_sampling_seed = int(pu_sampling_seed)
+        self.is_train = bool(is_train)
+        self._aug_rng_cache: np.random.Generator | None = None
         if self.pu_condition_max <= self.pu_condition_min:
             raise ValueError("pu_condition_max must be larger than pu_condition_min")
 
@@ -457,9 +465,10 @@ class ODDDatasetPileup(Dataset):
         self.raw_deps_cumsum = np.cumsum([0, *self.n_raw_deps.tolist()])
         
         self.n_nodes = self.n_tracks + self.n_clusters
-        self._build_pu_variants()
+        self._compute_non_hs_vertices()
         print(f"Number of events after filtering: {self.num_events}")
         print(f"Number of PU-conditioned samples: {len(self)}")
+        print(f"is_train (dynamic augmentation): {self.is_train}")
 
         # Print pileup vs hard scatter track statistics
         vertex_primary = self.full_data_array["track_majority_particle_vertex_primary"]
@@ -511,11 +520,13 @@ class ODDDatasetPileup(Dataset):
         raw = torch.tensor([float(pu_level)], dtype=torch.float32)
         return float(self.scaler.transforms["pu_level_condition"].transform(raw).item())
 
-    def _build_pu_variants(self) -> None:
-        """Precompute lightweight selected-vertex sets for each base event and PU level."""
-        rng = np.random.default_rng(self.pu_sampling_seed)
-        self.pu_selected_vertices: list[list[frozenset[int] | None]] = []
+    def _compute_non_hs_vertices(self) -> None:
+        """Per-event sorted numpy array of non-HS primary-vertex indices.
 
+        Built once at __init__; consumed on every __getitem__ to draw a
+        Poisson sample (deterministic for val/test, fresh for train).
+        """
+        self.non_hs_vertices: list[np.ndarray] = []
         for evt_idx in range(self.num_events):
             t_start, t_end = self.track_cumsum[evt_idx], self.track_cumsum[evt_idx + 1]
             track_vertices = self.full_data_array["track_majority_particle_vertex_primary"][t_start:t_end]
@@ -528,23 +539,38 @@ class ODDDatasetPileup(Dataset):
             vertices_tensor = torch.cat([track_vertices.long(), cluster_vertices])
             vertices_tensor = vertices_tensor[vertices_tensor > 0].unique()
             vertices = vertices_tensor.cpu().numpy()
+            self.non_hs_vertices.append(np.sort(vertices[vertices != 1]).astype(np.int64))
 
-            non_hs_vertices = np.sort(vertices[vertices != 1]).astype(np.int64)
-            event_variants: list[frozenset[int] | None] = []
-            for pu_level in self.pu_levels:
-                if pu_level >= self.base_pu_level:
-                    event_variants.append(None)
-                    continue
+    def _aug_rng(self) -> np.random.Generator:
+        """Lazy per-worker RNG for training augmentations.
 
-                n_pick = int(rng.poisson(float(pu_level)))
-                n_pick = min(n_pick, len(non_hs_vertices))
-                if n_pick > 0:
-                    sampled = rng.choice(non_hs_vertices, size=n_pick, replace=False)
-                    selected = {1, *[int(v) for v in sampled]}
-                else:
-                    selected = {1}
-                event_variants.append(frozenset(selected))
-            self.pu_selected_vertices.append(event_variants)
+        Seeded deterministically from pu_sampling_seed + worker_id so runs
+        reproduce when seed and num_workers match. Built once per worker.
+        """
+        if self._aug_rng_cache is None:
+            info = torch.utils.data.get_worker_info()
+            worker_id = info.id if info is not None else 0
+            self._aug_rng_cache = np.random.default_rng(self.pu_sampling_seed + worker_id)
+        return self._aug_rng_cache
+
+    def _select_vertices(self, idx: int, base_idx: int, pu_level: int) -> frozenset[int] | None:
+        """Draw the vertex subset for one (event, pu_level) sample.
+
+        - pu_level >= base_pu_level: no filtering (raw event).
+        - is_train: fresh draw from the per-worker stream.
+        - else: deterministic draw seeded from (pu_sampling_seed, idx).
+        """
+        if pu_level >= self.base_pu_level:
+            return None
+        rng = self._aug_rng() if self.is_train else np.random.default_rng(
+            self.pu_sampling_seed + int(idx)
+        )
+        non_hs = self.non_hs_vertices[base_idx]
+        n_pick = min(int(rng.poisson(float(pu_level))), len(non_hs))
+        if n_pick == 0:
+            return frozenset({1})
+        sampled = rng.choice(non_hs, size=n_pick, replace=False)
+        return frozenset({1, *map(int, sampled)})
 
     def _recalculate_cluster_energy(self, base_idx: int, selected_vertices: frozenset[int] | None, original_c_e: torch.Tensor) -> torch.Tensor:
         """Return original or selected-vertex cluster energy for one base event."""
@@ -656,8 +682,9 @@ class ODDDatasetPileup(Dataset):
         # 1. Calculate Slices
         # ---------------------------------------------------------------------
         base_idx, pu_idx, pu_level = self._event_base_and_pu(idx)
-        selected_vertices = self.pu_selected_vertices[base_idx][pu_idx]
+        selected_vertices = self._select_vertices(idx, base_idx, pu_level)
         pu_level_scaled = self._scale_pu_level(pu_level)
+        delta_phi = float(self._aug_rng().uniform(-np.pi, np.pi)) if self.is_train else 0.0
 
         n_tracks_original = self.n_tracks[base_idx]
         n_clusters_original = self.n_clusters[base_idx]
@@ -752,6 +779,18 @@ class ODDDatasetPileup(Dataset):
         c_number_of_hits = c_number_of_hits[cluster_keep_mask]
         c_energy_hits_std = c_energy_hits_std[cluster_keep_mask]
         c_max_hit_energy = c_max_hit_energy[cluster_keep_mask]
+
+        # --- Random phi rotation (train only, label-preserving) ---
+        if delta_phi != 0.0:
+            t_phi = _wrap_phi(t_phi, delta_phi)
+            t_phi_int = _wrap_phi(t_phi_int, delta_phi)
+            c_phi = _wrap_phi(c_phi, delta_phi)
+            t_sinphi = torch.sin(t_phi)
+            t_cosphi = torch.cos(t_phi)
+            t_sinphi_int = torch.sin(t_phi_int)
+            t_cosphi_int = torch.cos(t_phi_int)
+            c_sinphi = torch.sin(c_phi)
+            c_cosphi = torch.cos(c_phi)
 
         n_tracks = len(t_d0)
         n_clusters = len(c_e)
@@ -888,12 +927,20 @@ class ODDDatasetPileup(Dataset):
 
         is_charged = particle_class < 3
 
+        if delta_phi != 0.0:
+            p_phi_rot = _wrap_phi(get_t("particle_phi", p_start, p_end), delta_phi)
+            p_sinphi = torch.sin(p_phi_rot)
+            p_cosphi = torch.cos(p_phi_rot)
+        else:
+            p_sinphi = get_t("particle_sinphi", p_start, p_end)
+            p_cosphi = get_t("particle_cosphi", p_start, p_end)
+
         particle_data = {
             "e": get_t("particle_energy", p_start, p_end),
             "pt": get_t("particle_pt", p_start, p_end),
             "eta": get_t("particle_eta", p_start, p_end),
-            "sinphi": get_t("particle_sinphi", p_start, p_end),
-            "cosphi": get_t("particle_cosphi", p_start, p_end),
+            "sinphi": p_sinphi,
+            "cosphi": p_cosphi,
             "class": particle_class,
             "is_charged": is_charged,
         }
@@ -1484,6 +1531,7 @@ class ODDDataModule(L.LightningDataModule):
             if self.enable_split and self.unify_path:
                  kw['files_list'] = train_files
                  path = self.unify_path
+            kw['is_train'] = True
 
             self.train_dset = ODDDatasetPileup(
                 filepath=path,

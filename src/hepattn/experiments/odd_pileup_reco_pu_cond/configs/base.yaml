@@ -36,7 +36,7 @@ data:
   valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
   test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
 
-  unify_path: /storage/agrp/barakma/PileupODD/data/_baseline_new2
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu200
   enable_split: true
   train_split: 0.9
   val_split: 0.1
@@ -47,20 +47,20 @@ data:
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: 80
-  num_test: 80
-  num_val: 80
+  num_train: 1000
+  num_test: 1000
+  num_val: 1000
 
-  batch_size: 16
+  batch_size: 32
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
   scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco_pu_cond/configs/odd_var_transform.yaml
   max_nodes: 5500
   window_size: 256
-  pu_levels: [200, 120, 50, 0]
+  pu_levels: [200, 170, 140, 100, 60, 20]
   base_pu_level: 200
-  pu_condition_min: 0.0
+  pu_condition_min: 20.0
   pu_condition_max: 200.0
   pu_sampling_seed: 42
 
