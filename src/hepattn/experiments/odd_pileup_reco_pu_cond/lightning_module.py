@@ -163,6 +163,15 @@ class ODDPFlowTwoStream(ModelWrapper):
 
         if reco.get("pflow_class") is not None and len(reco["pflow_class"]) > 0:
             figs["reco/class_distribution"] = plot_class_distribution(reco)
+            _pu = reco.get("pu_level")
+            if _pu is not None:
+                _pu_mask = np.isclose(_pu, 200.0)
+                if int(_pu_mask.sum()) > 0:
+                    _reco_pu200 = {
+                        "pflow_class": reco["pflow_class"][_pu_mask],
+                        "truth_class": reco["truth_class"][_pu_mask],
+                    }
+                    figs["reco/class_distribution_pu200"] = plot_class_distribution(_reco_pu200)
         if cluster.get("evt_pred_neutral_e") is not None and len(cluster.get("evt_pred_neutral_e", [])) > 0:
             figs["calo/hs_energy_residual_by_type"] = PhysicsPlotter.plot_hs_energy_residual_by_type(
                 cluster["evt_pred_neutral_e"], cluster["evt_truth_neutral_e"],
@@ -281,17 +290,31 @@ class ODDPFlowTwoStream(ModelWrapper):
             except Exception as _e:
                 print(f"Particle-level reco plots failed: {_e}")
 
-            # Jet resolution with calo (expensive — cap to first 1000 events).
+            # Jet resolution with calo, PU 200 only (cluster + match on PU 200 sample only).
             try:
-                _MAX_JET = 1000
-                _data_small = {
-                    k: (v[:_MAX_JET] if hasattr(v, "__len__") else v)
-                    for k, v in _data.items()
-                }
-                _jets = cluster_jets(_data_small)
-                _fig = plot_jet_resolution_with_calo(_jets, _data_small, compare_jets=None)
-                if _fig is not None:
-                    figs["reco/jet_resolution_with_calo"] = _fig
+                _MAX_JET_EVENTS = 1000
+                _pu = jet.get("pu_level")
+                if _pu is None:
+                    raise RuntimeError("pu_level not accumulated — cannot filter to PU 200")
+                _pu_mask = np.isclose(_pu, 200.0)
+                _n_pu200 = int(_pu_mask.sum())
+                if _n_pu200 == 0:
+                    print("Jet resolution plot skipped: no PU 200 events in this validation epoch")
+                else:
+                    _jet_reco_pu200 = {
+                        k: (v[_pu_mask] if v is not None else None)
+                        for k, v in _jet_reco.items()
+                    }
+                    _data_pu200 = pflow_data_from_eval_dicts(_jet_reco_pu200)
+                    _data_small = {
+                        k: (v[:_MAX_JET_EVENTS] if hasattr(v, "__len__") else v)
+                        for k, v in _data_pu200.items()
+                    }
+                    _jets = cluster_jets(_data_small)
+                    _fig = plot_jet_resolution_with_calo(_jets, _data_small, compare_jets=None)
+                    if _fig is not None:
+                        figs["reco/jet_resolution_with_calo"] = _fig
+                    print(f"Jet resolution (PU 200 only): {_n_pu200} events available, used first {min(_n_pu200, _MAX_JET_EVENTS)}")
             except Exception as _e:
                 print(f"Jet resolution plot failed: {_e}")
 
@@ -433,6 +456,8 @@ class ODDPFlowTwoStream(ModelWrapper):
                 if stage == "val":
                     self._val_reco_data["pflow_class"].append(particle_class_preds.detach().cpu().numpy())
                     self._val_reco_data["truth_class"].append(particle_class_labels.detach().cpu().numpy())
+                    if "pu_level" in labels:
+                        self._val_reco_data["pu_level"].append(labels["pu_level"].float().cpu().numpy())
 
                     # Accumulate reco kinematics + node fields for ALL validation events.
                     # Jet clustering (expensive) is capped at 1000 at epoch-end time, not here.
@@ -459,6 +484,8 @@ class ODDPFlowTwoStream(ModelWrapper):
                     for _nk in ("node_eta", "node_phi", "node_e"):
                         if _nk in labels:
                             self._val_jet_data[_nk].append(labels[_nk].float().cpu().numpy())
+                    if "pu_level" in labels:
+                        self._val_jet_data["pu_level"].append(labels["pu_level"].float().cpu().numpy())
                     if "calo_hard_scatter_energy" in labels:
                         self._val_jet_data["calo_hs_energy"].append(
                             labels["calo_hard_scatter_energy"].float().cpu().numpy()

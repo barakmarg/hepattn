@@ -42,16 +42,16 @@ data:
   val_split: 0.1
   test_split: 0.1
   val_and_test_split_same: true
-  overtrain: true
+  overtrain: false
 
   num_workers: 4
   num_val_workers: 1
   num_test_workers: 1
-  num_train: 1000
-  num_test: 1000
-  num_val: 1000
+  num_train: -1
+  num_test: -1
+  num_val: -1
 
-  batch_size: 32
+  batch_size: 16
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
@@ -76,6 +76,7 @@ trainer:
   log_every_n_steps: 50
   default_root_dir: logs
   enable_progress_bar: True
+  accumulate_grad_batches: 4 # consider 4
 
   logger:
     class_path: hepattn.experiments.odd_pileup_maskformer.logger_utils.FixedCometLogger
@@ -105,7 +106,7 @@ model:
 
   lrs_config:
     initial: 6.25e-7
-    max: 6.25e-5
+    max: 6.25e-4 # consider increasing to 1e-4 if training is stable
     end: 6.25e-7
     pct_start: 0.05
     weight_decay: 0.01
