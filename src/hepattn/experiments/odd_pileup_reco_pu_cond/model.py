@@ -156,6 +156,8 @@ class TwoStreamMaskFormer(nn.Module):
         x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in input_names], dim=-2)
         x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in input_names], dim=-1)
 
+        x["pu_level"] = inputs["pu_level"]
+
         batch_size = x["key_valid"].shape[0]
 
         if batch_size == 1 and x["key_valid"].all():
@@ -281,16 +283,9 @@ class TwoStreamMaskFormer(nn.Module):
             pred_track_logits = track_outputs["final"]["mask"]["pflow_node_logit"]  # (B, 1, N)
             pred_track_mask = (pred_track_logits.squeeze(1).sigmoid() >= 0.5) & is_track
             extra_pred_tracks = pred_track_mask & ~reco_track_mask
-            n_track_sample = min(self.reco_track_noise_mean, is_track.shape[1])
-            track_noise_scores = torch.where(
-                extra_pred_tracks,
-                torch.rand(batch_size, is_track.shape[1], device=device),
-                torch.full((batch_size, is_track.shape[1]), -1.0, device=device),
+            sampled_extra_tracks = self._sample_pu_scaled_noise(
+                extra_pred_tracks, self.reco_track_noise_mean, x["pu_level"], batch_size, is_track.shape[1], device
             )
-            _, track_sample_idx = track_noise_scores.topk(n_track_sample, dim=-1)
-            sampled_extra_tracks = torch.zeros_like(extra_pred_tracks)
-            sampled_extra_tracks.scatter_(1, track_sample_idx, True)
-            sampled_extra_tracks = sampled_extra_tracks & extra_pred_tracks
             reco_track_mask = reco_track_mask | sampled_extra_tracks
 
             calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
@@ -306,16 +301,9 @@ class TwoStreamMaskFormer(nn.Module):
             extra_pred = pred_calo_mask & ~truth_calo_mask
 
             N_nodes = x["key_embed"].shape[1]
-            n_sample = min(self.reco_calo_noise_mean, N_nodes)
-            noise_scores = torch.where(
-                extra_pred,
-                torch.rand(batch_size, N_nodes, device=device),
-                torch.full((batch_size, N_nodes), -1.0, device=device),
+            sampled_extra = self._sample_pu_scaled_noise(
+                extra_pred, self.reco_calo_noise_mean, x["pu_level"], batch_size, N_nodes, device
             )
-            _, sample_idx = noise_scores.topk(n_sample, dim=-1)
-            sampled_extra = torch.zeros_like(extra_pred)
-            sampled_extra.scatter_(1, sample_idx, True)
-            sampled_extra = sampled_extra & extra_pred
 
             reco_calo_mask = truth_calo_mask | sampled_extra
 
@@ -424,6 +412,31 @@ class TwoStreamMaskFormer(nn.Module):
         valid[:, NL:] = track_valid
 
         return queries, valid
+
+    def _sample_pu_scaled_noise(
+        self,
+        extra_pred: Tensor,
+        base_count: int,
+        pu_level: Tensor,
+        batch_size: int,
+        N: int,
+        device,
+    ) -> Tensor:
+        # Sample noise positions ⊆ extra_pred; per-event count = base_count * pu_level / 200.
+        # k is static (== current code's behaviour) to keep tensor shapes constant for torch.compile / CUDA graphs.
+        k = min(base_count, N)
+        n_sample_b = (base_count * pu_level.float().flatten() / 200.0).round().long().clamp_(0, k)
+
+        noise_scores = torch.where(
+            extra_pred,
+            torch.rand(batch_size, N, device=device),
+            torch.full((batch_size, N), -1.0, device=device),
+        )
+        _, sample_idx = noise_scores.topk(k, dim=-1)
+        keep = torch.arange(k, device=device).unsqueeze(0) < n_sample_b.unsqueeze(1)
+        sampled = torch.zeros_like(extra_pred)
+        sampled.scatter_(1, sample_idx, keep)
+        return sampled & extra_pred
 
     def loss(self, outputs: dict, targets: dict) -> dict:
         losses = {}

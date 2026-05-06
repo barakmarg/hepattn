@@ -91,6 +91,7 @@ class ODDPFlowTwoStream(ModelWrapper):
 
         losses = self.model.loss(outputs, targets)
         total_loss = self.log_losses(losses, "train")
+        self._log_loss_by_pu(total_loss, targets, "train")
 
         for layer_name, layer_losses in losses.items():
             for task_name, task_losses in layer_losses.items():
@@ -116,7 +117,8 @@ class ODDPFlowTwoStream(ModelWrapper):
         outputs = self.model(inputs, targets=targets)
 
         losses = self.model.loss(outputs, targets)
-        self.log_losses(losses, "val")
+        total_loss = self.log_losses(losses, "val")
+        self._log_loss_by_pu(total_loss, targets, "val")
 
         preds = self.predict(outputs)
         self.log_metrics(preds, targets, "val")
@@ -132,6 +134,16 @@ class ODDPFlowTwoStream(ModelWrapper):
         preds = self.predict(outputs)
         self.log_metrics(preds, targets, "test")
         return outputs, preds, losses
+
+    def _log_loss_by_pu(self, total_loss, targets, stage):
+        # One scalar series per pileup level, so the logger can plot loss vs step
+        # with one line per pu_level. Batches are homogeneous in pu_level, so we
+        # take the first element. One .item() sync per step — negligible.
+        pu_t = targets.get("pu_level")
+        if pu_t is None:
+            return
+        pu = int(pu_t.flatten()[0].item())
+        self.log(f"{stage}/loss_pu{pu}", total_loss, sync_dist=True)
 
     # ------------------------------------------------------------------
     # Override log_task_metrics to handle multi-stream output format

@@ -51,16 +51,16 @@ data:
   num_test: -1
   num_val: -1
 
-  batch_size: 16
+  batch_size: 32
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
   scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco_pu_cond/configs/odd_var_transform.yaml
   max_nodes: 5500
   window_size: 256
-  pu_levels: [200, 170, 140, 100, 60, 20]
+  pu_levels: [200, 170, 140, 100, 60]
   base_pu_level: 200
-  pu_condition_min: 20.0
+  pu_condition_min: 60.0
   pu_condition_max: 200.0
   pu_sampling_seed: 42
 
@@ -106,7 +106,7 @@ model:
 
   lrs_config:
     initial: 6.25e-7
-    max: 6.25e-4 # consider increasing to 1e-4 if training is stable
+    max: 1e-4 # consider increasing to 1e-4 if training is stable
     end: 6.25e-7
     pct_start: 0.05
     weight_decay: 0.01

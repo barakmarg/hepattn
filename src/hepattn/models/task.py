@@ -1047,6 +1047,12 @@ class IncidenceRegressionTask(Task):
         output = outputs[self.output_object + "_incidence"].detach().to(torch.float32)
         target = targets[self.target_object + "_incidence"].to(torch.float32)
 
+        # Mask out padded node positions in the target so they don't pollute the
+        # matching cost. Pred is already zeroed at padded positions by forward().
+        node_valid_key = self.input_hit + "_valid"
+        if node_valid_key in targets:
+            target = target * targets[node_valid_key].to(target.dtype).unsqueeze(1)
+
         costs = {}
         for cost_fn, cost_weight in self.costs.items():
             costs[cost_fn] = cost_weight * cost_fns[cost_fn](output, target)
