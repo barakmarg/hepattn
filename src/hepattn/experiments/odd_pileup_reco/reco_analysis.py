@@ -188,6 +188,14 @@ def load_pflow_data(
                 node_pt = nm["node_pt"][sel].astype(np.float32)
                 if node_pt.ndim == 3 and node_pt.shape[-1] == 1:
                     node_pt = node_pt[..., 0]
+            if "tracks_mask" in nm.dtype.names:
+                tracks_mask = nm["tracks_mask"][sel].astype(np.int8)
+                if tracks_mask.ndim == 3 and tracks_mask.shape[-1] == 1:
+                    tracks_mask = tracks_mask[..., 0]
+            else:
+                tracks_mask = None
+        else:
+            tracks_mask = None
         if "calo_mask" in f:
             _cp = f["calo_mask"]["calo_prob"][sel].astype(np.float32)
             _cp = np.squeeze(_cp, axis=tuple(i for i in range(1, _cp.ndim) if i != 0 and _cp.shape[i] == 1))
@@ -245,6 +253,7 @@ def load_pflow_data(
         "calo_hs_frac": calo_hs_frac,
         "calo_prob": calo_prob,
         "node_pt": node_pt,
+        "tracks_mask": tracks_mask,
     }
 
 
@@ -286,6 +295,7 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
     calo_hs_frac = reco_data.get("calo_hs_frac")
     calo_prob = reco_data.get("calo_prob")
     node_pt = reco_data.get("node_pt")
+    tracks_mask = reco_data.get("tracks_mask")
 
     return {
         "pflow_class":     pred_class,
@@ -312,6 +322,7 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
         "calo_hs_frac": calo_hs_frac,
         "calo_prob": calo_prob,
         "node_pt": node_pt,
+        "tracks_mask": tracks_mask,
     }
 
 
@@ -2085,6 +2096,14 @@ def plot_jet_resolution_with_calo(
         min_pt=10.0,
     )
 
+    from hepattn.experiments.odd_pileup_reco.puppi import cluster_puppi_jets
+    puppi_jets = cluster_puppi_jets(
+        data,
+        jet_R=jet_R,
+        min_constituents=3,
+        min_pt=10.0,
+    )
+
     n_pflow = np.array([len(e) for e in jets["pflow_jet_pt"]])
     n_truth = np.array([len(e) for e in jets["truth_jet_pt"]])
     mask = (n_pflow > 0) & (n_truth > 0)
@@ -2212,6 +2231,34 @@ def plot_jet_resolution_with_calo(
         ca_hs_nc = _concat_nonempty(calo_hs_jets["calo_hs_jet_nconst"])
         ca_hs_e = _concat_jet_energy(calo_hs_jets, "calo_hs")
 
+    pu_res = {"deta": np.array([]), "dphi": np.array([]), "dpt": np.array([]), "dpt_over_truth": np.array([])}
+    pu_nc = np.array([])
+    pu_e = np.array([])
+    if puppi_jets is not None:
+        n_puppi = np.array([len(e) for e in puppi_jets["puppi_jet_pt"]])
+        mask_puppi = (n_puppi > 0) & (n_truth > 0)
+        tr_pu, pu_ix, _ = match_jets(
+            puppi_jets["puppi_jet_pt"][mask_puppi],
+            puppi_jets["puppi_jet_eta"][mask_puppi],
+            puppi_jets["puppi_jet_phi"][mask_puppi],
+            jets["truth_jet_pt"][mask_puppi],
+            jets["truth_jet_eta"][mask_puppi],
+            jets["truth_jet_phi"][mask_puppi],
+            dr_cut=dr_cut,
+        )
+        pu_res = get_jet_residuals(
+            tr_pu,
+            pu_ix,
+            jets["truth_jet_pt"][mask_puppi],
+            jets["truth_jet_eta"][mask_puppi],
+            jets["truth_jet_phi"][mask_puppi],
+            puppi_jets["puppi_jet_pt"][mask_puppi],
+            puppi_jets["puppi_jet_eta"][mask_puppi],
+            puppi_jets["puppi_jet_phi"][mask_puppi],
+        )
+        pu_nc = _concat_nonempty(puppi_jets["puppi_jet_nconst"])
+        pu_e = _concat_jet_energy(puppi_jets, "puppi")
+
     fig, axes = plt.subplots(3, 2, figsize=(12, 12))
     configs = [
         (pf_res["deta"], r"Jet $\Delta\eta$", np.linspace(-0.2, 0.2, 50), True, False, "deta"),
@@ -2314,6 +2361,18 @@ def plot_jet_resolution_with_calo(
         if len(ca_hs_d) > 0:
             ax.hist(ca_hs_d, bins=b, histtype="step", linestyle="--", linewidth=1.8, density=hist_density,
                     label=rf"Calo-HS  $\mu$={np.nanmean(ca_hs_d):.3f}, IQR={iqr(ca_hs_d):.3f}")
+
+        pu_d = {
+            "deta": pu_res["deta"],
+            "dphi": pu_res["dphi"],
+            "nconst": pu_nc,
+            "dpt": pu_res["dpt"],
+            "dpt_over_truth": pu_res["dpt_over_truth"],
+            "energy": pu_e,
+        }[key]
+        if len(pu_d) > 0:
+            ax.hist(pu_d, bins=b, histtype="step", linestyle="-.", linewidth=1.8, density=hist_density,
+                    label=rf"PUPPI  $\mu$={np.nanmean(pu_d):.3f}, IQR={iqr(pu_d):.3f}")
 
         if key == "nconst" and len(tr_nc) > 0:
             ax.hist(tr_nc, bins=b, histtype="stepfilled", alpha=0.4, color="orange", density=True,
