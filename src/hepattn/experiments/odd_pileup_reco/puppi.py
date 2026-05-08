@@ -353,6 +353,167 @@ def compute_puppi_weights_no_truth(
     return compute_puppi_weights(synth_data, **puppi_kwargs)
 
 
+def compute_puppi_weights_event(
+    node_pt: np.ndarray,
+    node_eta: np.ndarray,
+    node_phi: np.ndarray,
+    node_z0: np.ndarray,
+    node_is_track: np.ndarray,
+    node_valid: np.ndarray,
+    *,
+    R0: float = 0.2,
+    rms_pt_min: float = 0.1,
+    min_neutral_pt: float = 0.3,
+    min_neutral_pt_slope: float = 0.0,
+    n_pu_proxy: float = 0.0,
+    min_weight: float = 0.01,
+    eta_max_extrap: float = 2.0,
+    apply_lv_adjust: bool = True,
+    dz_cut: float = 0.7,
+    pv_pt_min: float = 1.0,
+) -> np.ndarray:
+    """Single-event truth-free PUPPI weights, optimized for use in
+    ``pflow_data.py::ODDDatasetPileup.__getitem__``.
+
+    All inputs are 1-D arrays of length ``n_nodes`` (the per-event padded shape
+    that pflow_data.py uses). Accepts numpy arrays or anything ``np.asarray``
+    accepts (torch tensors auto-convert). Returns ``(n_nodes,)`` float32 weights.
+
+    Numerically equivalent to the per-event branch inside
+    ``compute_puppi_weights_no_truth``, but ~2× faster thanks to:
+
+    1. **η-prefilter** — only nodes within ``R0`` of *some* LV track in η can
+       have non-zero α anyway (their α-neighbor sum is empty otherwise), so we
+       compute pairs only for those targets.
+    2. **Inline df=1 χ² formulas** via ``scipy.special.ndtr`` / ``ndtri`` — the
+       ``scipy.stats.chi2`` wrappers add ~0.5 ms of Python overhead per call.
+    """
+    from scipy.special import ndtr, ndtri
+
+    node_pt = np.asarray(node_pt, dtype=np.float32)
+    node_eta = np.asarray(node_eta, dtype=np.float32)
+    node_phi = np.asarray(node_phi, dtype=np.float32)
+    node_z0 = np.asarray(node_z0, dtype=np.float32)
+    node_is_track = np.asarray(node_is_track).astype(bool)
+    node_valid = np.asarray(node_valid).astype(bool)
+
+    valid = node_valid & np.isfinite(node_pt) & np.isfinite(node_eta) & np.isfinite(node_phi)
+    is_track_v = node_is_track & valid
+
+    # ---- Step 1: PV_z = pT²-weighted median z0 of high-pT tracks ----
+    sel = is_track_v & np.isfinite(node_z0) & (node_pt > pv_pt_min)
+    if not sel.any():
+        pv_z = 0.0
+    else:
+        z0_sel = node_z0[sel]
+        w_sel = (node_pt[sel] ** 2).astype(np.float64)
+        order = np.argsort(z0_sel)
+        cumw = np.cumsum(w_sel[order])
+        pv_z = float(z0_sel[order][int(np.searchsorted(cumw, cumw[-1] / 2.0))])
+
+    # ---- Step 2: synth tracks_mask via Δz CHS cut ----
+    is_lv = is_track_v & np.isfinite(node_z0) & (np.abs(node_z0 - pv_z) < dz_cut)
+    is_pu = is_track_v & ~is_lv
+    is_neutral = (~node_is_track) & valid
+
+    n_nodes = node_pt.shape[0]
+    weights = np.zeros(n_nodes, dtype=np.float32)
+    if not is_lv.any():
+        return weights  # no LV tracks → α undefined → all neutral weights = 0
+
+    lv_idx = np.where(is_lv)[0]
+    lv_pt = node_pt[lv_idx]
+    lv_eta = node_eta[lv_idx]
+    lv_phi = node_phi[lv_idx]
+
+    # Targets that need α: PU (calibration), neutrals (scoring), LV (LV-adjust input).
+    is_target = is_pu | is_neutral | is_lv
+
+    # ---- Step 3: η-prefilter targets to those near any LV track ----
+    # A target outside [min(lv_eta) - R0, max(lv_eta) + R0] cannot have any
+    # LV neighbor inside R0 → α stays 0 → weight stays 0. Skip them.
+    eta_lo = lv_eta.min() - R0
+    eta_hi = lv_eta.max() + R0
+    in_eta_band = (node_eta >= eta_lo) & (node_eta <= eta_hi)
+    tgt_mask = is_target & in_eta_band
+    tgt_idx = np.where(tgt_mask)[0]
+    alpha = np.zeros(n_nodes, dtype=np.float32)
+
+    if tgt_idx.size > 0:
+        deta = node_eta[tgt_idx, None] - lv_eta[None, :]
+        dphi = node_phi[tgt_idx, None] - lv_phi[None, :]
+        dphi = (dphi + np.pi) % (2.0 * np.pi) - np.pi
+        dr2 = deta * deta + dphi * dphi
+        within = (dr2 < R0 * R0) & (dr2 > 1e-4)
+        contrib = np.where(within, (lv_pt[None, :] ** 2) / np.where(dr2 > 0, dr2, 1.0), 0.0)
+        sum_contrib = contrib.sum(axis=1)
+        alpha_tgt = np.where(sum_contrib > 0, np.log(np.where(sum_contrib > 0, sum_contrib, 1.0)), 0.0).astype(np.float32)
+        alpha[tgt_idx] = alpha_tgt
+
+    # ---- Step 4: calibrate α_med, α_rms from PU tracks ----
+    cal_mask = is_pu & (np.abs(node_eta) < eta_max_extrap) & (node_pt > rms_pt_min) & (alpha != 0.0)
+    if cal_mask.sum() < 2:
+        cal_mask = is_target & (np.abs(node_eta) < eta_max_extrap) & (alpha != 0.0)
+    if cal_mask.sum() < 2:
+        alpha_med = np.float32(0.0)
+        alpha_rms = np.float32(1.0)
+    else:
+        cal_alpha = alpha[cal_mask]
+        alpha_med = np.float32(np.median(cal_alpha))
+        below = cal_alpha[cal_alpha <= alpha_med]
+        if below.size >= 2:
+            alpha_rms = float(np.sqrt(np.mean((below - alpha_med) ** 2)))
+        else:
+            alpha_rms = float(np.sqrt(np.mean((cal_alpha - alpha_med) ** 2)))
+        alpha_rms = np.float32(max(alpha_rms, 1e-6))
+
+        # CMS LV-adjust: shift med, rms by sqrt(chi2_quantile(l, 1) * rms),
+        # where l = N_LV_below / (N_LV_below + 0.5 N_PU_cal).
+        # chi2_quantile(p, 1) = ndtri((p+1)/2)**2.
+        if apply_lv_adjust:
+            pv_mask = is_lv & (np.abs(node_eta) < eta_max_extrap) & (alpha != 0.0)
+            n_pv = int(pv_mask.sum())
+            if n_pv > 0:
+                n_pv_below = int((alpha[pv_mask] <= alpha_med).sum())
+                n_pu_cal = int(cal_mask.sum())
+                denom = n_pv_below + 0.5 * n_pu_cal
+                l_adjust = n_pv_below / denom if denom > 0 else 0.0
+                if 0.0 < l_adjust < 1.0:
+                    chi2_q = float(ndtri((l_adjust + 1.0) / 2.0)) ** 2
+                    shift = np.float32(np.sqrt(chi2_q * alpha_rms))
+                    alpha_med = np.float32(alpha_med - shift)
+                    alpha_rms = np.float32(max(alpha_rms - shift, 1e-6))
+
+    # ---- Step 5: per-particle weight via signed χ²(df=1) CDF ----
+    # χ²-CDF(x, 1) = 2·Φ(√x) − 1 for x ≥ 0; 0 elsewhere.
+    diff = (alpha - alpha_med).astype(np.float32)
+    lval = (diff * np.abs(diff) / (alpha_rms * alpha_rms)).astype(np.float32)
+    sqrt_lval = np.sqrt(np.maximum(lval, 0.0))
+    p_vals = (2.0 * ndtr(sqrt_lval) - 1.0).astype(np.float32)
+    w = np.where(lval > 0.0, p_vals, np.float32(0.0))
+
+    # Category overrides + cuts
+    w = np.where(is_lv, np.float32(1.0), w)
+    w = np.where(is_pu, np.float32(0.0), w)
+    w = np.where(~node_valid, np.float32(0.0), w)
+    valid_cat = is_lv | is_pu | is_neutral
+    w = np.where(valid_cat, w, np.float32(0.0))
+    w = np.where(w < min_weight, np.float32(0.0), w)
+
+    # Pileup-aware neutral pT cut. ``n_pu_proxy=None`` triggers an auto-estimate
+    # from this event's PU-track count; otherwise treat as a scalar.
+    if n_pu_proxy is None:
+        pu_central = is_pu & (np.abs(node_eta) < eta_max_extrap) & (node_pt > rms_pt_min)
+        n_pu_eff = float(pu_central.sum()) / 30.0
+    else:
+        n_pu_eff = float(n_pu_proxy)
+    thr = min_neutral_pt + min_neutral_pt_slope * n_pu_eff
+    neutral_below = is_neutral & ((w * node_pt) < thr)
+    w = np.where(neutral_below, np.float32(0.0), w)
+
+    return w.astype(np.float32)
+
+
 def cluster_puppi_no_truth_jets(
     data: dict,
     jet_R: float = 0.7,
