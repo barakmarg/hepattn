@@ -144,6 +144,35 @@ PUPPI:
 - [reco_analysis.py:52–256](reco_analysis.py#L52) — `load_pflow_data` extended to load `tracks_mask` from `node_metadata`
 - [reco_analysis.py:2040](reco_analysis.py#L2040) — `plot_jet_resolution_with_calo` calls `cluster_puppi_jets` and overlays a `PUPPI` curve (`linestyle="-."`) in every panel of the 3×2 jet-resolution figure, alongside PFlow, Proxy, Calo, Calo-HS
 
+## Truth-free variant: `compute_puppi_weights_no_truth`
+
+The truth-aware version above relies on `tracks_mask` (per-track HS-vs-PU vertex
+label, the closest analog of CMS's CHS dz cut). For a fully-truth-free baseline,
+[puppi.py](puppi.py) also exposes `compute_puppi_weights_no_truth` /
+`cluster_puppi_no_truth_jets`, which **synthesize** `tracks_mask` from
+`node_z0` exactly the way real reconstruction does:
+
+1. Estimate the primary vertex's z position as the pT²-weighted median z0
+   of tracks with pT > `pv_pt_min` (default 1 GeV) — see
+   [`_estimate_pv_z`](puppi.py).
+2. Tag each track LV (mask=1) if `|z0 − PV_z| < dz_cut`, else PU (mask=0).
+3. Pass that synthesized mask through the same `compute_puppi_weights`.
+
+`dz_cut` was swept on the held-out 1800 events:
+
+| variant                      | nJets/ev | nc med/p99 | pT med/p99 | bias    | IQR   |
+|------------------------------|----------|------------|------------|---------|-------|
+| truth-aware (`tracks_mask`)  | 6.37     | 16/58      | 49/284     | +0.047  | 0.374 |
+| no-truth `dz_cut=0.5`        | 5.51     | 15/57      | 45/286     | -0.028  | 0.361 |
+| **no-truth `dz_cut=0.7`** ✓  | **5.81** | **15/58**  | **45/285** | **+0.001** | **0.377** |
+| no-truth `dz_cut=1.0`        | 6.17     | 15/59      | 44/282     | +0.035  | 0.385 |
+| no-truth `dz_cut=1.5`        | 6.71     | 15/61      | 43/278     | +0.080  | 0.410 |
+
+`dz_cut=0.7` (the default) **matches the truth-aware version** on IQR and is
+essentially unbiased. Conclusion: on this dataset, the algorithm doesn't really
+exploit `tracks_mask` beyond what a Δz CHS step recovers from `node_z0` — so
+for a fully-fair PUPPI baseline (no truth at all), use the no-truth variant.
+
 ## How to run
 
 End-to-end on the full H5:
@@ -166,7 +195,7 @@ neutrals near LV > neutrals far from LV), plus `α_med` / `α_rms` sanity values
 
 ## Limitations / what could improve it further
 
-- **No η-binning** of the α calibration. CMS uses separate central / forward bins (`puppiCentral`, `puppiForward`). For ODD's narrower acceptance this matters less, but a barrel/endcap split would likely tighten the IQR.
+- **No η-binning** of the α calibration (tested, hurts on ODD; code removed). CMS uses central + forward bins; we measured a (0–2.5, 2.5–4) split on this dataset and got **bias +0.05 → +0.15, IQR 0.37 → 0.40** on the held-out events. A finer (0–2, 2–3, 3–4) split was worse (bias +0.29, IQR 0.47). Reason: ODD's LV-track density falls off sharply (1123 LV tracks in |η|∈[2,2.5), 782 in [2.5,3), 0 beyond), so a forward-bin α_med calibrates to a degenerate sample and forward PU clusters end up *above* their local median. The single global α_med (dominated by central tracks) implicitly suppresses forward PU — forward α values mostly fall below it. Re-introducing η-binning would only make sense on a dataset with substantial forward tracking.
 - **Test-set tuning of `R0` and `min_neutral_pt`**. A clean cross-validation against an independent calibration sample would give defense-in-depth, but the tune→held-out check above shows the chosen values are stable.
 - **No photon / lepton special-casing.** CMS forces high-pT photons and leptons to weight=1; we don't have node-level PID, so this protection isn't applied. For HS jets dominated by photons (e.g. H→γγ), this would matter.
 - **No PFlow linking** — clusters carry full energy including charged-particle deposits. Mitigated by clustering jets from clusters only (not tracks), but a real PFlow-style reconstruction (matching tracks to clusters and subtracting) could feed cleaner inputs to PUPPI and would close part of the IQR gap to Calo-HS.

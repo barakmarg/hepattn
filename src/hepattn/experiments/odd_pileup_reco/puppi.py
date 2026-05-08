@@ -271,6 +271,113 @@ def compute_puppi_weights(
     return weights
 
 
+def _estimate_pv_z(z0: np.ndarray, pt: np.ndarray, is_track_valid: np.ndarray, pt_min: float = 1.0) -> float:
+    """pT²-weighted median z0 of high-pT tracks — proxy for the hard-scatter primary vertex.
+
+    The classic PUPPI/CHS PV estimator: hard-scatter has the highest-pT charged
+    activity, so weighting track z0s by pT² and taking the weighted median
+    gives a bias-resistant pointer to the LV.
+    """
+    sel = is_track_valid & np.isfinite(z0) & np.isfinite(pt) & (pt > pt_min)
+    if not sel.any():
+        return 0.0
+    z0_sel = z0[sel]
+    w_sel = pt[sel] ** 2
+    order = np.argsort(z0_sel)
+    z0_sorted = z0_sel[order]
+    w_sorted = w_sel[order]
+    cumw = np.cumsum(w_sorted)
+    half = cumw[-1] / 2.0
+    idx = int(np.searchsorted(cumw, half))
+    idx = min(idx, len(z0_sorted) - 1)
+    return float(z0_sorted[idx])
+
+
+def synthesize_tracks_mask(
+    data: dict,
+    *,
+    dz_cut: float = 0.7,
+    pv_pt_min: float = 1.0,
+) -> np.ndarray | None:
+    """Build a truth-free tracks_mask via PV-estimation + Δz CHS-style cut.
+
+    For each event:
+      1. Estimate PV_z = pT²-weighted median z0 of tracks with pT > ``pv_pt_min``.
+      2. Tag each track as LV (mask=1) if ``|z0 - PV_z| < dz_cut``, else PU (mask=0).
+
+    Returns ``(n_events, n_nodes)`` int8 array, or ``None`` if ``node_z0`` is missing.
+    Non-track nodes get mask=0 (irrelevant; PUPPI only consults the mask for tracks).
+    """
+    if data.get("node_z0") is None:
+        return None
+    node_valid = np.asarray(data["node_valid"]).astype(bool)
+    node_is_track = np.asarray(data["node_is_track"]).astype(bool)
+    node_z0 = np.asarray(data["node_z0"]).astype(np.float32)
+    node_pt = np.asarray(data["node_pt"]).astype(np.float32)
+    n_events, n_nodes = node_valid.shape
+    out = np.zeros((n_events, n_nodes), dtype=np.int8)
+    for i in range(n_events):
+        is_track_v = node_is_track[i] & node_valid[i]
+        if not is_track_v.any():
+            continue
+        pv_z = _estimate_pv_z(node_z0[i], node_pt[i], is_track_v, pt_min=pv_pt_min)
+        dz = np.abs(node_z0[i] - pv_z)
+        out[i] = (is_track_v & np.isfinite(node_z0[i]) & (dz < dz_cut)).astype(np.int8)
+    return out
+
+
+def compute_puppi_weights_no_truth(
+    data: dict,
+    *,
+    dz_cut: float = 0.7,
+    pv_pt_min: float = 1.0,
+    **puppi_kwargs,
+) -> np.ndarray | None:
+    """PUPPI weights using a truth-free tracks_mask synthesized from ``node_z0``.
+
+    Equivalent to ``compute_puppi_weights`` but builds the LV/PU track classification
+    by Δz to a pT²-weighted PV estimate, instead of consuming the truth
+    ``tracks_mask``. This is the analog of how real CMS/ATLAS reco classifies
+    tracks (CHS Δz cut), so it's the "fully fair, no truth" PUPPI.
+
+    Extra parameters (``dz_cut``, ``pv_pt_min``) control the CHS step;
+    everything else is forwarded to ``compute_puppi_weights``.
+    """
+    if data.get("node_z0") is None or data.get("node_pt") is None:
+        return None
+    synth_mask = synthesize_tracks_mask(data, dz_cut=dz_cut, pv_pt_min=pv_pt_min)
+    if synth_mask is None:
+        return None
+    synth_data = dict(data)
+    synth_data["tracks_mask"] = synth_mask
+    return compute_puppi_weights(synth_data, **puppi_kwargs)
+
+
+def cluster_puppi_no_truth_jets(
+    data: dict,
+    jet_R: float = 0.7,
+    min_constituents: int = 3,
+    min_pt: float = 10.0,
+    *,
+    dz_cut: float = 0.7,
+    pv_pt_min: float = 1.0,
+    **puppi_kwargs,
+) -> dict | None:
+    """Cluster PUPPI jets using the truth-free vertex association. Returns a dict
+    keyed ``puppi_nt_jet_*`` so it can coexist with the truth-aware version
+    in the same plot dict.
+    """
+    weights = compute_puppi_weights_no_truth(
+        data, dz_cut=dz_cut, pv_pt_min=pv_pt_min, **puppi_kwargs,
+    )
+    if weights is None:
+        return None
+    j = cluster_puppi_jets(data, jet_R=jet_R, min_constituents=min_constituents, min_pt=min_pt, weights=weights)
+    if j is None:
+        return None
+    return {f"puppi_nt_jet_{k.split('_jet_')[1]}": v for k, v in j.items()}
+
+
 def cluster_puppi_jets(
     data: dict,
     jet_R: float = 0.7,

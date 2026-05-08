@@ -188,6 +188,12 @@ def load_pflow_data(
                 node_pt = nm["node_pt"][sel].astype(np.float32)
                 if node_pt.ndim == 3 and node_pt.shape[-1] == 1:
                     node_pt = node_pt[..., 0]
+            if "node_z0" in nm.dtype.names:
+                node_z0 = nm["node_z0"][sel].astype(np.float32)
+                if node_z0.ndim == 3 and node_z0.shape[-1] == 1:
+                    node_z0 = node_z0[..., 0]
+            else:
+                node_z0 = None
             if "tracks_mask" in nm.dtype.names:
                 tracks_mask = nm["tracks_mask"][sel].astype(np.int8)
                 if tracks_mask.ndim == 3 and tracks_mask.shape[-1] == 1:
@@ -196,6 +202,7 @@ def load_pflow_data(
                 tracks_mask = None
         else:
             tracks_mask = None
+            node_z0 = None
         if "calo_mask" in f:
             _cp = f["calo_mask"]["calo_prob"][sel].astype(np.float32)
             _cp = np.squeeze(_cp, axis=tuple(i for i in range(1, _cp.ndim) if i != 0 and _cp.shape[i] == 1))
@@ -254,6 +261,7 @@ def load_pflow_data(
         "calo_prob": calo_prob,
         "node_pt": node_pt,
         "tracks_mask": tracks_mask,
+        "node_z0": node_z0,
     }
 
 
@@ -296,6 +304,7 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
     calo_prob = reco_data.get("calo_prob")
     node_pt = reco_data.get("node_pt")
     tracks_mask = reco_data.get("tracks_mask")
+    node_z0 = reco_data.get("node_z0")
 
     return {
         "pflow_class":     pred_class,
@@ -323,6 +332,7 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
         "calo_prob": calo_prob,
         "node_pt": node_pt,
         "tracks_mask": tracks_mask,
+        "node_z0": node_z0,
     }
 
 
@@ -2055,8 +2065,15 @@ def plot_jet_resolution_with_calo(
     jet_R: float = 0.7,
     compare_jets: dict | None = None,
     compare_label: str = "True-pileup-mask-reconstruction",
+    puppi_jets: dict | None = None,
+    puppi_label: str = "PUPPI",
 ) -> plt.Figure | None:
-    """Copy of jet-resolution plot with additional calo-cluster jet residual overlays."""
+    """Copy of jet-resolution plot with additional calo-cluster jet residual overlays.
+
+    If ``puppi_jets`` is supplied (a dict keyed ``puppi_jet_*``), it overrides
+    the internal call to ``cluster_puppi_jets`` — useful for swapping in the
+    truth-free variant. ``puppi_label`` controls the legend entry.
+    """
     from scipy.stats import iqr
 
     def _concat_nonempty(arrs: np.ndarray) -> np.ndarray:
@@ -2096,13 +2113,14 @@ def plot_jet_resolution_with_calo(
         min_pt=10.0,
     )
 
-    from hepattn.experiments.odd_pileup_reco.puppi import cluster_puppi_jets
-    puppi_jets = cluster_puppi_jets(
-        data,
-        jet_R=jet_R,
-        min_constituents=3,
-        min_pt=10.0,
-    )
+    if puppi_jets is None:
+        from hepattn.experiments.odd_pileup_reco.puppi import cluster_puppi_jets
+        puppi_jets = cluster_puppi_jets(
+            data,
+            jet_R=jet_R,
+            min_constituents=3,
+            min_pt=10.0,
+        )
 
     n_pflow = np.array([len(e) for e in jets["pflow_jet_pt"]])
     n_truth = np.array([len(e) for e in jets["truth_jet_pt"]])
@@ -2372,7 +2390,7 @@ def plot_jet_resolution_with_calo(
         }[key]
         if len(pu_d) > 0:
             ax.hist(pu_d, bins=b, histtype="step", linestyle="-.", linewidth=1.8, density=hist_density,
-                    label=rf"PUPPI  $\mu$={np.nanmean(pu_d):.3f}, IQR={iqr(pu_d):.3f}")
+                    label=rf"{puppi_label}  $\mu$={np.nanmean(pu_d):.3f}, IQR={iqr(pu_d):.3f}")
 
         if key == "nconst" and len(tr_nc) > 0:
             ax.hist(tr_nc, bins=b, histtype="stepfilled", alpha=0.4, color="orange", density=True,
