@@ -184,6 +184,18 @@ def load_pflow_data(
                 calo_hs_frac = nm["calo_hs_frac"][sel].astype(np.float32)
                 if calo_hs_frac.ndim == 3 and calo_hs_frac.shape[-1] == 1:
                     calo_hs_frac = calo_hs_frac[..., 0]
+            if "calo_charged_e" in nm.dtype.names:
+                calo_charged_e = nm["calo_charged_e"][sel].astype(np.float32)
+                if calo_charged_e.ndim == 3 and calo_charged_e.shape[-1] == 1:
+                    calo_charged_e = calo_charged_e[..., 0]
+            else:
+                calo_charged_e = None
+            if "calo_neutral_e" in nm.dtype.names:
+                calo_neutral_e = nm["calo_neutral_e"][sel].astype(np.float32)
+                if calo_neutral_e.ndim == 3 and calo_neutral_e.shape[-1] == 1:
+                    calo_neutral_e = calo_neutral_e[..., 0]
+            else:
+                calo_neutral_e = None
             if "node_pt" in nm.dtype.names:
                 node_pt = nm["node_pt"][sel].astype(np.float32)
                 if node_pt.ndim == 3 and node_pt.shape[-1] == 1:
@@ -203,6 +215,8 @@ def load_pflow_data(
         else:
             tracks_mask = None
             node_z0 = None
+            calo_charged_e = None
+            calo_neutral_e = None
         if "calo_mask" in f:
             _cp = f["calo_mask"]["calo_prob"][sel].astype(np.float32)
             _cp = np.squeeze(_cp, axis=tuple(i for i in range(1, _cp.ndim) if i != 0 and _cp.shape[i] == 1))
@@ -262,6 +276,8 @@ def load_pflow_data(
         "node_pt": node_pt,
         "tracks_mask": tracks_mask,
         "node_z0": node_z0,
+        "calo_charged_e": calo_charged_e,
+        "calo_neutral_e": calo_neutral_e,
     }
 
 
@@ -305,6 +321,8 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
     node_pt = reco_data.get("node_pt")
     tracks_mask = reco_data.get("tracks_mask")
     node_z0 = reco_data.get("node_z0")
+    calo_charged_e = reco_data.get("calo_charged_e")
+    calo_neutral_e = reco_data.get("calo_neutral_e")
 
     return {
         "pflow_class":     pred_class,
@@ -333,6 +351,8 @@ def pflow_data_from_eval_dicts(reco_data: dict, eta_cut: float = 4.0) -> dict:
         "node_pt": node_pt,
         "tracks_mask": tracks_mask,
         "node_z0": node_z0,
+        "calo_charged_e": calo_charged_e,
+        "calo_neutral_e": calo_neutral_e,
     }
 
 
