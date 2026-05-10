@@ -17,6 +17,7 @@ from lightning import seed_everything
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from hepattn.experiments.odd_pileup_reco.puppi import compute_puppi_weights_event
 from hepattn.utils.scaling import FeatureScaler
 
 
@@ -595,6 +596,28 @@ class ODDDatasetPileup(Dataset):
         hs_neutral_energy[d_cluster_idx] = d_neutral
         hs_charged_energy[d_cluster_idx] = d_charged
 
+        # --- PUPPI weight (per-node, in [0, 1], used as an unscaled model input).
+        # Truth-free Δz CHS + α-shape: tracks_mask synthesized from node_z0,
+        # so no per-cluster truth is consumed. See puppi.py.
+        node_pt_for_puppi  = torch.cat([t_pt,  c_e / torch.cosh(torch.clamp(c_eta, min=-10.0, max=10.0))], dim=-1)
+        node_eta_for_puppi = torch.cat([t_eta, c_eta], dim=-1)
+        node_phi_for_puppi = torch.cat([t_phi, c_phi], dim=-1)
+        node_z0_for_puppi  = torch.cat([t_z0,  torch.zeros(n_clusters, device=t_z0.device)], dim=-1)
+        node_is_track_for_puppi = torch.cat([
+            torch.ones(n_tracks, dtype=torch.bool),
+            torch.zeros(n_clusters, dtype=torch.bool),
+        ], dim=-1)
+        node_valid_for_puppi = torch.ones(n_tracks + n_clusters, dtype=torch.bool)
+        puppi_w = compute_puppi_weights_event(
+            node_pt_for_puppi.numpy(),
+            node_eta_for_puppi.numpy(),
+            node_phi_for_puppi.numpy(),
+            node_z0_for_puppi.numpy(),
+            node_is_track_for_puppi.numpy(),
+            node_valid_for_puppi.numpy(),
+        )
+        puppi_w_tensor = torch.from_numpy(puppi_w)  # already in [0, 1]
+
         node_features = {
             # Common freatures
             "phi": torch.cat([t_phi, c_phi], -1), # Usually not scaled, pos encoded
@@ -630,6 +653,8 @@ class ODDDatasetPileup(Dataset):
             # flags
             "is_track": torch.cat([torch.ones(n_tracks, dtype=torch.float32), torch.zeros(n_clusters, dtype=torch.float32),],-1,),
             "is_cluster": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), torch.ones(n_clusters, dtype=torch.float32),],-1,),
+            # PUPPI weight: per-node hard-scatter probability in [0, 1], no scaling.
+            "puppi_weight": puppi_w_tensor,
         }
 
         # Raw features (for loss computation and analysis)
@@ -647,6 +672,7 @@ class ODDDatasetPileup(Dataset):
             "node_z0":  torch.cat([t_z0,  torch.zeros(n_clusters, device=t_z0.device)], -1),
             "calo_hs_neutral_energy": torch.cat([torch.zeros(n_tracks), hs_neutral_energy], -1),
             "calo_hs_charged_energy": torch.cat([torch.zeros(n_tracks), hs_charged_energy], -1),
+            "puppi_weight": puppi_w_tensor,
         }
 
         # Compute Z-order (Morton) index from raw eta/phi for locality-preserving sort

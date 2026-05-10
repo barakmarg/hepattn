@@ -36,7 +36,7 @@ data:
   valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
   test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
 
-  unify_path: /storage/agrp/barakma/PileupODD/data/old/ttbar_pu200
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu200
   enable_split: true
   train_split: 0.9
   val_split: 0.1
@@ -51,7 +51,7 @@ data:
   num_test: -1
   num_val: -1
 
-  batch_size: 16
+  batch_size: 32
   incidence_cutval: 0.01
   hard_scatter_energy_threshold: 0.1
 
@@ -140,7 +140,7 @@ model:
                 net:
                   class_path: hepattn.models.Dense
                   init_args:
-                    input_size: 25
+                    input_size: 26
                     output_size: *dim
                 posenc:
                   class_path: hepattn.models.posenc.FourierPositionEncoder
