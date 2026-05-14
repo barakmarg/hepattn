@@ -2044,6 +2044,7 @@ def plot_jet_resolution_with_calo(
     jet_R: float = 0.7,
     compare_jets: dict | None = None,
     compare_label: str = "True-pileup-mask-reconstruction",
+    pu_level: float | None = None,
 ) -> plt.Figure | None:
     """Copy of jet-resolution plot with additional calo-cluster jet residual overlays."""
     from scipy.stats import iqr
@@ -2333,7 +2334,10 @@ def plot_jet_resolution_with_calo(
         ax.set_ylabel("Count" if not hist_density else "Density")
         ax.legend(fontsize=8, loc="upper right")
 
-    fig.suptitle("Jet resolution (with calo clusters)")
+    _title = "Jet resolution (with calo clusters)"
+    if pu_level is not None:
+        _title += f" — PU {pu_level:g}"
+    fig.suptitle(_title)
     fig.tight_layout()
     return fig
 

@@ -302,31 +302,32 @@ class ODDPFlowTwoStream(ModelWrapper):
             except Exception as _e:
                 print(f"Particle-level reco plots failed: {_e}")
 
-            # Jet resolution with calo, PU 200 only (cluster + match on PU 200 sample only).
+            # Jet resolution with calo, max PU level only (cluster + match on that PU sample only).
             try:
                 _MAX_JET_EVENTS = 1000
                 _pu = jet.get("pu_level")
                 if _pu is None:
-                    raise RuntimeError("pu_level not accumulated — cannot filter to PU 200")
-                _pu_mask = np.isclose(_pu, 200.0)
-                _n_pu200 = int(_pu_mask.sum())
-                if _n_pu200 == 0:
-                    print("Jet resolution plot skipped: no PU 200 events in this validation epoch")
+                    raise RuntimeError("pu_level not accumulated — cannot filter by PU")
+                _pu_max = float(np.max(_pu))
+                _pu_mask = np.isclose(_pu, _pu_max)
+                _n_pu = int(_pu_mask.sum())
+                if _n_pu == 0:
+                    print("Jet resolution plot skipped: no events in this validation epoch")
                 else:
-                    _jet_reco_pu200 = {
+                    _jet_reco_pu = {
                         k: (v[_pu_mask] if v is not None else None)
                         for k, v in _jet_reco.items()
                     }
-                    _data_pu200 = pflow_data_from_eval_dicts(_jet_reco_pu200)
+                    _data_pu = pflow_data_from_eval_dicts(_jet_reco_pu)
                     _data_small = {
                         k: (v[:_MAX_JET_EVENTS] if hasattr(v, "__len__") else v)
-                        for k, v in _data_pu200.items()
+                        for k, v in _data_pu.items()
                     }
                     _jets = cluster_jets(_data_small)
-                    _fig = plot_jet_resolution_with_calo(_jets, _data_small, compare_jets=None)
+                    _fig = plot_jet_resolution_with_calo(_jets, _data_small, compare_jets=None, pu_level=_pu_max)
                     if _fig is not None:
-                        figs["reco/jet_resolution_with_calo"] = _fig
-                    print(f"Jet resolution (PU 200 only): {_n_pu200} events available, used first {min(_n_pu200, _MAX_JET_EVENTS)}")
+                        figs[f"reco/jet_resolution_with_calo_pu{_pu_max:g}"] = _fig
+                    print(f"Jet resolution (PU {_pu_max:g} only): {_n_pu} events available, used first {min(_n_pu, _MAX_JET_EVENTS)}")
             except Exception as _e:
                 print(f"Jet resolution plot failed: {_e}")
 

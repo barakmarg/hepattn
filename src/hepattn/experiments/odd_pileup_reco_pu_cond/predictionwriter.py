@@ -106,10 +106,12 @@ class PflowPredictionWriter(Callback):
 
         to_write = {}
 
-        # --- Event numbers ---
+        # --- Event numbers and PU level ---
+        event_number = targets["event_number"].cpu().numpy().astype(np.int64).reshape(-1, 1)
+        pu_level = targets["pu_level"].cpu().numpy().astype(np.int32).reshape(-1, 1)
         to_write["events"] = u2s(
-            targets["event_number"].cpu().numpy().astype(np.int64).reshape(-1, 1),
-            dtype=np.dtype([("event_number", "i8")]),
+            np.concatenate([event_number, pu_level], axis=-1),
+            dtype=np.dtype([("event_number", "i8"), ("pu_level", "i4")]),
         )
 
         # --- Pileup removal outputs (Stream A & B) — full 5500-node space ---

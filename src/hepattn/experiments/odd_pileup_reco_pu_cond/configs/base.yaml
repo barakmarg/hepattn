@@ -58,9 +58,9 @@ data:
   scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco_pu_cond/configs/odd_var_transform.yaml
   max_nodes: 5500
   window_size: 256
-  pu_levels: [200, 140, 100, 60]
+  pu_levels: [200]
   base_pu_level: 200
-  pu_condition_min: 60.0
+  pu_condition_min: 0.0
   pu_condition_max: 200.0
   pu_sampling_seed: 42
 

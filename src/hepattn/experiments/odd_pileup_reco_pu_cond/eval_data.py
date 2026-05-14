@@ -164,6 +164,13 @@ def load_eval_data_from_h5(
             event_sel=event_sel,
         )
 
+        # Load pu_level if present. Newer writer stores it inside the events
+        # structured dataset; the retrofit script writes a top-level dataset.
+        if "events" in f and "pu_level" in f["events"].dtype.names:
+            reco_data["pu_level"] = f["events"]["pu_level"][event_sel].astype(np.int32)
+        elif "pu_level" in f:
+            reco_data["pu_level"] = f["pu_level"][event_sel].astype(np.int32)
+
     # Keep source path for downstream utilities that may lazily load
     # optional tensors not present in older in-memory dicts.
     reco_data["_source_h5_path"] = str(h5_path)
@@ -444,6 +451,7 @@ def run_forward_pass(
     inference_mode: bool | None = None,
     reco_debug_use_truth_masks: bool = False,
     test_suff: str = "",
+    pu_levels: list[int] | None = None,
 ) -> Path:
     """Run Lightning test step with PflowPredictionWriter, return H5 path.
 
@@ -508,6 +516,8 @@ def run_forward_pass(
         filepath = data_cfg.get("test_filepath", data_cfg.get("filepath"))
         files_list = None
 
+    resolved_pu_levels = pu_levels if pu_levels is not None else data_cfg.get("pu_levels", [200])
+
     # Use fully initialized DataModule so Lightning setup hooks have all attributes.
     datamodule = ODDDataModule(
         train_path=filepath,
@@ -527,6 +537,11 @@ def run_forward_pass(
         is_inference=True,
         test_suff=test_suff,
         enable_split=False,
+        pu_levels=resolved_pu_levels,
+        base_pu_level=data_cfg.get("base_pu_level", 200),
+        pu_condition_min=data_cfg.get("pu_condition_min", 0.0),
+        pu_condition_max=data_cfg.get("pu_condition_max", 200.0),
+        pu_sampling_seed=data_cfg.get("pu_sampling_seed", 42),
     )
 
     # Load model
@@ -555,3 +570,71 @@ def run_forward_pass(
     h5_path = writer.output_path
     print(f"Predictions written to {h5_path}")
     return h5_path
+
+
+def run_forward_pass_per_pu_level(
+    ckpt_path: str | Path,
+    config_path: str | Path,
+    data_dir: str | None = None,
+    files: list[str | Path] | None = None,
+    num_events_per_pu: int = 1000,
+    batch_size: int = 48,
+    num_workers: int = 1,
+    accelerator: str | None = None,
+    devices: int | str | list[int] | None = None,
+    precision: str | int | None = None,
+    inference_mode: bool | None = None,
+    reco_debug_use_truth_masks: bool = False,
+    test_suff: str = "",
+    pu_levels: list[int] | None = None,
+) -> dict[int, Path]:
+    """Run a separate forward pass per PU level, writing one H5 per level.
+
+    ``num_events_per_pu`` is the number of events to process at each PU level
+    (the datamodule expands ``num_events`` by the number of PU levels, so when
+    ``pu_levels=[pu]`` the H5 ends up with exactly ``num_events_per_pu`` rows).
+
+    Each call appends ``_pu{level}`` to ``test_suff`` so output H5s do not
+    overwrite each other.
+
+    Returns ``{pu_level: h5_path}``.
+    """
+    import yaml
+
+    if pu_levels is None:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        pu_levels = cfg["data"].get("pu_levels")
+        if pu_levels is None:
+            raise KeyError(
+                f"'data.pu_levels' not found in {config_path} — "
+                "pass pu_levels explicitly"
+            )
+    pu_levels = [int(x) for x in pu_levels]
+
+    results: dict[int, Path] = {}
+    base_suff = test_suff.rstrip("_")
+    for pu in pu_levels:
+        suff = f"{base_suff}_pu{pu}" if base_suff else f"pu{pu}"
+        print(f"\n===== PU {pu}: running forward pass ({num_events_per_pu} events) =====")
+        h5 = run_forward_pass(
+            ckpt_path=ckpt_path,
+            config_path=config_path,
+            data_dir=data_dir,
+            files=files,
+            num_events=num_events_per_pu,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            accelerator=accelerator,
+            devices=devices,
+            precision=precision,
+            inference_mode=inference_mode,
+            reco_debug_use_truth_masks=reco_debug_use_truth_masks,
+            test_suff=suff,
+            pu_levels=[pu],
+        )
+        results[pu] = Path(h5)
+    print("\n===== All PU levels done =====")
+    for pu, h5 in results.items():
+        print(f"  PU {pu}: {h5}")
+    return results
