@@ -33,15 +33,15 @@ from hepattn.experiments.odd_pileup_reco.reco_analysis import (
     load_pflow_data,
     plot_jet_resolution_with_calo,
 )
-
+#/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260421-T104425/ckpts/epoch=099-val_loss=13.99981__test_dihiggs.h5
 
 DEFAULT_H5 = (
     "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/"
     "logs/odd_pflow_reco_20260421-T104425/ckpts/"
-    "epoch=099-val_loss=13.99981__test_latest_256_dim.h5"
+    "epoch=099-val_loss=13.99981__test_dihiggs.h5"
 )
 DEFAULT_PARQUET_DIR = (
-    "/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_chunked"
+    "/storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_chunked"
 )
 DEFAULT_BEST_JSON = (
     "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/"
@@ -49,7 +49,7 @@ DEFAULT_BEST_JSON = (
 )
 DEFAULT_OUT = (
     "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/"
-    "puppi_jet_res_2000_charged_subtract_full.png"
+    "puppi_jet_res_2000_ddhiggs_charged_subtract_full.png"
 )
 
 

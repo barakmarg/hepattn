@@ -17,7 +17,6 @@ from lightning import seed_everything
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from hepattn.experiments.odd_pileup_reco.puppi import compute_puppi_weights_event
 from hepattn.utils.scaling import FeatureScaler
 
 
@@ -202,7 +201,7 @@ class ODDDatasetPileup(Dataset):
         cluster_vars = ["total_cluster_energy", "cluster_rho",
                         "cluster_eta", "cluster_phi",
                         "hcal_fraction", "sigma_eta", "sigma_phi", "sigma_rho",
-                        "cluster_time", "number_of_hits", "energy_hits_std", "max_hit_energy"]
+                        "number_of_hits", "energy_hits_std", "max_hit_energy"]
         deps_vars = ["hard_scatter_energy_deps_in_cluster", "cluster_idx",
                      "hs_neutral_energy_in_cluster", "hs_charged_energy_in_cluster"]
         # Particle variables for reconstruction targets
@@ -574,7 +573,6 @@ class ODDDatasetPileup(Dataset):
         c_sigma_phi = get_t("sigma_phi", c_start, c_end)
         c_sigma_rho = get_t("sigma_rho", c_start, c_end)
         c_hcal_fraction = get_t("hcal_fraction", c_start, c_end)
-        c_cluster_time = get_t("cluster_time", c_start, c_end)
         c_number_of_hits = get_t("number_of_hits", c_start, c_end)
         c_energy_hits_std = get_t("energy_hits_std", c_start, c_end)
         c_max_hit_energy = get_t("max_hit_energy", c_start, c_end)
@@ -595,28 +593,6 @@ class ODDDatasetPileup(Dataset):
         hs_charged_energy = torch.zeros_like(c_e)
         hs_neutral_energy[d_cluster_idx] = d_neutral
         hs_charged_energy[d_cluster_idx] = d_charged
-
-        # --- PUPPI weight (per-node, in [0, 1], used as an unscaled model input).
-        # Truth-free Δz CHS + α-shape: tracks_mask synthesized from node_z0,
-        # so no per-cluster truth is consumed. See puppi.py.
-        node_pt_for_puppi  = torch.cat([t_pt,  c_e / torch.cosh(torch.clamp(c_eta, min=-10.0, max=10.0))], dim=-1)
-        node_eta_for_puppi = torch.cat([t_eta, c_eta], dim=-1)
-        node_phi_for_puppi = torch.cat([t_phi, c_phi], dim=-1)
-        node_z0_for_puppi  = torch.cat([t_z0,  torch.zeros(n_clusters, device=t_z0.device)], dim=-1)
-        node_is_track_for_puppi = torch.cat([
-            torch.ones(n_tracks, dtype=torch.bool),
-            torch.zeros(n_clusters, dtype=torch.bool),
-        ], dim=-1)
-        node_valid_for_puppi = torch.ones(n_tracks + n_clusters, dtype=torch.bool)
-        puppi_w = compute_puppi_weights_event(
-            node_pt_for_puppi.numpy(),
-            node_eta_for_puppi.numpy(),
-            node_phi_for_puppi.numpy(),
-            node_z0_for_puppi.numpy(),
-            node_is_track_for_puppi.numpy(),
-            node_valid_for_puppi.numpy(),
-        )
-        puppi_w_tensor = torch.from_numpy(puppi_w)  # already in [0, 1]
 
         node_features = {
             # Common freatures
@@ -645,7 +621,6 @@ class ODDDatasetPileup(Dataset):
             "sigma_phi": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["sigma_phi"].transform(c_sigma_phi)], -1),
             "sigma_rho": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["sigma_rho"].transform(c_sigma_rho)], -1),
             "hcal_fraction": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), c_hcal_fraction], -1),
-            "cluster_time": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["cluster_time"].transform(c_cluster_time)], -1),
             "number_of_hits": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["number_of_hits"].transform(c_number_of_hits)], -1),
             "energy_hits_std": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["energy_hits_std"].transform(c_energy_hits_std)], -1),
             "max_hit_energy": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), self.scaler.transforms["max_hit_energy"].transform(c_max_hit_energy)], -1),
@@ -653,8 +628,6 @@ class ODDDatasetPileup(Dataset):
             # flags
             "is_track": torch.cat([torch.ones(n_tracks, dtype=torch.float32), torch.zeros(n_clusters, dtype=torch.float32),],-1,),
             "is_cluster": torch.cat([torch.zeros(n_tracks, dtype=torch.float32), torch.ones(n_clusters, dtype=torch.float32),],-1,),
-            # PUPPI weight: per-node hard-scatter probability in [0, 1], no scaling.
-            "puppi_weight": puppi_w_tensor,
         }
 
         # Raw features (for loss computation and analysis)
@@ -672,7 +645,6 @@ class ODDDatasetPileup(Dataset):
             "node_z0":  torch.cat([t_z0,  torch.zeros(n_clusters, device=t_z0.device)], -1),
             "calo_hs_neutral_energy": torch.cat([torch.zeros(n_tracks), hs_neutral_energy], -1),
             "calo_hs_charged_energy": torch.cat([torch.zeros(n_tracks), hs_charged_energy], -1),
-            "puppi_weight": puppi_w_tensor,
         }
 
         # Compute Z-order (Morton) index from raw eta/phi for locality-preserving sort
@@ -904,6 +876,101 @@ class ODDDatasetPileup(Dataset):
         df_clusters = pl.read_parquet(file_dir / f"calo_clusters-{index:05d}.parquet")
         df_deps_raw_parquet = pl.read_parquet(file_dir / f"target_particles_deps-{index:05d}.parquet")
         df_tracks = pl.read_parquet(file_dir / f"tracks-{index:05d}.parquet")
+
+        # All-vertices datasets store HS (vertex_primary == 1) and PU (vertex_primary > 1)
+        # particles together. Downstream code at lines ~716/759/770 uses particle_idx as a
+        # POSITIONAL row index into per-event tensors sized to the HS-particle count, so a
+        # plain filter would leave non-contiguous indices and silently miswire the
+        # incidence matrix. Filter to HS-only AND reindex particle_idx to 0..n_hs-1 per
+        # event, propagating the new index to df_deps_raw_parquet (inner join, drops PU
+        # deps) and df_tracks (left join, fills -1 for tracks pointing to removed PU
+        # particles -- handled by the existing -1 sentinel logic downstream).
+        n_distinct_vp = (
+            df_particles.lazy()
+            .select(pl.col("vertex_primary").explode().n_unique())
+            .collect()
+            .item()
+        )
+        if n_distinct_vp is not None and n_distinct_vp > 1:
+            n_particles_before = int(
+                df_particles.lazy()
+                .select(pl.col("particle_idx").list.len().sum())
+                .collect()
+                .item()
+            )
+
+            particle_list_cols = [c for c in df_particles.columns if c != "event_id"]
+
+            # Explode + filter HS + assign a NEW contiguous per-event particle_idx,
+            # keeping the original under `old_particle_idx` to drive the remap join.
+            df_particles_hs = (
+                df_particles.lazy()
+                .explode(particle_list_cols)
+                .filter(pl.col("vertex_primary") == 1)
+                .with_columns(pl.col("particle_idx").alias("old_particle_idx"))
+                .with_columns(
+                    pl.int_range(pl.len()).over("event_id").cast(pl.Int64).alias("particle_idx"),
+                )
+                .collect()
+            )
+            remap = df_particles_hs.lazy().select("event_id", "old_particle_idx", "particle_idx")
+
+            df_particles = (
+                df_particles_hs.lazy()
+                .drop("old_particle_idx")
+                .group_by("event_id", maintain_order=True)
+                .agg([pl.col(c) for c in particle_list_cols])
+                .collect()
+            )
+
+            deps_list_cols = [c for c in df_deps_raw_parquet.columns if c != "event_id"]
+            df_deps_raw_parquet = (
+                df_deps_raw_parquet.lazy()
+                .explode(deps_list_cols)
+                .join(
+                    remap,
+                    left_on=["event_id", "particle_idx"],
+                    right_on=["event_id", "old_particle_idx"],
+                    how="inner",
+                )
+                .drop("particle_idx")
+                .rename({"particle_idx_right": "particle_idx"})
+                .group_by("event_id", maintain_order=True)
+                .agg([pl.col(c) for c in deps_list_cols])
+                .collect()
+            )
+
+            track_list_cols = [c for c in df_tracks.columns if c != "event_id"]
+            df_tracks = (
+                df_tracks.lazy()
+                .explode(track_list_cols)
+                .join(
+                    remap,
+                    left_on=["event_id", "particle_idx"],
+                    right_on=["event_id", "old_particle_idx"],
+                    how="left",
+                )
+                .with_columns(
+                    pl.col("particle_idx_right").fill_null(-1).cast(pl.Int64).alias("particle_idx"),
+                )
+                .drop("particle_idx_right")
+                .group_by("event_id", maintain_order=True)
+                .agg([pl.col(c) for c in track_list_cols])
+                .collect()
+            )
+
+            n_particles_after = int(
+                df_particles.lazy()
+                .select(pl.col("particle_idx").list.len().sum())
+                .collect()
+                .item()
+            )
+            print(
+                f"[preprocess_hook idx={index}] vertex_primary has {n_distinct_vp} distinct values — "
+                f"filtered df_particles {n_particles_before} -> {n_particles_after} (kept vertex_primary == 1); "
+                f"remapped df_deps_raw_parquet and df_tracks particle_idx to 0..n_hs-1 per event. "
+                f"Required because downstream incidence-matrix code uses particle_idx as a positional row index."
+            )
 
         # Align column names to match expected schema
         rename_map = {}
