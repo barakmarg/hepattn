@@ -320,39 +320,45 @@ $p_T > p_T^{\text{min}}$.
 
 ## 6) Hyperparameters
 
-Defaults in `compute_puppi_weights_charged_subtract()`:
+**Tuned parameters** (from Optuna v1,
+`optuna_puppi_charged_subtract/puppi_charged_subtract_v1_best.json`,
+200 trials × 100 events, best value = 0.2725):
 
-- `R0 = 0.139`
-- `rms_pt_min = 0.080`
-- `min_neutral_pt = 0.504`
-- `min_neutral_pt_slope = 1.837`
-- `min_weight = 0.051`
-- `eta_max_extrap = 2.543`
-- `apply_lv_adjust = False`
+- `R0 = 0.1238`
+- `rms_pt_min = 0.6260`
+- `min_neutral_pt = 0.0805`
+- `min_neutral_pt_slope = 0.000566`
+- `min_weight = 0.0563`
+- `eta_max_extrap = 2.4724`
+- `apply_lv_adjust = True`
 - `subtract_pu_charged = True`
 - `n_pu_proxy = None`
 
-These match the `puppi_perfect` v2 Optuna-tuned operating point. The
-PU-charged subtraction is an algorithmic change rather than a hyperparameter
-retune; standalone re-tuning lives in
-[optuna_puppi_charged_subtract.py](optuna_puppi_charged_subtract.py) and
-optimizes the same combined objective:
+These are the parameters used in all plots and the full comparison script
+(`run_puppi_jet_resolution_charged_subtract_full.py`, loaded via
+`--best-json`). The function-level defaults in
+`compute_puppi_weights_charged_subtract()` are older placeholders; always
+use `--best-json` or pass the params explicitly.
+
+The Optuna search optimises the combined objective
 
 $$
  \mathcal{L} = |\text{bias}| + \text{IQR} + 0.5 \cdot |\text{nc}_{\text{rel}}|
 $$
 
-where the metrics come from jet $\Delta p_T/p_T$ and the relative
-constituent-count difference.
+on jet $\Delta p_T/p_T$ and the relative constituent-count difference.
+Best result: bias = +0.0009, IQR = 0.266, nc\_rel = −0.012 on 100 events.
 
-**Interpretation of key hyperparameters** (same role as PUPPI-Perfect):
+**Interpretation of key hyperparameters**:
 
 - **$R_0$ (cone size)**: smaller than the CMS default, better matches the
   dense cluster environment and focuses on the HS jet core.
 - **`min_neutral_pt + min_neutral_pt_slope * N_PU`**: PU-aware neutral
-  threshold; makes neutral selection stricter as PU increases.
-- **`apply_lv_adjust=False`**: the CMS low-PU adjustment worsens bias in
-  ODD cluster space and is disabled.
+  threshold; very low here because after full charged subtraction the
+  neutral residual is already soft.
+- **`apply_lv_adjust=True`**: the CMS low-PU adjustment is enabled; after
+  full charged subtraction the neutral residual is sparse everywhere, so LV
+  and PU α distributions overlap and the correction improves discrimination.
 - **`eta_max_extrap`**: extends calibration in $\eta$ for the forward region.
 - **`subtract_pu_charged`**: master switch for the PU-charged subtraction. Set
   to `False` to recover `puppi_perfect` exactly.

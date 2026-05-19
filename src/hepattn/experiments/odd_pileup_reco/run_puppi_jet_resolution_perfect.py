@@ -78,6 +78,8 @@ def main() -> int:
     fig = plot_jet_resolution_with_calo(
         jets, data,
         jet_R=args.jet_R,
+        min_constituents=args.min_constituents,
+        min_pt=args.min_pt,
         puppi_jets=puppi_jets_perfect,
         puppi_label="PUPPI (perfect PFlow)",
     )

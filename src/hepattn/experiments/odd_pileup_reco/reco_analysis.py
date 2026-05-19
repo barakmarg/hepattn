@@ -2083,10 +2083,13 @@ def plot_jet_resolution_with_calo(
     data: dict,
     dr_cut: float = 0.4,
     jet_R: float = 0.7,
+    min_constituents: int = 3,
+    min_pt: float = 10.0,
     compare_jets: dict | None = None,
     compare_label: str = "True-pileup-mask-reconstruction",
     puppi_jets: dict | None = None,
     puppi_label: str = "PUPPI",
+    show_calo: bool = True,
 ) -> plt.Figure | None:
     """Copy of jet-resolution plot with additional calo-cluster jet residual overlays.
 
@@ -2119,8 +2122,8 @@ def plot_jet_resolution_with_calo(
     calo_jets = cluster_calo_jets(
         data,
         jet_R=jet_R,
-        min_constituents=3,
-        min_pt=10.0,
+        min_constituents=min_constituents,
+        min_pt=min_pt,
     )
     if calo_jets is None:
         print("  jet_resolution_with_calo skipped: raw node_metadata fields missing")
@@ -2129,8 +2132,8 @@ def plot_jet_resolution_with_calo(
     calo_hs_jets = cluster_calo_hs_jets(
         data,
         jet_R=jet_R,
-        min_constituents=3,
-        min_pt=10.0,
+        min_constituents=min_constituents,
+        min_pt=min_pt,
     )
 
     if puppi_jets is None:
@@ -2138,8 +2141,8 @@ def plot_jet_resolution_with_calo(
         puppi_jets = cluster_puppi_jets(
             data,
             jet_R=jet_R,
-            min_constituents=3,
-            min_pt=10.0,
+            min_constituents=min_constituents,
+            min_pt=min_pt,
         )
 
     n_pflow = np.array([len(e) for e in jets["pflow_jet_pt"]])
@@ -2384,7 +2387,7 @@ def plot_jet_resolution_with_calo(
             "dpt_over_truth": ca_res["dpt_over_truth"],
             "energy": ca_e,
         }[key]
-        if len(ca_d) > 0:
+        if show_calo and len(ca_d) > 0:
             ax.hist(ca_d, bins=b, histtype="step", linewidth=1.8, density=hist_density,
                     label=rf"Calo  $\mu$={np.nanmean(ca_d):.3f}, IQR={iqr(ca_d):.3f}")
 
