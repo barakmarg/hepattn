@@ -1632,8 +1632,12 @@ def _cluster_jets_single(
     jet_R: float,
     min_const: int,
     min_pt: float,
+    jet_algorithm: str = "antikt",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Cluster one event's particles into jets with FastJet."""
+    """Cluster one event's particles into jets with FastJet.
+
+    ``jet_algorithm`` is ``"antikt"`` (default, LHC standard) or ``"kt"``.
+    """
     import fastjet as fj
 
     sel = indicator > ind_threshold
@@ -1646,8 +1650,15 @@ def _cluster_jets_single(
     pz = pt * np.sinh(eta)
     e  = np.sqrt(px**2 + py**2 + pz**2)
 
+    if jet_algorithm == "antikt":
+        alg = fj.antikt_algorithm
+    elif jet_algorithm == "kt":
+        alg = fj.kt_algorithm
+    else:
+        raise ValueError(f"jet_algorithm must be 'antikt' or 'kt', got {jet_algorithm!r}")
+
     pj = [fj.PseudoJet(float(px[k]), float(py[k]), float(pz[k]), float(e[k])) for k in range(len(px))]
-    cs   = fj.ClusterSequence(pj, fj.JetDefinition(fj.kt_algorithm, jet_R))
+    cs   = fj.ClusterSequence(pj, fj.JetDefinition(alg, jet_R))
     jets = [j for j in fj.sorted_by_pt(cs.inclusive_jets())
             if len(j.constituents()) >= min_const and j.pt() > min_pt]
 
@@ -1668,6 +1679,7 @@ def cluster_jets(
     jet_R: float = 0.7,
     min_constituents: int = 3,
     min_pt: float = 10.0,
+    jet_algorithm: str = "antikt",
 ) -> dict:
     """Cluster particles into jets for all events.
 
@@ -1697,6 +1709,7 @@ def cluster_jets(
             out = _cluster_jets_single(
                 data[ptetaphi_key][i], data[ind_key][i],
                 ind_threshold, jet_R, min_constituents, min_pt,
+                jet_algorithm=jet_algorithm,
             )
             pt_l.append(out[0]); eta_l.append(out[1]); phi_l.append(out[2])
             m_l.append(out[3]);  nc_l.append(out[4])
@@ -1712,6 +1725,7 @@ def cluster_calo_jets(
     jet_R: float = 0.7,
     min_constituents: int = 3,
     min_pt: float = 10.0,
+    jet_algorithm: str = "antikt",
 ) -> dict | None:
     """Cluster jets from raw calorimeter clusters (valid non-track nodes).
 
@@ -1763,6 +1777,7 @@ def cluster_calo_jets(
             jet_R,
             min_constituents,
             min_pt,
+            jet_algorithm=jet_algorithm,
         )
         pt_l.append(out[0]); eta_l.append(out[1]); phi_l.append(out[2])
         m_l.append(out[3]);  nc_l.append(out[4])
@@ -1781,6 +1796,7 @@ def cluster_calo_hs_jets(
     jet_R: float = 0.7,
     min_constituents: int = 3,
     min_pt: float = 10.0,
+    jet_algorithm: str = "antikt",
 ) -> dict | None:
     """Cluster calo jets using truth pileup-subtracted cluster energy (calo_hs_energy)."""
     try:
@@ -1826,6 +1842,7 @@ def cluster_calo_hs_jets(
             jet_R,
             min_constituents,
             min_pt,
+            jet_algorithm=jet_algorithm,
         )
         pt_l.append(out[0]); eta_l.append(out[1]); phi_l.append(out[2])
         m_l.append(out[3]);  nc_l.append(out[4])
@@ -1836,6 +1853,91 @@ def cluster_calo_hs_jets(
         "calo_hs_jet_phi": np.array(phi_l, dtype=object),
         "calo_hs_jet_mass": np.array(m_l, dtype=object),
         "calo_hs_jet_nconst": np.array(nc_l, dtype=object),
+    }
+
+
+def cluster_calo_hs_plus_hs_tracks_jets(
+    data: dict,
+    jet_R: float = 0.7,
+    min_constituents: int = 3,
+    min_pt: float = 10.0,
+    jet_algorithm: str = "antikt",
+) -> dict | None:
+    """Perfect-PFlow HS jets: clusters carry only HS-neutral residual, HS tracks
+    are added at their own (pT, η, φ).
+
+    Per cluster: ``E = max(calo_hs_energy − calo_charged_e, 0)`` at cluster
+    (η, φ). Per HS track (``tracks_mask == 1``): track ``(pt, eta, phi)``.
+    Anti-kT cluster both together. This is a truth-aided ceiling that uses
+    track resolution for charged HS particles instead of calo deposits.
+    """
+    try:
+        import fastjet  # noqa: F401
+    except ImportError as e:
+        raise ImportError("fastjet is required for jet clustering") from e
+
+    from tqdm import tqdm
+
+    required = ("node_valid", "node_is_track", "node_eta", "node_phi",
+                "calo_hs_energy", "calo_charged_e", "tracks_mask", "node_pt")
+    if any(data.get(k) is None for k in required):
+        return None
+
+    node_valid    = np.asarray(data["node_valid"]).astype(bool)
+    node_is_track = np.asarray(data["node_is_track"]).astype(bool)
+    node_eta      = np.asarray(data["node_eta"]).astype(np.float32)
+    node_phi      = np.asarray(data["node_phi"]).astype(np.float32)
+    node_pt       = np.asarray(data["node_pt"]).astype(np.float32)
+    tracks_mask   = np.asarray(data["tracks_mask"]).astype(np.int8)
+    hs_e          = np.asarray(data["calo_hs_energy"]).astype(np.float32)
+    ch_e          = np.asarray(data["calo_charged_e"]).astype(np.float32)
+
+    if any(a.ndim != 2 for a in (node_valid, node_is_track, node_eta, node_phi,
+                                  node_pt, tracks_mask, hs_e, ch_e)):
+        return None
+
+    # Cluster HS-neutral residual pT at cluster (η, φ).
+    hs_neutral_e = np.maximum(hs_e - ch_e, 0.0)
+    hs_neutral_pt = hs_neutral_e / np.cosh(np.clip(node_eta, -10.0, 10.0))
+
+    is_cluster = node_valid & (~node_is_track)
+    is_hs_track = node_valid & node_is_track & (tracks_mask == 1)
+
+    # Per-node pT used in the jet input: HS-neutral residual for clusters,
+    # track pT for HS tracks, 0 elsewhere.
+    used_pt = np.where(is_cluster, hs_neutral_pt,
+                       np.where(is_hs_track, node_pt, 0.0)).astype(np.float32)
+
+    selectable = (
+        (is_cluster | is_hs_track)
+        & np.isfinite(used_pt)
+        & np.isfinite(node_eta)
+        & np.isfinite(node_phi)
+        & (used_pt > 0)
+    )
+
+    n_events = node_valid.shape[0]
+    pt_l, eta_l, phi_l, m_l, nc_l = [], [], [], [], []
+    for i in tqdm(range(n_events), desc="Jets (calo-hs + hs-tracks)"):
+        ptetaphi = np.stack([used_pt[i], node_eta[i], node_phi[i]], axis=-1)
+        out = _cluster_jets_single(
+            ptetaphi,
+            selectable[i],
+            0.5,
+            jet_R,
+            min_constituents,
+            min_pt,
+            jet_algorithm=jet_algorithm,
+        )
+        pt_l.append(out[0]); eta_l.append(out[1]); phi_l.append(out[2])
+        m_l.append(out[3]);  nc_l.append(out[4])
+
+    return {
+        "calo_hs_track_jet_pt":     np.array(pt_l, dtype=object),
+        "calo_hs_track_jet_eta":    np.array(eta_l, dtype=object),
+        "calo_hs_track_jet_phi":    np.array(phi_l, dtype=object),
+        "calo_hs_track_jet_mass":   np.array(m_l, dtype=object),
+        "calo_hs_track_jet_nconst": np.array(nc_l, dtype=object),
     }
 
 
@@ -2090,12 +2192,21 @@ def plot_jet_resolution_with_calo(
     puppi_jets: dict | None = None,
     puppi_label: str = "PUPPI",
     show_calo: bool = True,
+    include_calo_hs_tracks: bool = True,
+    calo_hs_tracks_label: str = "Calo-HS + HS tracks",
+    jet_algorithm: str = "antikt",
 ) -> plt.Figure | None:
     """Copy of jet-resolution plot with additional calo-cluster jet residual overlays.
 
     If ``puppi_jets`` is supplied (a dict keyed ``puppi_jet_*``), it overrides
     the internal call to ``cluster_puppi_jets`` — useful for swapping in the
     truth-free variant. ``puppi_label`` controls the legend entry.
+
+    If ``include_calo_hs_tracks`` is True and the H5 contains the required
+    truth fields (``calo_hs_energy``, ``calo_charged_e``, ``tracks_mask``),
+    a "perfect-PFlow HS" line is added: HS-neutral cluster residual at cluster
+    (η, φ) plus HS tracks at track (pT, η, φ). Tighter truth-aided ceiling
+    than Calo-HS alone (uses track resolution for charged HS particles).
     """
     from scipy.stats import iqr
 
@@ -2124,6 +2235,7 @@ def plot_jet_resolution_with_calo(
         jet_R=jet_R,
         min_constituents=min_constituents,
         min_pt=min_pt,
+        jet_algorithm=jet_algorithm,
     )
     if calo_jets is None:
         print("  jet_resolution_with_calo skipped: raw node_metadata fields missing")
@@ -2134,7 +2246,18 @@ def plot_jet_resolution_with_calo(
         jet_R=jet_R,
         min_constituents=min_constituents,
         min_pt=min_pt,
+        jet_algorithm=jet_algorithm,
     )
+
+    calo_hs_track_jets = None
+    if include_calo_hs_tracks:
+        calo_hs_track_jets = cluster_calo_hs_plus_hs_tracks_jets(
+            data,
+            jet_R=jet_R,
+            min_constituents=min_constituents,
+            min_pt=min_pt,
+            jet_algorithm=jet_algorithm,
+        )
 
     if puppi_jets is None:
         from hepattn.experiments.odd_pileup_reco.puppi import cluster_puppi_jets
@@ -2272,6 +2395,34 @@ def plot_jet_resolution_with_calo(
         ca_hs_nc = _concat_nonempty(calo_hs_jets["calo_hs_jet_nconst"])
         ca_hs_e = _concat_jet_energy(calo_hs_jets, "calo_hs")
 
+    ca_ht_res = {"deta": np.array([]), "dphi": np.array([]), "dpt": np.array([]), "dpt_over_truth": np.array([])}
+    ca_ht_nc = np.array([])
+    ca_ht_e = np.array([])
+    if calo_hs_track_jets is not None:
+        n_ca_ht = np.array([len(e) for e in calo_hs_track_jets["calo_hs_track_jet_pt"]])
+        mask_ca_ht = (n_ca_ht > 0) & (n_truth > 0)
+        tr_cht, cht_ix, _ = match_jets(
+            calo_hs_track_jets["calo_hs_track_jet_pt"][mask_ca_ht],
+            calo_hs_track_jets["calo_hs_track_jet_eta"][mask_ca_ht],
+            calo_hs_track_jets["calo_hs_track_jet_phi"][mask_ca_ht],
+            jets["truth_jet_pt"][mask_ca_ht],
+            jets["truth_jet_eta"][mask_ca_ht],
+            jets["truth_jet_phi"][mask_ca_ht],
+            dr_cut=dr_cut,
+        )
+        ca_ht_res = get_jet_residuals(
+            tr_cht,
+            cht_ix,
+            jets["truth_jet_pt"][mask_ca_ht],
+            jets["truth_jet_eta"][mask_ca_ht],
+            jets["truth_jet_phi"][mask_ca_ht],
+            calo_hs_track_jets["calo_hs_track_jet_pt"][mask_ca_ht],
+            calo_hs_track_jets["calo_hs_track_jet_eta"][mask_ca_ht],
+            calo_hs_track_jets["calo_hs_track_jet_phi"][mask_ca_ht],
+        )
+        ca_ht_nc = _concat_nonempty(calo_hs_track_jets["calo_hs_track_jet_nconst"])
+        ca_ht_e = _concat_jet_energy(calo_hs_track_jets, "calo_hs_track")
+
     pu_res = {"deta": np.array([]), "dphi": np.array([]), "dpt": np.array([]), "dpt_over_truth": np.array([])}
     pu_nc = np.array([])
     pu_e = np.array([])
@@ -2402,6 +2553,18 @@ def plot_jet_resolution_with_calo(
         if len(ca_hs_d) > 0:
             ax.hist(ca_hs_d, bins=b, histtype="step", linestyle="--", linewidth=1.8, density=hist_density,
                     label=rf"Calo-HS  $\mu$={np.nanmean(ca_hs_d):.3f}, IQR={iqr(ca_hs_d):.3f}")
+
+        ca_ht_d = {
+            "deta": ca_ht_res["deta"],
+            "dphi": ca_ht_res["dphi"],
+            "nconst": ca_ht_nc,
+            "dpt": ca_ht_res["dpt"],
+            "dpt_over_truth": ca_ht_res["dpt_over_truth"],
+            "energy": ca_ht_e,
+        }[key]
+        if len(ca_ht_d) > 0:
+            ax.hist(ca_ht_d, bins=b, histtype="step", linestyle=(0, (3, 1, 1, 1)), linewidth=1.8, density=hist_density,
+                    label=rf"{calo_hs_tracks_label}  $\mu$={np.nanmean(ca_ht_d):.3f}, IQR={iqr(ca_ht_d):.3f}")
 
         pu_d = {
             "deta": pu_res["deta"],

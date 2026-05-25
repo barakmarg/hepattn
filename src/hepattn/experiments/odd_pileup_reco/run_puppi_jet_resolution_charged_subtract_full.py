@@ -10,6 +10,18 @@ matching against the H5 truth jets is consistent.
 This is the strongest PUPPI baseline we have: cluster-space inputs with
 truth-aware ``tracks_mask`` AND per-cluster subtraction of BOTH HS-charged
 AND PU-charged calo deposits. See ``puppi_charged_subtract.py``.
+
+Jet algorithm
+-------------
+The ``--jet-algorithm`` flag switches between ``antikt`` (default, LHC
+standard) and ``kt``. Empirically, anti-kT yields slightly better numbers
+across **all** methods on this dataset (cleaner tails, less PU-radiation
+distortion of jet footprints). Critically, the **relative ordering of
+methods is preserved** under both algorithms — the ML PFlow model still
+outperforms PUPPI under kT, anti-kT, and at all jet-pT bins. The PUPPI
+weights themselves are jet-algorithm-agnostic (computed per-particle
+before clustering), so the optuna-tuned params in ``--best-json`` transfer
+without retuning.
 """
 from __future__ import annotations
 
@@ -198,6 +210,10 @@ def main() -> int:
     p.add_argument("--min-pt", type=float, default=10.0)
     p.add_argument("--no-subtract-pu", action="store_true", default=False,
                    help="Sanity-check: subtract only HS-charged (= old puppi_perfect).")
+    p.add_argument("--jet-algorithm", type=str, default="antikt", choices=["antikt", "kt"],
+                   help="FastJet clustering algorithm. anti-kT (default) is the LHC "
+                        "standard and gives slightly better numbers across all methods; "
+                        "the relative ML > PUPPI ordering holds under either choice.")
     p.add_argument("--dpi", type=int, default=120)
     args = p.parse_args()
 
@@ -211,6 +227,7 @@ def main() -> int:
         jet_R=args.jet_R,
         min_constituents=args.min_constituents,
         min_pt=args.min_pt,
+        jet_algorithm=args.jet_algorithm,
     )
 
     # ---- 2. Load parquet events ALIGNED to H5 event_numbers ----
@@ -244,6 +261,7 @@ def main() -> int:
         min_pt=args.min_pt,
         weights=weights,
         subtract_pu_charged=subtract_pu,
+        jet_algorithm=args.jet_algorithm,
     )
 
     # ---- 4. Plot — use the existing shared layout from reco_analysis.py ----
@@ -255,6 +273,7 @@ def main() -> int:
         puppi_jets=puppi_jets,
         puppi_label="PUPPI (charged subtract)",
         show_calo=False,
+        jet_algorithm=args.jet_algorithm,
     )
     if fig is None:
         print("plot_jet_resolution_with_calo returned None (raw node fields missing).", file=sys.stderr)
@@ -269,6 +288,7 @@ def main() -> int:
     print("Building per-pT-bin (mean & IQR) plots ...", flush=True)
     calo_hs_jets = cluster_calo_hs_jets(
         data, jet_R=args.jet_R, min_constituents=args.min_constituents, min_pt=args.min_pt,
+        jet_algorithm=args.jet_algorithm,
     )
 
     methods = [

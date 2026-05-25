@@ -332,6 +332,7 @@ def cluster_puppi_charged_subtract_jets(
     *,
     weights: np.ndarray | None = None,
     subtract_pu_charged: bool = True,
+    jet_algorithm: str = "antikt",
     **puppi_kwargs,
 ) -> dict:
     """Cluster jets from LV tracks (weight=1, full pT) + clusters (PUPPI-weighted
@@ -378,7 +379,7 @@ def cluster_puppi_charged_subtract_jets(
         sel = (valid & np.isfinite(weighted_pt) & np.isfinite(eta)
                & np.isfinite(phi) & (weighted_pt > 0))
         ptetaphi = np.stack([weighted_pt, eta, phi], axis=-1)
-        out = _cluster_jets_single(ptetaphi, sel, 0.5, jet_R, min_constituents, min_pt)
+        out = _cluster_jets_single(ptetaphi, sel, 0.5, jet_R, min_constituents, min_pt, jet_algorithm=jet_algorithm)
         pt_l.append(out[0]); eta_l.append(out[1]); phi_l.append(out[2])
         m_l.append(out[3]);  nc_l.append(out[4])
 
@@ -396,6 +397,7 @@ def cluster_truth_hs_jets_from_events(
     jet_R: float = 0.7,
     min_constituents: int = 3,
     min_pt: float = 10.0,
+    jet_algorithm: str = "antikt",
 ) -> dict:
     """Cluster jets from HS truth particles (vertex_primary==1) stored in events."""
     try:
@@ -418,7 +420,7 @@ def cluster_truth_hs_jets_from_events(
         phi = events["hs_part_phi"][i].astype(np.float32)
         sel = np.isfinite(pt) & np.isfinite(eta) & np.isfinite(phi) & (pt > 0)
         ptetaphi = np.stack([pt, eta, phi], axis=-1)
-        out = _cluster_jets_single(ptetaphi, sel, 0.5, jet_R, min_constituents, min_pt)
+        out = _cluster_jets_single(ptetaphi, sel, 0.5, jet_R, min_constituents, min_pt, jet_algorithm=jet_algorithm)
         pt_l.append(out[0]); eta_l.append(out[1]); phi_l.append(out[2])
         m_l.append(out[3]);  nc_l.append(out[4])
 
