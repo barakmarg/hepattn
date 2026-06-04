@@ -36,7 +36,7 @@ data:
   valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
   test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
 
-  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu200
+  unify_path: /storage/agrp/barakma/PileupODD/data/ggf_pu200
   enable_split: true
   train_split: 0.9
   val_split: 0.1
