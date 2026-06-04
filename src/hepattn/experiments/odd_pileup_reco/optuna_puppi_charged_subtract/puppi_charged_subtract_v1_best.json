@@ -1,0 +1,19 @@
+{
+  "best_value": 0.27254769609054286,
+  "best_params": {
+    "R0": 0.1238416661408564,
+    "rms_pt_min": 0.6259518622946757,
+    "min_neutral_pt": 0.08050629801739886,
+    "min_neutral_pt_slope": 0.0005662779057206725,
+    "min_weight": 0.056258490877107034,
+    "eta_max_extrap": 2.4724408551838977,
+    "apply_lv_adjust": true
+  },
+  "best_bias": 0.0009040622971951962,
+  "best_iqr": 0.26565354131162167,
+  "best_nc_rel": -0.011980184963451986,
+  "best_n_matched": 624,
+  "n_trials": 200,
+  "n_events": 100,
+  "subtract_pu_charged": true
+}
