@@ -24,6 +24,7 @@ particles from the *one* collision we actually care about.
    - [5.4 Particle classes & trackless reclassification](#54-particle-classes--trackless-reclassification)
    - [5.5 Truth labels produced](#55-truth-labels-produced)
 6. [Shared Encoder](#6-shared-encoder)
+   - [6.1 Locality ordering — Morton (Z-order) encoding](#61-locality-ordering--morton-z-order-encoding)
 7. [Stream A — Find the Hard-Scatter Tracks](#7-stream-a--find-the-hard-scatter-tracks)
 8. [The Bridge — Hybrid Queries](#8-the-bridge--hybrid-queries)
 9. [Stream B — Find the Hard-Scatter Calo Clusters](#9-stream-b--find-the-hard-scatter-calo-clusters)
@@ -122,7 +123,7 @@ Three design decisions make this work, and they recur throughout the document:
   │  STREAM B  (calo)        │  calo-only cross-attention, 4 layers          │
   │  → per-cluster HS score  │                                               │
   └───────────┬─────────────┘                                               │
-              │  which clusters are HS?  (truth+noise in training / predicted at inference)
+              │  which tracks & clusters are HS?  (truth+noise in training / predicted at inference)
               ▼                                                              │
   ┌────────────────────────────────────────────────────────────────────────┴──┐
   │  STREAM C  (reconstruction)                                                 │
@@ -203,9 +204,9 @@ In addition to these 24 *network-input* features, the loader keeps a set of **ra
 quantities used by the loss and by reconstruction — e.g. each node's true energy, pT, η, sinφ, cosφ,
 the HS energy deposited in each cluster, and the HS energy fraction of each cluster.
 
-The model also computes a **`deltaR_idx`** ordering of the nodes. The shared encoder uses windowed
-attention, and sorting nodes by this locality index means each window covers a compact region of the
-detector.
+The model also computes a **`deltaR_idx`** ordering of the nodes — a Morton (Z-order) code of each
+node's (η, φ). The shared encoder uses windowed attention, and sorting nodes by this locality index
+means each window covers a compact region of the detector (exact implementation in [§6.1](#61-locality-ordering--morton-z-order-encoding)).
 
 ### 5.3 The incidence matrix & the pileup token
 
@@ -305,6 +306,61 @@ flash-varlen attention** (window size 256). Windowing keeps the cost manageable 
 nodes; sorting nodes by `deltaR_idx` first means each window is a coherent detector region. The
 encoder uses "hybrid norm" and a value-residual connection (standard stability tricks).
 
+### 6.1 Locality ordering — Morton (Z-order) encoding
+
+Windowed attention only saves work if nodes that are *physically* close (small ΔR in the η–φ plane)
+also end up *adjacent* in the 1-D sequence the encoder slides its window over. The dataset achieves
+this by sorting nodes along a **Morton code** (a.k.a. Z-order curve) of their (η, φ) position — this
+is exactly the `deltaR_idx` field the encoder sorts on (`input_sort_field: deltaR_idx`).
+
+A Morton code maps a 2-D coordinate to a single integer by **bit-interleaving** the two quantised
+axes. Points that are near each other in 2-D share high-order bits and therefore land near each
+other on the 1-D curve with high probability — so a contiguous window of 256 sorted positions is, in
+practice, a compact η–φ neighbourhood. This makes windowed attention a cheap approximation of true
+ΔR-local attention.
+
+The exact implementation (`morton_encode()` in `pflow_data.py`):
+
+```python
+def morton_encode(eta, phi, n_bits=16, shift_phi=False):
+    # 1. Normalise each axis to [0, 1]:
+    eta_norm = clamp((eta + 6.0) / 12.0, 0, 1)        # η assumed within [-6, +6]
+    phi_norm = clamp((phi + π) / (2π), 0, 1)          # φ within [-π, +π]
+    if shift_phi:                                     # optional Swin-style shift
+        phi_norm = fmod(phi_norm + 0.5, 1.0)          # rotate φ by π (move the wrap-seam)
+
+    # 2. Quantise each axis to n_bits = 16-bit integers (grid of 65535 steps):
+    scale = (1 << n_bits) - 1                         # 65535
+    ei = long(eta_norm * scale)
+    pi = long(phi_norm * scale)
+
+    # 3. Interleave the bits: η takes the odd bit positions, φ the even ones:
+    result = 0
+    for bit in range(n_bits):
+        result |= ((ei >> bit & 1) << (2*bit + 1))    # η bit -> position 2*bit+1
+        result |= ((pi >> bit & 1) << (2*bit))        # φ bit -> position 2*bit
+    return result.double()                            # float64 (52-bit mantissa) is exact here
+```
+
+Points worth noting for the paper:
+
+- **Fixed normalisation ranges.** η is mapped from the assumed range `[-6, +6]` and φ from
+  `[-π, +π]`; both are clamped, so out-of-range values saturate rather than wrap.
+- **16-bit quantisation per axis** → a 65535 × 65535 grid; the interleaved code uses 32 bits and is
+  returned as `float64` (whose 52-bit mantissa represents it exactly).
+- **Bit layout:** η occupies the odd bit positions (`2·bit+1`), φ the even positions (`2·bit`).
+- **Padding:** padded (non-existent) node slots are given `deltaR_idx = +inf` so they always sort to
+  the end and never fall inside a real window.
+- **Shifted variant (`shift_phi=True`).** A second code `node_deltaR_idx_shifted` is computed by
+  rotating φ by π before quantisation, which moves the periodic "tear" at φ = ±π so that genuinely
+  ΔR-close tokens straddling ±π become adjacent — intended for Swin-style **shifted-window**
+  attention. In the shipped configuration the encoder uses the **unshifted** index only
+  (`window_wrap: false`); the shifted code is computed but not consumed.
+
+The same Morton ordering is used by the dataset's `print_deltaR_stats()` diagnostic, which sorts a
+sample of events by `deltaR_idx` and measures how well a window of `window_size` covers each node's
+true ΔR neighbours — i.e. how good the locality approximation is for a given window size.
+
 One small but important detail: right after the encoder runs, the model **saves a reference to the
 encoder output** (`initial_encoder_embed`). This same tensor is reused much later as a skip
 connection into Stream C (§10). It is kept *live* (not copied or detached), which is what lets
@@ -399,6 +455,46 @@ sample_weight = target + null_weight * (1 - target)   # null_weight = 0.05
 ```
 
 so the network is not swamped by the overwhelming majority of pileup clusters.
+
+#### Tversky loss — exact α / β and why
+
+The Tversky loss generalises Dice by penalising false positives and false negatives with **separate**
+weights:
+
+```
+tp = Σ p·t        fp = Σ p·(1−t)        fn = Σ (1−p)·t
+tversky = (tp + 1) / (tp + α·fp + β·fn + 1)
+loss    = 1 − tversky
+```
+
+| Parameter | Value | Role |
+|---|---|---|
+| **α (FP penalty)** | **0.25** | weight on false positives (pileup wrongly called HS) |
+| **β (FN penalty)** | **0.75** | weight on false negatives (true HS cluster missed) |
+
+These are the function defaults in `loss.py::mask_tversky_loss` — `CaloNodeMaskTask` calls the loss
+without overriding them, so `α = 0.25, β = 0.75` are what run. (With `α = β = 0.5` this would reduce
+exactly to Dice.) Because **β > α**, a missed HS cluster is penalised **3× more** than a false alarm —
+the loss is deliberately biased toward **recall**.
+
+Why bias toward recall here? Three reinforcing reasons, all rooted in Stream B's role as the
+HS-cluster gate feeding Stream C:
+
+1. **A miss is unrecoverable; a false positive is filterable.** If a true HS cluster is dropped here
+   (FN), its energy is permanently lost from reconstruction — no later stage can bring it back. A
+   spurious pileup cluster that leaks through (FP) is merely extra input that Stream C's Hungarian
+   matching and pileup token (§11) can still absorb or reject. The costlier error gets the larger
+   weight.
+2. **It matches the asymmetric node-selection downstream.** Stream C intentionally over-includes —
+   true HS clusters **plus up to 250 sampled false positives** (§12). Penalising FN more heavily than
+   FP is the loss-level expression of that same "rather over-keep than miss" philosophy.
+3. **Severe class imbalance.** HS clusters are rare versus pileup, so a symmetric objective could win
+   by simply under-predicting HS. The recall-biased Tversky (β = 0.75) and the BCE `sample_weight`
+   (null cells down-weighted 20× via `null_weight = 0.05`) together counteract that collapse.
+
+The pairing of **BCE + Tversky** is also intentional: BCE supplies stable per-cell gradients, while
+Tversky supplies the region-overlap, recall-biased signal. (Streams A and C instead use the symmetric
+**BCE + Dice**, because their decoders do not perform this same recall-critical HS pre-filtering.)
 
 > Note: `tasks.py` also contains alternative calo heads that were tried during development
 > (`CaloHitMaskTask`, which gives each hybrid query its own mask and max-pools them; and energy-
@@ -607,7 +703,7 @@ differ; the config is what actually runs.*
 | **Bridge** | `num_latent_queries` | 16 |
 | | `max_hs_tracks` | 190 |
 | **Stream B** | decoder | `CaloFlashCrossAttentionDecoder`, 4 layers, calo-only, 16 heads |
-| | task | `CaloNodeMaskTask`: Dense 256→[128,64,32]→1, BCE 5.0 + Tversky 5.0, null_weight 0.05, pred 0.3, HS thresholds frac 0.10 / energy 0.15 |
+| | task | `CaloNodeMaskTask`: Dense 256→[128,64,32]→1, BCE 5.0 + Tversky 5.0 (α 0.25 / β 0.75, recall-biased), null_weight 0.05, pred 0.3, HS thresholds frac 0.10 / energy 0.15 |
 | **Stream C** | `max_reco_calo_nodes` | 1200 |
 | | `max_reco_nodes` | 1400 |
 | | `num_reco_queries` | 400 |
