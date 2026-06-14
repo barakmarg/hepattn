@@ -1171,7 +1171,7 @@ def run_data_plots(
 ) -> dict[str, plt.Figure]:
     """Generate all data-only plots without loading a model."""
     import yaml
-    from hepattn.experiments.odd_pileup_reco.pflow_data import ODDDatasetPileup
+    from hepattn.experiments.odd_pileup_reco.pflow_data import EagerODDDataset as ODDDatasetPileup
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)

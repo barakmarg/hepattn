@@ -6,6 +6,7 @@ Data format: Parquet files loaded via Polars, transformed to NumPy/PyTorch tenso
 """
 
 import gc
+import os
 from pathlib import Path
 from typing import Any
 
@@ -77,50 +78,45 @@ class ODDDatasetPileup(Dataset):
 
     def __init__(
         self,
-        filepath: str,
         inputs: dict,
         targets: dict,
         scale_dict_path: str,
-        num_events: int = -1,
         num_objects: int = 400,
         max_nodes: int = 7000,
         remove_wrong_idxs: bool = True,
         incidence_cutval: float = 1e-4,
         is_inference: bool = False,
-        files_list: list[Path] | None = None,
         hard_scatter_energy_threshold: float = 0.03,
         window_size: int = 512,
+        compute_deltaR_stats: bool = True,
     ):
         """
-        Initialize ODD Dataset.
+        Base ODD dataset: holds config + scaler + the shared event-building logic.
+
+        Data *sourcing* is delegated to subclasses via `_fetch_event(idx)`:
+          - `EagerODDDataset` : all events concatenated into RAM (original behavior).
+          - `MmapODDDataset`  : per-shard memory-mapped .pt files on local SSD.
 
         Args:
-            filepath: Path to parquet file or directory containing parquet files
             inputs: Dictionary specifying input features
             targets: Dictionary specifying target variables
             scale_dict_path: Path to YAML file with feature scaling parameters
-            num_events: Number of events to load (-1 for all)
             num_objects: Maximum number of particles (output objects)
             max_nodes: Maximum number of nodes (tracks + clusters)
             remove_wrong_idxs: Whether to remove events with invalid indices
             incidence_cutval: Threshold for incidence matrix values
             is_inference: Whether running in inference mode
-            files_list: Optional list of files to load (supercedes globbing in filepath)
             window_size: Window size for windowed attention (used in deltaR stats)
+            compute_deltaR_stats: Run the (slow) deltaR window analysis after loading.
         """
         super().__init__()
 
         self.scaler = FeatureScaler(scale_dict_path)
-        # Stage (e.g., 'train', 'val', 'test') - used to toggle stage-specific logic
         # Initialize class labels mapping (PDG ID -> class index)
         self.init_label_dicts()
-
         # Initialize variable lists
         self.init_variables_list()
 
-        # Input file handling
-        self.filedir = filepath
-        self.files_list = files_list
         # Store configuration
         self.inputs = inputs
         self.targets = targets
@@ -131,13 +127,42 @@ class ODDDatasetPileup(Dataset):
         self.is_inference = is_inference
         self.window_size = window_size
         self.hard_scatter_energy_threshold = hard_scatter_energy_threshold
+        self.compute_deltaR_stats = compute_deltaR_stats
 
-        print(f"Loading ODD dataset from {filepath} with {num_events} samples")
-        print(f"Is inference: {self.is_inference}")
+    # ------------------------------------------------------------------
+    # Data sourcing interface
+    # ------------------------------------------------------------------
+    _FAMILY_PREFIXES = (
+        ("raw_deps_", "raw_deps"),
+        ("deps_", "deps"),
+        ("particle_", "particle"),
+        ("track_", "track"),
+    )
 
-        # Load data from parquet
-        self.load_data(filepath,num_events)
-        gc.collect()
+    @classmethod
+    def _family(cls, key: str) -> str:
+        """Map a full_data_array key to its per-event count family.
+
+        Tracks/deps/raw_deps/particles are prefixed; everything else (the bare
+        cluster columns like `total_cluster_energy`/`sigma_eta` plus the
+        `cluster_*` derived columns) is a cluster column.
+        """
+        for prefix, fam in cls._FAMILY_PREFIXES:
+            if key.startswith(prefix):
+                return fam
+        return "cluster"
+
+    def _fetch_event(self, idx: int) -> dict[str, Any]:
+        """Return one event's data. Implemented by subclasses.
+
+        Returns a dict with:
+          'arrays'      : {name: 1D tensor slice} for every full_data_array key
+                          (raw + derived), keyed exactly as the eager loader.
+          'n_tracks', 'n_clusters', 'n_particles' : ints
+          'hard_scatter_vz' : float
+          'event_number'    : int
+        """
+        raise NotImplementedError
 
     def load_data(self, file_dir: str, num_events: int) -> None:
         """
@@ -194,7 +219,8 @@ class ODDDatasetPileup(Dataset):
         stats_dropped_particles = 0
         stats_max_particles_seen = 0
         stats_dropped_particles = 0 # New
-        
+        stats_dropped_no_hs = 0  # events with zero hard-scatter tracks (undefined vertex)
+
         # List of variables to extract (keeping consistent with original code)
         track_vars = ["d0", "z0", "pt","phi", "theta",'eta', "phi_int", "eta_int",
                       "track_tanlambda", "track_omega", "particle_idx", "majority_particle_vertex_primary"]
@@ -230,6 +256,14 @@ class ODDDatasetPileup(Dataset):
             n_deps = df_deps.select(pl.col("cluster_idx").list.len()).to_series().to_numpy()
             n_raw_deps = df_raw_deps.select(pl.col("particle_idx").list.len()).to_series().to_numpy()
 
+            # Hard-scatter tracks per event. df_tracks is post-preprocess_hook, so
+            # particle_idx already has PU tracks set to -1; count particle_idx >= 0.
+            # Events with zero HS tracks have no defined hard-scatter vertex
+            # (hard_scatter_vz -> NaN), so they are dropped via mask_has_hs below.
+            n_hs_tracks = df_tracks.select(
+                pl.col("particle_idx").list.eval((pl.element() >= 0).cast(pl.Int64)).list.sum()
+            ).to_series().to_numpy()
+
             n_nodes = n_tracks + n_clusters
             
             # Update Stats
@@ -237,13 +271,15 @@ class ODDDatasetPileup(Dataset):
             mask_nodes_ok = n_nodes < self.max_nodes
             max_particles = self.num_objects - 1  # position 0 reserved for pileup token
             mask_particles_ok = n_particles <= max_particles
+            mask_has_hs = n_hs_tracks > 0
             stats_dropped_nodes += (~mask_nodes_ok).sum()
             stats_dropped_particles += (~mask_particles_ok & mask_nodes_ok).sum()
+            stats_dropped_no_hs += (~mask_has_hs & mask_nodes_ok & mask_particles_ok).sum()
             if (~mask_particles_ok & mask_nodes_ok).any():
                 over = n_particles[(~mask_particles_ok) & mask_nodes_ok]
                 stats_max_particles_seen = max(stats_max_particles_seen, int(over.max()))
 
-            mask = mask_nodes_ok & mask_particles_ok
+            mask = mask_nodes_ok & mask_particles_ok & mask_has_hs
             
             # Check if we need to trim the batch to meet exact num_events
             valid_count = mask.sum()
@@ -345,6 +381,7 @@ class ODDDatasetPileup(Dataset):
         print(f"Events dropped (Too many nodes > {self.max_nodes}): {stats_dropped_nodes}")
         print(f"Events dropped (Too many particles > {self.num_objects - 1}): {stats_dropped_particles}"
               + (f" (max seen: {stats_max_particles_seen})" if stats_max_particles_seen > 0 else ""))
+        print(f"Events dropped (Zero hard-scatter tracks, undefined vertex): {stats_dropped_no_hs}")
         print(f"Total events kept: {total_events_loaded}")
         print(f"----------------------------")
 
@@ -419,11 +456,13 @@ class ODDDatasetPileup(Dataset):
         self.n_nodes = self.n_tracks + self.n_clusters
         print(f"Number of events after filtering: {self.num_events}")
 
-        # Print pileup vs hard scatter track statistics
-        vertex_primary = self.full_data_array["track_majority_particle_vertex_primary"]
-        n_hard_scatter = (vertex_primary == 1).sum().item()
-        n_pileup = (vertex_primary != 1).sum().item()
-        n_total_tracks = len(vertex_primary)
+        # Print pileup vs hard scatter track statistics.
+        # HS = matched to a target particle (particle_idx >= 0); pileup tracks
+        # carry -1 (see preprocess_hook). vertex_primary is uniformly 1 here.
+        track_pidx = self.full_data_array["track_particle_idx"]
+        n_hard_scatter = (track_pidx >= 0).sum().item()
+        n_pileup = (track_pidx < 0).sum().item()
+        n_total_tracks = len(track_pidx)
         pct_hard_scatter = 100 * n_hard_scatter / n_total_tracks if n_total_tracks > 0 else 0
         pct_pileup = 100 * n_pileup / n_total_tracks if n_total_tracks > 0 else 0
         print(f"Track composition: Hard scatter {n_hard_scatter} ({pct_hard_scatter:.1f}%) | Pileup {n_pileup} ({pct_pileup:.1f}%)")
@@ -435,7 +474,8 @@ class ODDDatasetPileup(Dataset):
             deps_to_cluster_ratio = total_deps_energy / total_cluster_energy if total_cluster_energy > 0 else 0
             print(f"Energy composition: Total deposited HS energy {total_deps_energy:.2e} | Total cluster energy {total_cluster_energy:.2e} | Ratio {deps_to_cluster_ratio:.4f}")
 
-        self.print_deltaR_stats(window_size=self.window_size)
+        if self.compute_deltaR_stats:
+            self.print_deltaR_stats(window_size=self.window_size)
 
     def print_deltaR_stats(self, n_sample: int = 100, window_size: int = 512) -> None:
         """Sample events and print delta R statistics within a Z-order sorted window.
@@ -502,17 +542,17 @@ class ODDDatasetPileup(Dataset):
         return int(self.num_events)
 
     def load_event(self, idx: int) -> dict[str, Any]:
+        """Fetch one event from the backend, then build its model tensors."""
+        return self._build_event(self._fetch_event(idx))
+
+    def _build_event(self, ev: dict[str, Any]) -> dict[str, Any]:
         """
-        Load a single event by index.
+        Build a single event's model tensors from pre-sliced per-event arrays.
 
-        TODO: Implement event loading logic:
-        - Extract track, cluster, and particle features for this event
-        - Build node features (concatenation of track + cluster features)
-        - Build incidence matrix (particle-to-node assignment)
-        - Apply feature scaling
-
-        Args:
-            idx: Event index
+        `ev` comes from the backend's `_fetch_event()`: `ev['arrays']` holds each
+        feature already sliced to this event (keyed exactly like the eager
+        `full_data_array`), and `ev` carries the per-event counts + scalars. This
+        method is backend-agnostic — identical output for eager and mmap.
 
         Returns:
             Dictionary containing:
@@ -523,25 +563,25 @@ class ODDDatasetPileup(Dataset):
             - indicator_truth: (num_objects,) tensor indicating valid particles
             - node_q_mask: (max_nodes,) boolean tensor indicating valid nodes
         """
-        # 1. Calculate Slices
+        # 1. Per-event arrays + counts (sourced by the backend)
         # ---------------------------------------------------------------------
-        n_tracks = self.n_tracks[idx]
-        n_clusters = self.n_clusters[idx]
+        arrays = ev["arrays"]
+        n_tracks = ev["n_tracks"]
+        n_clusters = ev["n_clusters"]
         n_nodes = n_tracks + n_clusters
-        
-        n_particles = self.n_particles[idx]
+        n_particles = ev["n_particles"]
 
-        t_start, t_end = self.track_cumsum[idx], self.track_cumsum[idx+1]
-        c_start, c_end = self.cluster_cumsum[idx], self.cluster_cumsum[idx+1]
-        d_start, d_end = self.deps_cumsum[idx], self.deps_cumsum[idx+1]
-        p_start, p_end = self.particle_cumsum[idx], self.particle_cumsum[idx+1]
-        rd_start, rd_end = self.raw_deps_cumsum[idx], self.raw_deps_cumsum[idx+1]
+        # start/end are no longer needed (arrays are already per-event sliced),
+        # but keep the names defined so the original get_t(name, start, end) call
+        # sites continue to work unchanged.
+        t_start = t_end = c_start = c_end = d_start = d_end = None
+        p_start = p_end = rd_start = rd_end = None
 
         # 2. Extract & Pad Input Features
         # ---------------------------------------------------------------------
-        # Helper to get tensor slice
-        def get_t(name, start, end):
-            return self.full_data_array[name][start:end]
+        # Helper: arrays are already sliced per-event; ignore any start/end args.
+        def get_t(name, *_):
+            return arrays[name]
 
         # --- Tracks ---
         t_d0 = get_t("track_d0", t_start, t_end)
@@ -558,9 +598,14 @@ class ODDDatasetPileup(Dataset):
         t_sinphi_int = get_t("track_sinphi_int", t_start, t_end)
         t_tanlambda = get_t("track_tanlambda", t_start, t_end)
         t_omega = get_t("track_omega", t_start, t_end)
-        t_vertex_primary = get_t("track_majority_particle_vertex_primary", t_start, t_end)
-        t_vertex_primary_mask = (t_vertex_primary == 1).float() # New mask for primary vertex tracks
         t_particle_idx = get_t("track_particle_idx", t_start, t_end).long()
+        # Hard-scatter tracks = tracks matched to a target (HS) particle, i.e.
+        # particle_idx in [0, n_particles). Pileup tracks carry particle_idx == -1
+        # (set in preprocess_hook from source_pileup_event_id, or by the
+        # all-vertices remap). This is the collision-proof HS flag; the raw
+        # `vertex_primary` is uniformly 1 in the pileup-overlay production and
+        # cannot distinguish HS from PU.
+        t_vertex_primary_mask = ((t_particle_idx >= 0) & (t_particle_idx < n_particles)).float()
 
         # --- Clusters ---
         c_e = get_t("cluster_e", c_start, c_end)
@@ -668,7 +713,7 @@ class ODDDatasetPileup(Dataset):
         node_inp_features = torch.stack(list(node_features.values()), dim=-1)
 
         # Hard scatter vertex token: single scalar (truth_vz_pt2_weighted for vertex_primary==1)
-        hs_vz_raw = torch.tensor([self.hard_scatter_vz[idx]], dtype=torch.float32)
+        hs_vz_raw = torch.tensor([ev["hard_scatter_vz"]], dtype=torch.float32)
         hs_vz_scaled = self.scaler.transforms["truth_vz_pt2_weighted"].transform(hs_vz_raw)
         # Shape (1, 1): [n_vertex_tokens=1, n_features=1]
         vertex_token_features = hs_vz_scaled.unsqueeze(0)
@@ -783,8 +828,10 @@ class ODDDatasetPileup(Dataset):
         inputs = {}
         labels = {}
 
-        # load event
-        data_dict = self.load_event(idx)
+        # fetch event once, then build (avoids a second backend fetch)
+        ev = self._fetch_event(idx)
+        data_dict = self._build_event(ev)
+        arrays = ev["arrays"]
 
         inputs = {
             "node_features": data_dict["node_inp_features"],
@@ -799,12 +846,12 @@ class ODDDatasetPileup(Dataset):
             # Raw node features needed by IncidenceBasedRegressionTask
             "node_pt": data_dict["node_raw_features"]["node_pt"],
             "node_sinphi": torch.cat([
-                torch.sin(self.full_data_array["track_phi"][self.track_cumsum[idx]:self.track_cumsum[idx+1]]),
-                torch.sin(self.full_data_array["cluster_phi"][self.cluster_cumsum[idx]:self.cluster_cumsum[idx+1]]),
+                torch.sin(arrays["track_phi"]),
+                torch.sin(arrays["cluster_phi"]),
             ], -1),
             "node_cosphi": torch.cat([
-                torch.cos(self.full_data_array["track_phi"][self.track_cumsum[idx]:self.track_cumsum[idx+1]]),
-                torch.cos(self.full_data_array["cluster_phi"][self.cluster_cumsum[idx]:self.cluster_cumsum[idx+1]]),
+                torch.cos(arrays["track_phi"]),
+                torch.cos(arrays["cluster_phi"]),
             ], -1),
         }
         # Pad sinphi/cosphi
@@ -825,7 +872,7 @@ class ODDDatasetPileup(Dataset):
         labels["calo_hs_neutral_energy"] = data_dict["node_raw_features"]["calo_hs_neutral_energy"]
         labels["calo_hs_charged_energy"] = data_dict["node_raw_features"]["calo_hs_charged_energy"]
 
-        labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
+        labels["event_number"] = torch.tensor(ev["event_number"], dtype=torch.int64)
 
         # MaskFormer targets (1 target object = 1 hard scatter vertex)
         labels["particle_valid"] = torch.tensor([True])  # shape (1,)
@@ -836,7 +883,7 @@ class ODDDatasetPileup(Dataset):
         labels["particle_node_valid"] = particle_node_valid.unsqueeze(0).float()  # (1, max_nodes)
 
         # Vertex z regression target (truth hard-scatter vz)
-        labels["particle_vz"] = torch.tensor([self.hard_scatter_vz[idx]], dtype=torch.float32)
+        labels["particle_vz"] = torch.tensor([ev["hard_scatter_vz"]], dtype=torch.float32)
 
         # Per-node is_track accessible as target for per-node tasks
         labels["node_is_track"] = data_dict["node_raw_features"]["is_track"]
@@ -988,6 +1035,23 @@ class ODDDatasetPileup(Dataset):
         cols_to_explode = [col for col in df_tracks.columns if col != 'event_id']
         tracks_lazy = df_tracks.lazy().explode(cols_to_explode)
 
+        # Pileup-overlay productions tag pileup tracks with a non-null
+        # `source_pileup_event_id` (null => hard-scatter). Because `particle_id`
+        # is event-local, a pileup track whose id collides with a hard-scatter
+        # particle_id would otherwise be spuriously matched to that HS particle
+        # (~45% of track->particle links on pu200), contaminating the incidence
+        # matrix and the HS-track mask. Force pileup tracks to particle_idx == -1
+        # so the existing -1 sentinel routes them to the pileup token. No-op for
+        # datasets without the column (e.g. all-vertices productions, which
+        # instead null PU particle_idx via the remap branch above).
+        if "source_pileup_event_id" in df_tracks.columns:
+            tracks_lazy = tracks_lazy.with_columns(
+                pl.when(pl.col("source_pileup_event_id").is_not_null())
+                .then(pl.lit(-1, dtype=pl.Int64))
+                .otherwise(pl.col("particle_idx").cast(pl.Int64))
+                .alias("particle_idx")
+            )
+
         if not self.is_inference:
             # Remove double-matched tracks only in non-inference stages.
             tracks_lazy = (
@@ -1008,16 +1072,20 @@ class ODDDatasetPileup(Dataset):
         # Always compute hard_scatter_vz; downstream feature construction requires it.
         df_tracks = (
             tracks_lazy
+            # HS tracks (matched to a target particle) define the hard-scatter
+            # vertex. vertex_primary is degenerate (==1 for all tracks) in the
+            # pileup-overlay production, so use particle_idx >= 0 instead.
+            .with_columns((pl.col("particle_idx") >= 0).alias("is_hs"))
             .with_columns(
                 [
                     (
-                        (pl.col("majority_particle_vz") * pl.col("pt").pow(2)).sum().over(["event_id", "majority_particle_vertex_primary"]) /
-                        pl.col("pt").pow(2).sum().over(["event_id", "majority_particle_vertex_primary"])
+                        (pl.col("majority_particle_vz") * pl.col("pt").pow(2)).sum().over(["event_id", "is_hs"]) /
+                        pl.col("pt").pow(2).sum().over(["event_id", "is_hs"])
                     ).alias("truth_vz_pt2_weighted")
                 ]
             )
             .with_columns(
-                pl.when(pl.col("majority_particle_vertex_primary") == 1)
+                pl.when(pl.col("is_hs"))
                 .then(pl.col("truth_vz_pt2_weighted"))
                 .otherwise(None)
                 .max()
@@ -1235,6 +1303,212 @@ class ODDDatasetPileup(Dataset):
             # TODO: Add cluster-particle association variable if available
         ]
 
+
+# Derived columns recomputed at read time by the mmap backend (NOT stored on
+# disk). Must stay in sync with the derived columns built in load_data().
+DERIVED_KEYS = (
+    "track_sinphi", "track_cosphi", "track_sinphi_int", "track_cosphi_int",
+    "cluster_e", "cluster_sinphi", "cluster_cosphi",
+    "particle_sinphi", "particle_cosphi", "particle_class",
+)
+
+
+class EagerODDDataset(ODDDatasetPileup):
+    """Original in-RAM loader: reads all parquet shards into one concatenated
+    ``full_data_array`` at construction. Simple and single-GPU friendly, but the
+    whole dataset lives in RAM (and is duplicated per DDP rank)."""
+
+    def __init__(
+        self,
+        filepath: str,
+        num_events: int = -1,
+        files_list: list[Path] | None = None,
+        **base_kwargs,
+    ):
+        super().__init__(**base_kwargs)
+        self.filedir = filepath
+        self.files_list = files_list
+        print(f"Loading ODD dataset (eager) from {filepath} with {num_events} samples")
+        print(f"Is inference: {self.is_inference}")
+        self.load_data(filepath, num_events)
+        gc.collect()
+
+    def _fetch_event(self, idx: int) -> dict[str, Any]:
+        offs = {
+            "track": (self.track_cumsum[idx], self.track_cumsum[idx + 1]),
+            "cluster": (self.cluster_cumsum[idx], self.cluster_cumsum[idx + 1]),
+            "deps": (self.deps_cumsum[idx], self.deps_cumsum[idx + 1]),
+            "particle": (self.particle_cumsum[idx], self.particle_cumsum[idx + 1]),
+            "raw_deps": (self.raw_deps_cumsum[idx], self.raw_deps_cumsum[idx + 1]),
+        }
+        arrays = {}
+        for name, full in self.full_data_array.items():
+            s, e = offs[self._family(name)]
+            arrays[name] = full[s:e]
+        return {
+            "arrays": arrays,
+            "n_tracks": int(self.n_tracks[idx]),
+            "n_clusters": int(self.n_clusters[idx]),
+            "n_particles": int(self.n_particles[idx]),
+            "hard_scatter_vz": float(self.hard_scatter_vz[idx]),
+            "event_number": int(self.event_number[idx]),
+        }
+
+
+class MmapODDDataset(ODDDatasetPileup):
+    """Per-shard memory-mapped loader for large datasets.
+
+    Each ``shard_{i:05d}.pt`` holds the RAW flat tensors for one parquet shard
+    (built offline by ``prep_mmap.py``); a small ``shards_index.pt`` lists every
+    shard's per-event count arrays so ``__init__`` never opens the shard files.
+    Shard tensors are mmap'd lazily and per-worker (PID-guarded) so forked
+    DataLoader workers never share an inherited handle. Resident RAM is the
+    OS page-cache working set (shared across DDP ranks on the same node), not
+    the whole dataset.
+    """
+
+    FAMILIES = ("track", "cluster", "deps", "particle", "raw_deps")
+    # count family -> per-shard count array name (as stored by prep_mmap.py)
+    _COUNT_KEY = {
+        "track": "n_tracks",
+        "cluster": "n_clusters",
+        "deps": "n_deps",
+        "particle": "n_particles",
+        "raw_deps": "n_raw_deps",
+    }
+
+    def __init__(
+        self,
+        index_path: str,
+        files_list: list | None = None,
+        num_events: int = -1,
+        **base_kwargs,
+    ):
+        super().__init__(**base_kwargs)
+
+        index = torch.load(str(index_path), weights_only=False)
+        shards = index["shards"]
+        self.stored_keys = list(index["stored_keys"])
+
+        # Shard files are resolved relative to the index's directory, so the
+        # dataset reads from wherever the index lives (e.g. the staged $TMPDIR
+        # copy), not the absolute path recorded at prep time.
+        index_dir = Path(index_path).parent
+
+        # Optionally restrict to a subset of shard files (train/val split).
+        if files_list is not None:
+            wanted = {Path(p).name for p in files_list}
+            shards = [s for s in shards if Path(s["path"]).name in wanted]
+
+        # Build global event index -> (shard, local) + per-shard local cumsums.
+        self.shard_paths: list[str] = []
+        self.shard_cumsums: list[dict] = []
+        self.shard_hsvz: list[np.ndarray] = []
+        self.shard_evt: list[np.ndarray] = []
+        shard_of: list[int] = []
+        local_of: list[int] = []
+        for sh in shards:
+            n_ev = int(sh["n_events"])
+            if n_ev == 0:
+                continue
+            si = len(self.shard_paths)
+            self.shard_paths.append(str(index_dir / Path(sh["path"]).name))
+            cums = {}
+            for fam in self.FAMILIES:
+                counts = np.asarray(sh[self._COUNT_KEY[fam]])
+                cums[fam] = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+            self.shard_cumsums.append(cums)
+            self.shard_hsvz.append(np.asarray(sh["hard_scatter_vz"], dtype=np.float32))
+            self.shard_evt.append(np.asarray(sh["event_id"]))
+            shard_of.extend([si] * n_ev)
+            local_of.extend(range(n_ev))
+
+        self._shard_of = np.asarray(shard_of, dtype=np.int64)
+        self._local_of = np.asarray(local_of, dtype=np.int64)
+
+        total = len(self._shard_of)
+        if num_events != -1:
+            total = min(total, num_events)
+            self._shard_of = self._shard_of[:total]
+            self._local_of = self._local_of[:total]
+        self.num_events = total
+
+        # Lazily-populated, per-worker mmap handle cache (see _shard()).
+        self._cache: dict[int, dict] = {}
+        self._cache_pid: int | None = None
+
+        print(f"Loading ODD dataset (mmap) from index {index_path}: "
+              f"{len(self.shard_paths)} shards, {self.num_events} events")
+        print(f"Is inference: {self.is_inference}")
+
+    def __len__(self) -> int:
+        return int(self.num_events)
+
+    def _shard(self, s: int) -> dict:
+        # Fork-safety: a forked DataLoader worker must not reuse the parent's
+        # mmap handles -> drop the cache whenever the PID changes.
+        pid = os.getpid()
+        if self._cache_pid != pid:
+            self._cache = {}
+            self._cache_pid = pid
+        h = self._cache.get(s)
+        if h is None:
+            h = torch.load(self.shard_paths[s], mmap=True, weights_only=True)
+            self._cache[s] = h
+        return h
+
+    def _fetch_event(self, idx: int) -> dict[str, Any]:
+        s = int(self._shard_of[idx])
+        local = int(self._local_of[idx])
+        sh = self._shard(s)
+        cums = self.shard_cumsums[s]
+        offs = {fam: (int(cums[fam][local]), int(cums[fam][local + 1])) for fam in self.FAMILIES}
+
+        arrays: dict[str, Any] = {}
+        for name in self.stored_keys:
+            a, b = offs[self._family(name)]
+            arrays[name] = sh[name][a:b]
+
+        # Recompute derived columns (dropped on disk) to match the eager loader.
+        tphi = arrays["track_phi"].float()
+        arrays["track_sinphi"] = torch.sin(tphi)
+        arrays["track_cosphi"] = torch.cos(tphi)
+        tphi_int = arrays["track_phi_int"].float()
+        arrays["track_sinphi_int"] = torch.sin(tphi_int)
+        arrays["track_cosphi_int"] = torch.cos(tphi_int)
+        arrays["cluster_e"] = arrays["total_cluster_energy"]
+        cphi = arrays["cluster_phi"].float()
+        arrays["cluster_sinphi"] = torch.sin(cphi)
+        arrays["cluster_cosphi"] = torch.cos(cphi)
+        pphi = arrays["particle_phi"].float()
+        arrays["particle_sinphi"] = torch.sin(pphi)
+        arrays["particle_cosphi"] = torch.cos(pphi)
+        pdg = arrays["particle_pdg_id"]
+        arrays["particle_class"] = torch.tensor(
+            [self.class_labels.get(int(x), 5) for x in pdg], dtype=torch.long
+        )
+        arrays["raw_deps_particle_idx"] = arrays["raw_deps_particle_idx"].to(torch.int64)
+        arrays["raw_deps_cluster_idx"] = arrays["raw_deps_cluster_idx"].to(torch.int64)
+
+        return {
+            "arrays": arrays,
+            "n_tracks": int(cums["track"][local + 1] - cums["track"][local]),
+            "n_clusters": int(cums["cluster"][local + 1] - cums["cluster"][local]),
+            "n_particles": int(cums["particle"][local + 1] - cums["particle"][local]),
+            "hard_scatter_vz": float(self.shard_hsvz[s][local]),
+            "event_number": int(self.shard_evt[s][local]),
+        }
+
+
+def _mmap_worker_init_fn(worker_id: int) -> None:
+    """Reset a worker's mmap handle cache so it never reuses an inherited one."""
+    info = torch.utils.data.get_worker_info()
+    ds = info.dataset if info is not None else None
+    if ds is not None and hasattr(ds, "_cache"):
+        ds._cache = {}
+        ds._cache_pid = os.getpid()
+
+
 class ODDDataModule(L.LightningDataModule):
     def __init__(
         self,
@@ -1268,10 +1542,15 @@ class ODDDataModule(L.LightningDataModule):
         seed: int = 42,
         hard_scatter_energy_threshold: float = 0.03,
         window_size: int = 512,
+        backend: str = "eager",
+        mmap_index_name: str = "shards_index.pt",
         **kwargs,
     ):
         super().__init__()
 
+        assert backend in ("eager", "mmap"), f"Unknown data.backend={backend!r} (use 'eager' or 'mmap')"
+        self.backend = backend
+        self.mmap_index_name = mmap_index_name
         self.train_path = train_path
         self.valid_path = valid_path
         self.batch_size = batch_size
@@ -1309,11 +1588,34 @@ class ODDDataModule(L.LightningDataModule):
         }
         self.dataset_kwargs.update(kwargs)
 
+    def _make_dataset(self, stage_path, files_list, num_events):
+        """Construct the backend-appropriate dataset.
+
+        eager: `files_list` are parquet paths, `filepath` is the directory.
+        mmap : `files_list` are shard_*.pt paths; the dataset reads the index.
+        """
+        common = {**self.dataset_kwargs, "scale_dict_path": self.scale_dict_path}
+        if self.backend == "mmap":
+            index_path = str(Path(self.unify_path) / self.mmap_index_name)
+            return MmapODDDataset(
+                index_path=index_path,
+                files_list=files_list,
+                num_events=num_events,
+                **common,
+            )
+        path = self.unify_path if (self.enable_split and self.unify_path) else stage_path
+        return EagerODDDataset(
+            filepath=path,
+            files_list=files_list,
+            num_events=num_events,
+            **common,
+        )
+
     def setup(self, stage: str):
         is_global_zero = True
         if self.trainer is not None:
              is_global_zero = self.trainer.is_global_zero
-        
+
         if is_global_zero:
             print("-" * 100)
 
@@ -1321,19 +1623,24 @@ class ODDDataModule(L.LightningDataModule):
         val_files = None
         test_files = None
 
+        # eager splits over parquet shards; mmap splits over packed .pt shards.
+        glob_pattern = "shard_*.pt" if self.backend == "mmap" else "target_particles-*.parquet"
+
         if self.enable_split and self.unify_path:
             import random
             path = Path(self.unify_path)
-            # Must use sorted to ensure determinism before shuffle
-            all_files = sorted(list(path.glob("target_particles-*.parquet")))
-            
+            # Must use sorted to ensure determinism before shuffle.
+            # Exclude the tiny .meta.pt sidecars — glob("shard_*.pt") also matches
+            # "shard_*.meta.pt", which would otherwise pollute the train/val split.
+            all_files = sorted(p for p in path.glob(glob_pattern) if not p.name.endswith(".meta.pt"))
+
             # Deterministic shuffle
             rng = random.Random(self.seed)
             rng.shuffle(all_files)
-            
+
             n_total = len(all_files)
             n_train = int(n_total * self.train_split)
-            
+
             train_files = all_files[:n_train]
             if self.overtrain:
                 val_files = all_files[:n_train]
@@ -1350,7 +1657,7 @@ class ODDDataModule(L.LightningDataModule):
                 n_val = int(n_total * self.val_split)
                 val_files = all_files[n_train:n_train+n_val]
                 test_files = all_files[n_train+n_val:]
-            
+
             print(f"Splitting {n_total} files from {self.unify_path}")
             print(f"Train: {(train_files)} files")
             print(f"Val: {(val_files)} files")
@@ -1358,32 +1665,8 @@ class ODDDataModule(L.LightningDataModule):
 
         # create training and validation datasets
         if stage == "fit":
-            kw = self.dataset_kwargs.copy()
-            path = self.train_path
-            if self.enable_split and self.unify_path:
-                 kw['files_list'] = train_files
-                 path = self.unify_path
-
-            self.train_dset = ODDDatasetPileup(
-                filepath=path,
-                num_events=self.num_train,
-                scale_dict_path=self.scale_dict_path,
-                **kw,
-            )
-
-        if stage == "fit":
-            kw = self.dataset_kwargs.copy()
-            path = self.valid_path
-            if self.enable_split and self.unify_path:
-                 kw['files_list'] = val_files
-                 path = self.unify_path
-            
-            self.val_dset = ODDDatasetPileup(
-                filepath=path,
-                num_events=self.num_val,
-                scale_dict_path=self.scale_dict_path,
-                **kw,
-            )
+            self.train_dset = self._make_dataset(self.train_path, train_files, self.num_train)
+            self.val_dset = self._make_dataset(self.valid_path, val_files, self.num_val)
 
         # Only print train/val dataset details when actually training
         if stage == "fit" and is_global_zero:
@@ -1391,21 +1674,9 @@ class ODDDataModule(L.LightningDataModule):
             print(f"Created validation dataset with {len(self.val_dset):,} events")
 
         if stage == "test":
-            kw = self.dataset_kwargs.copy()
-            path = self.test_path
-            
-            if self.enable_split and self.unify_path:
-                kw['files_list'] = test_files
-                path = self.unify_path
-            elif self.test_path is None:
-                 assert self.test_path is not None, "No test file specified, see --data.test_path"
-            
-            self.test_dset = ODDDatasetPileup(
-                filepath=path,
-                num_events=self.num_test,
-                scale_dict_path=self.scale_dict_path,
-                **kw,
-            )
+            if not (self.enable_split and self.unify_path):
+                assert self.test_path is not None, "No test file specified, see --data.test_path"
+            self.test_dset = self._make_dataset(self.test_path, test_files, self.num_test)
             print(f"Created test dataset with {len(self.test_dset):,} events")
 
         if is_global_zero:
@@ -1414,6 +1685,13 @@ class ODDDataModule(L.LightningDataModule):
     def get_dataloader(self, stage: str, dataset: ODDDatasetPileup, shuffle: bool, num_workers: int | None = None):
         nw = num_workers if num_workers is not None else self.num_workers
         print(f"Creating {stage} dataloader with {len(dataset):,} events")
+        # mmap datasets must reset their per-worker handle cache after fork.
+        is_mmap = isinstance(dataset, MmapODDDataset)
+        worker_init_fn = _mmap_worker_init_fn if is_mmap else None
+        # Spawn mmap workers via "forkserver" rather than forking the
+        # CUDA-initialized main process — plain fork deadlocks at the first
+        # epoch. Eager backend keeps the default (fork) to preserve old behavior.
+        mp_context = "forkserver" if (nw > 0 and is_mmap) else None
         return DataLoader(
             dataset=dataset,
             batch_size=self.batch_size,
@@ -1423,6 +1701,8 @@ class ODDDataModule(L.LightningDataModule):
             shuffle=shuffle,
             pin_memory=self.pin_memory,
             persistent_workers=nw > 0,
+            worker_init_fn=worker_init_fn,
+            multiprocessing_context=mp_context,
         )
 
     def train_dataloader(self):

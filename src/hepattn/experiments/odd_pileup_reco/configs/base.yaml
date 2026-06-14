@@ -36,7 +36,9 @@ data:
   valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
   test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
 
-  unify_path: /storage/agrp/barakma/PileupODD/data/ggf_pu200
+  # For backend: mmap this must be the prep_mmap.py output dir (shard_*.pt +
+  # shards_index.pt). brk.sh overrides it to the $TMPDIR/mmap staged copy.
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu0_overlay_pu200_mmap
   enable_split: true
   train_split: 0.9
   val_split: 0.1
@@ -44,7 +46,14 @@ data:
   val_and_test_split_same: true
   overtrain: false
 
-  num_workers: 4
+  # Data loading backend:
+  #   eager : read all parquet shards into RAM at startup (single-GPU; high RAM).
+  #   mmap  : per-shard memory-mapped .pt files (large datasets / multi-GPU).
+  #           For mmap, point unify_path at the dir built by prep_mmap.py
+  #           (contains shard_*.pt + shards_index.pt), ideally staged on $TMPDIR.
+  backend: mmap
+
+  num_workers: 8
   num_val_workers: 1
   num_test_workers: 1
   num_train: -1
@@ -63,9 +72,16 @@ data:
 # Trainer Configuration
 # =============================================================================
 trainer:
-  max_epochs: 100
+  max_epochs: 50
   accelerator: gpu
-  devices: 1
+  devices: 4
+  # DDP: one process per GPU. find_unused_parameters=true is required for this
+  # 3-stream model (some heads/params get no gradient on a given step, e.g.
+  # cost_weight=0 / mask-gated tasks). Do NOT add static_graph.
+  strategy:
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args:
+      find_unused_parameters: true
   precision: bf16-mixed
   gradient_clip_val: 0.1
   log_every_n_steps: 50
@@ -100,7 +116,7 @@ model:
 
   lrs_config:
     initial: 6.25e-7
-    max: 6.25e-5
+    max: 1.25e-4
     end: 6.25e-7
     pct_start: 0.05
     weight_decay: 0.01
