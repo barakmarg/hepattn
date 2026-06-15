@@ -56,8 +56,11 @@ class TwoStreamMaskFormer(nn.Module):
         calo_hs_energy_threshold: float = 0.15,
         calo_pred_threshold: float = 0.2,
         reco_calo_noise_mean: int = 300,
-        reco_calo_noise_std: float = 50.0,
+        reco_calo_noise_std: float = 0.0,
+        reco_calo_fn_frac: float = 0.0,
         reco_track_noise_mean: int = 15,
+        reco_track_fn_frac: float = 0.0,
+        reco_track_fp_frac: float = 0.0,
         reco_debug_use_truth_masks: bool = False,
     ):
         super().__init__()
@@ -99,8 +102,11 @@ class TwoStreamMaskFormer(nn.Module):
         self.calo_hs_energy_threshold = calo_hs_energy_threshold
         self.calo_pred_threshold = calo_pred_threshold
         self.reco_calo_noise_mean = reco_calo_noise_mean
-        self.reco_calo_noise_std = reco_calo_noise_std
-        self.reco_track_noise_mean = reco_track_noise_mean
+        self.reco_calo_noise_std = reco_calo_noise_std        # Gaussian std of per-event FP calo count
+        self.reco_calo_fn_frac = reco_calo_fn_frac            # random fraction of true HS calo dropped
+        self.reco_track_noise_mean = reco_track_noise_mean    # (diagnostics only; training uses fp_frac)
+        self.reco_track_fn_frac = reco_track_fn_frac          # random fraction of true HS tracks dropped
+        self.reco_track_fp_frac = reco_track_fp_frac          # FP tracks added ~ frac * (#true HS tracks)
         # Debug-only toggle: in inference, use truth masks for Stream C filtering.
         self.reco_debug_use_truth_masks = reco_debug_use_truth_masks
 
@@ -123,11 +129,23 @@ class TwoStreamMaskFormer(nn.Module):
         # Expose all tasks for ModelWrapper compatibility
         self.tasks = nn.ModuleList([*track_tasks, *calo_tasks, *self.reco_tasks])
 
-    def forward(self, inputs: dict[str, Tensor], targets: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
+    def forward(
+        self,
+        inputs: dict[str, Tensor],
+        targets: dict[str, Tensor] | None = None,
+        use_teacher_forcing: bool | None = None,
+        track_tf: bool | None = None,
+        calo_tf: bool | None = None,
+    ) -> dict[str, Tensor]:
         input_names = [input_net.input_name for input_net in self.input_nets]
 
         assert "key" not in input_names, "'key' input name is reserved."
         assert "query" not in input_names, "'query' input name is reserved."
+
+        # Teacher-forcing conditioning path. When use_teacher_forcing is None the
+        # behavior is unchanged (TF only while training); pass True/False to force
+        # either path regardless of train/eval mode (used for diagnostics).
+        tf_mode = (self.training and self.teacher_forcing) if use_teacher_forcing is None else bool(use_teacher_forcing)
 
         x = {}
 
@@ -201,7 +219,7 @@ class TwoStreamMaskFormer(nn.Module):
         # =====================================================================
         is_track = x["node_is_track"].bool().squeeze(-1)  # (B, N)
 
-        if self.training and self.teacher_forcing:
+        if tf_mode:
             hs_track_mask = x["tracks_mask"].bool() & is_track  # (B, N)
         else:
             mask_logits = track_outputs["final"]["mask"]["pflow_node_logit"]  # (B, 1, N)
@@ -247,7 +265,8 @@ class TwoStreamMaskFormer(nn.Module):
         if self.reco_decoder is not None:
             reco_outputs = self._forward_reco(
                 x, initial_encoder_embed, track_outputs, calo_outputs,
-                is_track, targets, input_names, batch_size,
+                is_track, targets, input_names, batch_size, tf_mode,
+                track_tf=track_tf, calo_tf=calo_tf,
             )
             for layer_name, layer_out in reco_outputs.items():
                 outputs[f"reco_{layer_name}"] = layer_out
@@ -264,35 +283,64 @@ class TwoStreamMaskFormer(nn.Module):
         targets: dict[str, Tensor] | None,
         input_names: list[str],
         batch_size: int,
+        tf_mode: bool,
+        track_tf: bool | None = None,
+        calo_tf: bool | None = None,
     ) -> dict[str, dict]:
-        """Stream C: filter to HS nodes and run reconstruction decoder."""
+        """Stream C: filter to HS nodes and run reconstruction decoder.
+
+        track_tf / calo_tf independently override the *source* of the track and calo
+        reco-selection masks (truth+noise vs predicted). When None each falls back to
+        tf_mode, so default behavior is unchanged. The independent controls let a
+        diagnostic mix truth tracks with predicted calo (and vice-versa) to attribute
+        the teacher-forcing-vs-inference gap to one stream — see Idea 1 (factorial).
+        """
         device = x["key_embed"].device
         node_valid = x.get("key_valid")
         if node_valid is None:
             node_valid = torch.ones(batch_size, x["key_embed"].shape[1], dtype=torch.bool, device=device)
 
-        # --- Determine HS masks ---
-        # Keep this explicit for easier debug-time reasoning.
-        if self.training and self.teacher_forcing and targets is not None:
-            # Training teacher-forcing path: truth masks + sampled predicted residual PU.
-            reco_track_mask = targets["tracks_mask"].bool() & is_track
+        track_tf_eff = tf_mode if track_tf is None else bool(track_tf)
+        calo_tf_eff = tf_mode if calo_tf is None else bool(calo_tf)
+        # Oracle (truth, no noise) only in the pure-inference debug case with no override.
+        debug_oracle = (
+            (not track_tf_eff) and (not calo_tf_eff)
+            and self.reco_debug_use_truth_masks and targets is not None
+        )
+        N_nodes = x["key_embed"].shape[1]
 
-            # Sample extra FP tracks from pred, mirroring calo noise logic.
+        # --- Track reco mask ---
+        if track_tf_eff and targets is not None:
+            # Teacher forcing: truth HS tracks (random FN drop) + sampled predicted residual PU.
+            N_trk = is_track.shape[1]
+            truth_track_mask = targets["tracks_mask"].bool() & is_track
+            track_keep = torch.rand(batch_size, N_trk, device=device) >= self.reco_track_fn_frac
+            truth_track_kept = truth_track_mask & track_keep
+
             pred_track_logits = track_outputs["final"]["mask"]["pflow_node_logit"]  # (B, 1, N)
             pred_track_mask = (pred_track_logits.squeeze(1).sigmoid() >= 0.5) & is_track
-            extra_pred_tracks = pred_track_mask & ~reco_track_mask
-            n_track_sample = min(self.reco_track_noise_mean, is_track.shape[1])
-            track_noise_scores = torch.where(
+            extra_pred_tracks = pred_track_mask & ~truth_track_mask
+            track_scores = torch.where(
                 extra_pred_tracks,
-                torch.rand(batch_size, is_track.shape[1], device=device),
-                torch.full((batch_size, is_track.shape[1]), -1.0, device=device),
+                torch.rand(batch_size, N_trk, device=device),
+                torch.full((batch_size, N_trk), float("-inf"), device=device),
             )
-            _, track_sample_idx = track_noise_scores.topk(n_track_sample, dim=-1)
-            sampled_extra_tracks = torch.zeros_like(extra_pred_tracks)
-            sampled_extra_tracks.scatter_(1, track_sample_idx, True)
-            sampled_extra_tracks = sampled_extra_tracks & extra_pred_tracks
-            reco_track_mask = reco_track_mask | sampled_extra_tracks
+            # per-event FP-track count ~ frac * (#true HS tracks); compile-safe variable-k via sort+gather
+            n_truth_trk = truth_track_mask.sum(1).float()
+            k_trk = (self.reco_track_fp_frac * n_truth_trk).round().clamp_(0, N_trk - 1).long()
+            sorted_t, _ = track_scores.sort(dim=-1, descending=True)
+            thr_t = sorted_t.gather(1, k_trk.unsqueeze(1))
+            sampled_extra_tracks = extra_pred_tracks & (track_scores > thr_t)
+            reco_track_mask = truth_track_kept | sampled_extra_tracks
+        elif debug_oracle:
+            reco_track_mask = targets["tracks_mask"].bool() & is_track
+        else:
+            track_logits = track_outputs["final"]["mask"]["pflow_node_logit"]
+            reco_track_mask = (track_logits.squeeze(1).sigmoid() >= 0.5) & is_track
 
+        # --- Calo reco mask ---
+        if calo_tf_eff and targets is not None:
+            # Teacher forcing: truth HS calo (random FN drop) + Gaussian-count predicted residual PU.
             calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
             calo_hs_energy = targets["calo_hard_scatter_energy"]
             truth_calo_mask = (
@@ -300,29 +348,25 @@ class TwoStreamMaskFormer(nn.Module):
                 & (calo_hs_energy > self.calo_hs_energy_threshold)
                 & ~is_track & node_valid
             )
+            calo_keep = torch.rand(batch_size, N_nodes, device=device) >= self.reco_calo_fn_frac
+            truth_calo_kept = truth_calo_mask & calo_keep
 
             pred_calo_logits = calo_outputs["final"]["calo_mask"]["calo_node_logit"]  # (B, 1, N)
             pred_calo_mask = (pred_calo_logits.squeeze(1).sigmoid() >= self.calo_pred_threshold) & ~is_track & node_valid
             extra_pred = pred_calo_mask & ~truth_calo_mask
-
-            N_nodes = x["key_embed"].shape[1]
-            n_sample = min(self.reco_calo_noise_mean, N_nodes)
-            noise_scores = torch.where(
+            calo_scores = torch.where(
                 extra_pred,
                 torch.rand(batch_size, N_nodes, device=device),
-                torch.full((batch_size, N_nodes), -1.0, device=device),
+                torch.full((batch_size, N_nodes), float("-inf"), device=device),
             )
-            _, sample_idx = noise_scores.topk(n_sample, dim=-1)
-            sampled_extra = torch.zeros_like(extra_pred)
-            sampled_extra.scatter_(1, sample_idx, True)
-            sampled_extra = sampled_extra & extra_pred
-
-            reco_calo_mask = truth_calo_mask | sampled_extra
-
-        elif (not self.training) and self.reco_debug_use_truth_masks and targets is not None:
-            # Debug inference path: strict oracle truth masks only.
-            reco_track_mask = targets["tracks_mask"].bool() & is_track
-            print("Using debug truth masks for reconstruction calo selection!!")
+            # per-event FP count ~ N(mean, std); compile-safe variable-k via sort+gather threshold.
+            k_calo = torch.randn(batch_size, device=device) * self.reco_calo_noise_std + self.reco_calo_noise_mean
+            k_calo = k_calo.round().clamp_(0, N_nodes - 1).long()
+            sorted_c, _ = calo_scores.sort(dim=-1, descending=True)
+            thr_c = sorted_c.gather(1, k_calo.unsqueeze(1))
+            sampled_extra = extra_pred & (calo_scores > thr_c)
+            reco_calo_mask = truth_calo_kept | sampled_extra
+        elif debug_oracle:
             calo_hs_frac = targets["calo_hard_scatter_energy_frac"]
             calo_hs_energy = targets["calo_hard_scatter_energy"]
             reco_calo_mask = (
@@ -330,12 +374,7 @@ class TwoStreamMaskFormer(nn.Module):
                 & (calo_hs_energy > self.calo_hs_energy_threshold)
                 & ~is_track & node_valid
             )
-
         else:
-            # Default inference path: predicted masks.
-            track_logits = track_outputs["final"]["mask"]["pflow_node_logit"]
-            reco_track_mask = (track_logits.squeeze(1).sigmoid() >= 0.5) & is_track
-
             calo_logits = calo_outputs["final"]["calo_mask"]["calo_node_logit"]
             reco_calo_mask = (calo_logits.squeeze(1).sigmoid() >= self.calo_pred_threshold) & ~is_track & node_valid
 

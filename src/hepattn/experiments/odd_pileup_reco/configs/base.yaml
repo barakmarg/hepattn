@@ -38,7 +38,7 @@ data:
 
   # For backend: mmap this must be the prep_mmap.py output dir (shard_*.pt +
   # shards_index.pt). brk.sh overrides it to the $TMPDIR/mmap staged copy.
-  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu0_overlay_pu200_mmap
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu200
   enable_split: true
   train_split: 0.9
   val_split: 0.1
@@ -51,14 +51,14 @@ data:
   #   mmap  : per-shard memory-mapped .pt files (large datasets / multi-GPU).
   #           For mmap, point unify_path at the dir built by prep_mmap.py
   #           (contains shard_*.pt + shards_index.pt), ideally staged on $TMPDIR.
-  backend: mmap
+  backend: eager
 
   num_workers: 8
   num_val_workers: 1
   num_test_workers: 1
-  num_train: -1
-  num_test: -1
-  num_val: -1
+  num_train: 1000
+  num_test: 1000
+  num_val: 1000
 
   batch_size: 32
   incidence_cutval: 0.01
@@ -74,7 +74,7 @@ data:
 trainer:
   max_epochs: 50
   accelerator: gpu
-  devices: 4
+  devices: 1
   # DDP: one process per GPU. find_unused_parameters=true is required for this
   # 3-stream model (some heads/params get no gradient on a given step, e.g.
   # cost_weight=0 / mask-gated tasks). Do NOT add static_graph.
@@ -284,9 +284,13 @@ model:
       calo_hs_frac_threshold: 0.10
       calo_hs_energy_threshold: 0.15
       calo_pred_threshold: 0.3
-      reco_calo_noise_mean: 250
-      reco_calo_noise_std: 50.0
-      reco_track_noise_mean: 15
+      # Distribution-matched teacher forcing for Stream C (reproduces the inference
+      # selection: purity/recall/size/energy-spectrum). FP count ~ N(mean, std) per event.
+      reco_calo_noise_mean: 170      # mean FP pileup calo nodes added per event
+      reco_calo_noise_std: 100.0     # per-event Gaussian spread of the FP count
+      reco_calo_fn_frac: 0.10        # random fraction of true HS calo dropped (false negatives)
+      reco_track_fn_frac: 0.10       # random fraction of true HS tracks dropped
+      reco_track_fp_frac: 0.10       # FP tracks added ~ frac * (#true HS tracks)
 
       reco_decoder:
         class_path: hepattn.models.decoder.MaskFormerDecoder

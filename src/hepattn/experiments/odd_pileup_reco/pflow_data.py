@@ -1544,6 +1544,7 @@ class ODDDataModule(L.LightningDataModule):
         window_size: int = 512,
         backend: str = "eager",
         mmap_index_name: str = "shards_index.pt",
+        files_list: list | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -1564,6 +1565,12 @@ class ODDDataModule(L.LightningDataModule):
         self.pin_memory = pin_memory
         self.test_suff = test_suff
         self.scale_dict_path = scale_dict_path
+
+        # Optional explicit list of files to use when not splitting (used by all
+        # stages that don't get split-derived files). Kept as a first-class
+        # parameter so it does NOT leak into dataset_kwargs and collide with the
+        # files_list that _make_dataset passes positionally.
+        self.files_list = files_list
 
         self.unify_path = unify_path
         self.enable_split = enable_split
@@ -1594,6 +1601,10 @@ class ODDDataModule(L.LightningDataModule):
         eager: `files_list` are parquet paths, `filepath` is the directory.
         mmap : `files_list` are shard_*.pt paths; the dataset reads the index.
         """
+        # Fall back to the explicit constructor-level files_list when this stage
+        # has no split-derived files (e.g. enable_split=False).
+        if files_list is None:
+            files_list = self.files_list
         common = {**self.dataset_kwargs, "scale_dict_path": self.scale_dict_path}
         if self.backend == "mmap":
             index_path = str(Path(self.unify_path) / self.mmap_index_name)
