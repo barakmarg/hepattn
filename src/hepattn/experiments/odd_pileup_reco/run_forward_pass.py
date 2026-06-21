@@ -79,22 +79,49 @@ val_files = path_list = [
     "/storage/agrp/barakma/PileupODD/data/ttbar_pu200/target_particles-00099.parquet",
     "/storage/agrp/barakma/PileupODD/data/ttbar_pu200/target_particles-00389.parquet"
 ]
-CKPT = '/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260519-T142453/ckpts/epoch=073-val_loss=13.67910.ckpt'
+#CKPT = '/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260519-T142453/ckpts/epoch=073-val_loss=13.67910.ckpt'
+#CKPT = '/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260615-T105829/ckpts/epoch=072-val_loss=12.74524.ckpt'
+#CKPT = '/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260615-T233516/ckpts/epoch=083-val_loss=11.27779.ckpt'
+CKPT = '/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260616-T142037/ckpts/epoch=030-val_loss=13.34838.ckpt'
 CONFIG = '/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/configs/base.yaml'
+
+# Evaluation dataset (all-vertices paper sample) — forward pass runs over the
+# first DATA_NUM_EVENTS events in this directory.
+DATA_DIR = '/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper'
+DATA_NUM_EVENTS = 10000
 
 
 if __name__ == "__main__":
-    # Verify the model's *actual* in-model teacher-forcing selection (the new
-    # config recipe: calo FN=0.10 + FP=170±100, tracks 0.10/0.10) reproduces the
-    # pred (inference) distributions — should match tf_sweep "fn_random_0_10_fp_170_100".
-    verify = verify_tf_selection(
+    # Forward pass over the all-vertices paper sample, written as 1000-event H5
+    # shards inside a folder next to the checkpoint (last shard holds the
+    # remainder). devices=1 so the prediction writer writes a single event stream.
+    h5_paths = run_forward_pass(
         ckpt_path=CKPT,
         config_path=CONFIG,
-        files=val_files,
-        num_events=2000,
-        batch_size=32,
+        data_dir=DATA_DIR,
+        num_events=DATA_NUM_EVENTS,
+        batch_size=48,
+        num_workers=8,
+        accelerator="gpu",
+        devices=1,
+        inference_mode=True,
+        events_per_file=1000,
+        test_suff="ttbar_pu200_overlay_paper",
+        predict_only=True,
     )
-    print(verify["means"])
+    print(f"Wrote {len(h5_paths)} shard(s):")
+    for _p in h5_paths:
+        print(f"  {_p}")
+
+    # --- Reference diagnostics (kept for reference) ---
+    # verify = verify_tf_selection(
+    #     ckpt_path=CKPT,
+    #     config_path=CONFIG,
+    #     files=val_files,
+    #     num_events=2000,
+    #     batch_size=16,
+    # )
+    # print(verify["means"])
 
     # #--- Idea 1: factorial track/calo ablation (kept for reference) ---
     # attribution = diagnose_track_class_attribution(

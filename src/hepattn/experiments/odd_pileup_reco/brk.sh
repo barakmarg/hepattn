@@ -45,7 +45,13 @@ python prep_mmap.py --out-dir "$DST_MMAP" --index-only
 echo "Built $(find "$DST_MMAP" -name 'shard_*.pt' ! -name '*.meta.pt' | wc -l) shards in $DST_MMAP."
 
 # --- Train (4-GPU DDP, mmap backend) ----------------------------------------
+# FRESH run warm-started from a stable checkpoint: --model.init_from_ckpt copies only
+# the weights, then training begins at epoch 0 with a new optimizer + full LR schedule
+# (and teacher_forcing:false from the config). This is NOT a resume — use --ckpt_path
+# for that instead.
+CKPT=/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/odd_pflow_reco_20260616-T142037/ckpts/epoch=030-val_loss=13.34838.ckpt
 python main.py fit --config configs/base.yaml \
     --data.backend mmap \
-    --data.unify_path "$DST_MMAP"
+    --data.unify_path "$DST_MMAP" \
+    --model.init_from_ckpt "$CKPT"
 popd

@@ -63,12 +63,30 @@ def load_convert_h5(filepath):
 
 
 class PflowPredictionWriter(Callback):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        events_per_file: int | None = None,
+        write_root: bool = True,
+        predict_only: bool = True,
+    ) -> None:
         super().__init__()
+        # If set, predictions are split across multiple H5 files holding at most
+        # ``events_per_file`` events each (the final file holds the remainder).
+        # If None, everything is written to a single file (original behaviour).
+        self.events_per_file = events_per_file
+        # If False, skip the per-file ROOT conversion (H5 output only).
+        self.write_root = write_root
+        # If True, the LightningModule skips the test-time loss (and its
+        # Hungarian matching) during the forward pass — much faster, and the
+        # writer never uses the loss anyway. Set False to keep loss/metrics.
+        self.predict_only = predict_only
 
     def setup(self, trainer: Trainer, module: LightningModule, stage: str) -> None:
         if stage != "test":
             return
+
+        # Tell the LightningModule whether to skip the (unused, expensive) loss.
+        module._predict_only = self.predict_only
 
         self.writer = None
         self.trainer = trainer
@@ -78,27 +96,79 @@ class PflowPredictionWriter(Callback):
         self.num_events = len(self.ds)
         self.var_transform = self.ds.scaler.transforms
 
-    @property
-    def output_path(self) -> Path:
+        # Multi-file chunking state. A batch may straddle a file boundary, so
+        # _write_batch splits batches across files as needed.
+        self._chunked = self.events_per_file is not None
+        self._chunk_size = self.events_per_file if self._chunked else self.num_events
+        self._file_idx = 0            # index of the file currently being written
+        self._events_in_file = 0      # events written into the current file
+        self._events_total = 0        # events written across all files
+        self._file_capacity = 0       # allocated rows of the current file
+        self._current_path: Path | None = None
+        self._output_paths: list[Path] = []
+
+    def _output_path_for(self, part_idx: int | None) -> Path:
         out_dir = Path(self.trainer.ckpt_path).parent
         out_basename = str(Path(self.trainer.ckpt_path).stem)
         suffix = f"_{self.test_suff}" if self.test_suff else ""
-        return Path(out_dir / f"{out_basename}__test{suffix}.h5")
+        base = f"{out_basename}__test{suffix}"
+        if part_idx is None:
+            # Single-file mode: write directly next to the checkpoint.
+            return Path(out_dir / f"{base}.h5")
+        # Chunked mode: group the per-1k-event part files in their own folder
+        # (named like the single-file output) next to the checkpoint.
+        return Path(out_dir / base / f"{base}__part{part_idx:03d}.h5")
+
+    @property
+    def output_path(self) -> Path:
+        """Primary output file (the only file in single-file mode)."""
+        return self._output_path_for(self._file_idx if self._chunked else None)
+
+    @property
+    def output_paths(self) -> list[Path]:
+        """All output files written so far (populated as files are closed)."""
+        return list(self._output_paths)
+
+    def _open_writer(self, template: dict) -> None:
+        """Open an H5Writer for the next output file, sized to its capacity."""
+        from ftag.hdf5 import H5Writer
+        self._file_capacity = min(self._chunk_size, self.num_events - self._events_total)
+        part_idx = self._file_idx if self._chunked else None
+        self._current_path = self._output_path_for(part_idx)
+        self._current_path.parent.mkdir(parents=True, exist_ok=True)
+        dtypes = {k: v.dtype for k, v in template.items()}
+        shapes = {k: (self._file_capacity, *v.shape[1:]) for k, v in template.items()}
+        self.writer = H5Writer(
+            jets_name="events",
+            dst=self._current_path,
+            dtypes=dtypes,
+            shapes=shapes,
+            shuffle=False,
+            precision="full",
+        )
+        self._events_in_file = 0
+
+    def _close_writer(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self._output_paths.append(self._current_path)
+            self.writer = None
+            self._file_idx += 1
 
     def _write_batch(self, to_write):
-        if self.writer is None:
-            from ftag.hdf5 import H5Writer
-            dtypes = {k: v.dtype for k, v in to_write.items()}
-            shapes = {k: (self.num_events, *v.shape[1:]) for k, v in to_write.items()}
-            self.writer = H5Writer(
-                jets_name="events",
-                dst=self.output_path,
-                dtypes=dtypes,
-                shapes=shapes,
-                shuffle=False,
-                precision="full",
-            )
-        self.writer.write(to_write)
+        n_batch = next(iter(to_write.values())).shape[0]
+        offset = 0
+        while offset < n_batch:
+            if self.writer is None:
+                self._open_writer(to_write)
+            take = min(self._file_capacity - self._events_in_file, n_batch - offset)
+            chunk = {k: v[offset:offset + take] for k, v in to_write.items()}
+            self.writer.write(chunk)
+            self._events_in_file += take
+            self._events_total += take
+            offset += take
+            if self._events_in_file >= self._file_capacity:
+                self._close_writer()
 
     def on_test_batch_end(self, trainer, module, test_step_outputs, batch, batch_idx):
         _inputs, targets = batch
@@ -254,30 +324,37 @@ class PflowPredictionWriter(Callback):
         self._write_batch(to_write)
 
     def on_test_end(self, trainer, module):
-        if self.writer is not None:
-            print(f"Wrote predictions to {self.output_path}")
-            self.writer.close()
+        # Flush any file still open (e.g. a short final/only file that never
+        # reached its full capacity).
+        self._close_writer()
+
+        for h5_path in self._output_paths:
+            print(f"Wrote predictions to {h5_path}")
+
+        if not self.write_root:
+            return
 
         print("Loading predictions...")
-        event_number, pflow_class, pflow_ptetaphi, proxy_ptetaphi, pflow_indicator = load_convert_h5(self.output_path.as_posix())
-        root_path = self.output_path.with_suffix(".root").as_posix()
-        print("Writing to ROOT file")
-        root_data = {
-            "mpflow": {
-                "pt": ak.Array(pflow_ptetaphi[..., 0]),
-                "eta": ak.Array(pflow_ptetaphi[..., 1]),
-                "phi": ak.Array(pflow_ptetaphi[..., 2]),
-                "class": ak.Array(pflow_class),
-            },
-            "pred_ind": ak.Array(pflow_indicator),
-            "event_number": ak.Array(event_number)[: len(pflow_indicator)],
-        }
-        if proxy_ptetaphi is not None:
-            root_data["proxy"] = {
-                "pt": ak.Array(proxy_ptetaphi[..., 0]),
-                "eta": ak.Array(proxy_ptetaphi[..., 1]),
-                "phi": ak.Array(proxy_ptetaphi[..., 2]),
+        for h5_path in self._output_paths:
+            event_number, pflow_class, pflow_ptetaphi, proxy_ptetaphi, pflow_indicator = load_convert_h5(h5_path.as_posix())
+            root_path = h5_path.with_suffix(".root").as_posix()
+            print(f"Writing to ROOT file {root_path}")
+            root_data = {
+                "mpflow": {
+                    "pt": ak.Array(pflow_ptetaphi[..., 0]),
+                    "eta": ak.Array(pflow_ptetaphi[..., 1]),
+                    "phi": ak.Array(pflow_ptetaphi[..., 2]),
+                    "class": ak.Array(pflow_class),
+                },
+                "pred_ind": ak.Array(pflow_indicator),
+                "event_number": ak.Array(event_number)[: len(pflow_indicator)],
             }
-        with uproot.recreate(root_path) as f:
-            f["event_tree"] = root_data
-        print(f"Wrote ROOT file to {root_path}")
+            if proxy_ptetaphi is not None:
+                root_data["proxy"] = {
+                    "pt": ak.Array(proxy_ptetaphi[..., 0]),
+                    "eta": ak.Array(proxy_ptetaphi[..., 1]),
+                    "phi": ak.Array(proxy_ptetaphi[..., 2]),
+                }
+            with uproot.recreate(root_path) as f:
+                f["event_tree"] = root_data
+            print(f"Wrote ROOT file to {root_path}")

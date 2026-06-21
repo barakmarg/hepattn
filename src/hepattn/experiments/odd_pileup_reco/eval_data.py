@@ -114,14 +114,82 @@ def _build_event_selector(
 # H5 loading
 # ---------------------------------------------------------------------------
 
+def _h5_n_events(path: str | Path) -> int:
+    """Number of events in a single prediction-writer H5 file."""
+    with h5py.File(path, "r") as f:
+        return _infer_n_events(f)
+
+
+def map_event_range_to_files(
+    paths: list[str | Path],
+    event_start: int | None = None,
+    event_stop: int | None = None,
+) -> list[tuple[Path, int, int]]:
+    """Map a global ``[event_start, event_stop)`` range onto an ordered list of
+    H5 files (each holding a contiguous block of events).
+
+    Returns a list of ``(path, local_start, local_stop)`` for the files that
+    overlap the requested global range; files with no overlap are omitted.
+    Negative bounds are interpreted relative to the total event count, and
+    ``None`` means "from the beginning"/"to the end".
+    """
+    paths = [Path(p) for p in paths]
+    counts = [_h5_n_events(p) for p in paths]
+    total = sum(counts)
+
+    start = 0 if event_start is None else int(event_start)
+    stop = total if event_stop is None else int(event_stop)
+    if start < 0:
+        start += total
+    if stop < 0:
+        stop += total
+    start = max(0, min(start, total))
+    stop = max(start, min(stop, total))
+
+    out: list[tuple[Path, int, int]] = []
+    base = 0
+    for p, n in zip(paths, counts):
+        lo = max(start, base) - base
+        hi = min(stop, base + n) - base
+        if hi > lo:
+            out.append((p, lo, hi))
+        base += n
+    return out
+
+
+def concat_eval_dicts(dicts: list[dict]) -> dict:
+    """Concatenate same-schema eval dicts along the leading (event/flat) axis.
+
+    Non-array values keep the first dict's value. Used to merge per-file
+    results when loading predictions split across multiple H5 files.
+    """
+    dicts = [d for d in dicts if d]
+    if not dicts:
+        return {}
+    if len(dicts) == 1:
+        return dicts[0]
+    out: dict = {}
+    for k in dicts[0]:
+        vals = [d[k] for d in dicts if k in d]
+        if all(isinstance(v, np.ndarray) for v in vals):
+            try:
+                out[k] = np.concatenate(vals, axis=0)
+            except ValueError:
+                out[k] = vals[0]
+        else:
+            out[k] = vals[0]
+    return out
+
+
 def load_eval_data_from_h5(
-    h5_path: str | Path,
+    h5_path: str | Path | list[str | Path] | tuple,
     calo_pred_threshold: float = CALO_PRED_THRESHOLD,
     calo_hs_frac_threshold: float = CALO_HS_FRAC_THRESHOLD,
     calo_hs_energy_threshold: float = CALO_HS_ENERGY_THRESHOLD,
     event_start: int | None = None,
     event_stop: int | None = None,
     event_indices: list[int] | np.ndarray | None = None,
+    load_reco: bool = True,
 ) -> tuple[dict, dict, dict]:
     """Load prediction writer H5 and return (track_data, cluster_data, reco_data).
 
@@ -130,13 +198,22 @@ def load_eval_data_from_h5(
 
     Parameters
     ----------
-    h5_path : path to the prediction writer output H5 file
+    h5_path : path to the prediction writer output H5 file, OR a list/tuple of
+        paths (e.g. the per-1k-event split files from ``run_forward_pass``).
+        When several files are given they are treated as one contiguous event
+        stream in the order provided, and the returned dicts are concatenated.
     calo_pred_threshold : binary threshold for calo mask predictions
     calo_hs_frac_threshold : truth HS fraction threshold for mask truth
     calo_hs_energy_threshold : truth HS energy threshold for mask truth
     event_start : optional inclusive start index for contiguous event slicing
+        (global across all files when a list is given)
     event_stop : optional exclusive stop index for contiguous event slicing
-    event_indices : optional explicit event indices (strictly increasing)
+    event_indices : optional explicit event indices (strictly increasing;
+        single-file only)
+    load_reco : if True (default), load reco_data (object class/regression and,
+        if present, the large truth/pred incidence tensors). Set False to skip
+        _load_reco entirely (returns ``{}``) — much faster/lighter when only
+        track_data and cluster_data are needed.
 
     Returns
     -------
@@ -144,6 +221,42 @@ def load_eval_data_from_h5(
     cluster_data : dict  (empty if node_metadata absent)
     reco_data : dict  (always populated if object_class + regression exist)
     """
+    # Multiple files: load each (with its share of the global event range) and
+    # concatenate. cluster event_idx is offset so it stays globally contiguous.
+    if isinstance(h5_path, (list, tuple)):
+        paths = [Path(p) for p in h5_path]
+        if len(paths) != 1:
+            if event_indices is not None:
+                raise ValueError(
+                    "event_indices is not supported across multiple H5 files; "
+                    "use event_start/event_stop instead"
+                )
+            file_ranges = map_event_range_to_files(paths, event_start, event_stop)
+            tracks, clusters, recos = [], [], []
+            loaded = 0
+            for p, lo, hi in file_ranges:
+                t, c, r = load_eval_data_from_h5(
+                    p,
+                    calo_pred_threshold=calo_pred_threshold,
+                    calo_hs_frac_threshold=calo_hs_frac_threshold,
+                    calo_hs_energy_threshold=calo_hs_energy_threshold,
+                    event_start=lo,
+                    event_stop=hi,
+                    load_reco=load_reco,
+                )
+                if isinstance(c.get("event_idx"), np.ndarray) and c["event_idx"].size:
+                    c = {**c, "event_idx": c["event_idx"] + loaded}
+                tracks.append(t)
+                clusters.append(c)
+                recos.append(r)
+                loaded += hi - lo
+            track_data = concat_eval_dicts(tracks)
+            cluster_data = concat_eval_dicts(clusters)
+            reco_data = concat_eval_dicts(recos)
+            reco_data["_source_h5_path"] = ";".join(str(p) for p in paths)
+            return track_data, cluster_data, reco_data
+        h5_path = paths[0]
+
     h5_path = Path(h5_path)
     with h5py.File(h5_path, "r") as f:
         n_events = _infer_n_events(f)
@@ -154,7 +267,7 @@ def load_eval_data_from_h5(
             event_indices=event_indices,
         )
 
-        reco_data = _load_reco(f, event_sel=event_sel)
+        reco_data = _load_reco(f, event_sel=event_sel) if load_reco else {}
         track_data = _load_track(f, event_sel=event_sel)
         cluster_data = _load_cluster(
             f,
@@ -444,8 +557,10 @@ def run_forward_pass(
     inference_mode: bool | None = None,
     reco_debug_use_truth_masks: bool = False,
     test_suff: str = "",
-) -> Path:
-    """Run Lightning test step with PflowPredictionWriter, return H5 path.
+    events_per_file: int | None = None,
+    predict_only: bool = True,
+) -> Path | list[Path]:
+    """Run Lightning test step with PflowPredictionWriter, return H5 path(s).
 
     This is the forward-pass path that produces an H5 in the canonical
     prediction writer format, which can then be loaded with
@@ -466,10 +581,18 @@ def run_forward_pass(
     reco_debug_use_truth_masks : if True, use truth masks (oracle) for Stream C
         reconstruction filtering during inference. Default is False.
     test_suff : suffix appended to output file name
+    events_per_file : if set, split the output across multiple H5 files holding
+        at most this many events each (the final file holds the remainder).
+        Files are named ``..__test{suff}__partNNN.h5``. If None (default), a
+        single H5 file is written as before.
+    predict_only : if True (default), skip the test-time loss (and its Hungarian
+        matching) during the forward pass — much faster, and the writer never
+        uses the loss. Set False to also compute/log loss and metrics.
 
     Returns
     -------
-    Path to the generated H5 file
+    Path to the generated H5 file, or a list of Paths (one per part) when
+    ``events_per_file`` is set. No ROOT files are written.
     """
     import yaml
     from lightning import Trainer
@@ -536,8 +659,10 @@ def run_forward_pass(
     elif reco_debug_use_truth_masks:
         print("Warning: model does not expose reco_debug_use_truth_masks; running default inference masks")
 
-    # Create prediction writer callback
-    writer = PflowPredictionWriter()
+    # Create prediction writer callback (H5 only — no ROOT output)
+    writer = PflowPredictionWriter(
+        events_per_file=events_per_file, write_root=False, predict_only=predict_only,
+    )
 
     trainer = Trainer(
         accelerator=trainer_accelerator,
@@ -552,9 +677,16 @@ def run_forward_pass(
     print("Running test...")
     trainer.test(model, datamodule=datamodule, ckpt_path=str(ckpt_path))
 
-    h5_path = writer.output_path
-    print(f"Predictions written to {h5_path}")
-    return h5_path
+    out_paths = writer.output_paths
+    if events_per_file is None:
+        h5_path = out_paths[0] if out_paths else writer.output_path
+        print(f"Predictions written to {h5_path}")
+        return h5_path
+
+    print(f"Predictions written to {len(out_paths)} file(s):")
+    for p in out_paths:
+        print(f"  {p}")
+    return out_paths
 
 
 # ---------------------------------------------------------------------------

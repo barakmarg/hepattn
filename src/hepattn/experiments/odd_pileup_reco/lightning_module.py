@@ -53,8 +53,16 @@ class ODDPFlowTwoStream(ModelWrapper):
         lrs_config: dict,
         optimizer: str = "AdamW",
         mtl: bool = False,
+        init_from_ckpt: str | None = None,
     ):
         super().__init__(name, model, lrs_config, optimizer, mtl)
+
+        # Weights-only warm start: initialise from a checkpoint's weights but begin a
+        # FRESH run (epoch 0, new optimizer + LR schedule). Unlike trainer --ckpt_path
+        # (which fully resumes optimizer/epoch/LR), this only copies parameters. Done in
+        # __init__ (before the Compile callback) so the state_dict keys still match.
+        if init_from_ckpt is not None:
+            self._init_from_ckpt(init_from_ckpt)
 
         self.MI = MaskInference
 
@@ -79,6 +87,16 @@ class ODDPFlowTwoStream(ModelWrapper):
         self._val_cluster_data: dict[str, list] = defaultdict(list)
         self._val_reco_data: dict[str, list] = defaultdict(list)
         self._val_jet_data: dict[str, list] = defaultdict(list)
+
+    def _init_from_ckpt(self, ckpt_path: str) -> None:
+        """Load only the model weights from a Lightning checkpoint (strict=False)."""
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        state_dict = ckpt.get("state_dict", ckpt)
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        model_missing = [k for k in missing if k.startswith("model.")]
+        print(f"[init_from_ckpt] warm-started weights from {ckpt_path}")
+        print(f"[init_from_ckpt]   model params not found in ckpt: {len(model_missing)} "
+              f"| unexpected ckpt keys: {len(unexpected)}")
 
     # ------------------------------------------------------------------
     # Override training/validation steps to pass targets to forward
@@ -125,6 +143,15 @@ class ODDPFlowTwoStream(ModelWrapper):
     def test_step(self, batch, batch_idx):
         inputs, targets = batch
         outputs = self.model(inputs, targets=targets)
+
+        # Prediction-writing runs (e.g. PflowPredictionWriter) only need the
+        # forward outputs + preds for the H5. Skip the loss — its Hungarian
+        # matching over the reco objects is the dominant per-batch cost and runs
+        # in the main process (so more dataloader workers/CPUs do not help). The
+        # flag defaults off, so training/validation behaviour is unchanged.
+        if getattr(self, "_predict_only", False):
+            preds = self.predict(outputs)
+            return outputs, preds, {}
 
         losses = self.model.loss(outputs, targets)
         self.log_losses(losses, "test")

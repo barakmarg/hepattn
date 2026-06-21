@@ -61,6 +61,7 @@ def load_charged_subtract_events(
     event_start: int = 0,
     event_stop: int | None = None,
     event_ids: list[int] | np.ndarray | None = None,
+    events_per_file: int | None = None,
 ) -> dict:
     """Load clusters + tracks + per-cluster charged-energy deps + HS particles.
 
@@ -114,6 +115,20 @@ def load_charged_subtract_events(
     selected: set[int] | None = None
     if event_ids is not None:
         selected = set(int(x) for x in np.asarray(event_ids).ravel().tolist())
+
+        # Read ONLY the parquet shards that contain the requested events, by pure
+        # filename arithmetic — NO probe reads (this lives on Lustre, so we avoid
+        # extra metadata/IO ops). Files are '<prefix>-<NNNNN>.parquet' holding
+        # event_ids [NNNNN*events_per_file, +events_per_file). Opt-in: only when
+        # events_per_file is given, so other callers keep the full-scan behaviour.
+        if events_per_file:
+            def _shard_index(p: Path) -> int:
+                return int(p.stem.rsplit("-", 1)[-1])
+            needed = {int(e) // events_per_file for e in selected}
+            files_clu = [p for p in files_clu if _shard_index(p) in needed]
+            files_tr = [p for p in files_tr if _shard_index(p) in needed]
+            files_tp = [p for p in files_tp if _shard_index(p) in needed]
+            files_dep = [p for p in files_dep if _shard_index(p) in needed]
 
     # Pass 1: read each shard, build event_id -> per-shard rows for the events we want.
     # For event_ids mode we keep a global dict; otherwise we stream.

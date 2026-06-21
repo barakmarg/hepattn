@@ -526,6 +526,8 @@ def plot_n_particles_by_pt_bin(
     data: dict,
     ind_threshold: float = 0.5,
     pt_bins: tuple[float, ...] = (0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 200.0),
+    truth_label: str = "Truth",
+    pred_label: str = "PFlow",
 ) -> plt.Figure:
     """Per-event particle multiplicity histograms split by particle-pt bins."""
     if len(pt_bins) < 2:
@@ -566,8 +568,8 @@ def plot_n_particles_by_pt_bin(
         max_count = max(1, *series_max)
         bins = np.arange(-0.5, max_count + 1.5, 1.0)
 
-        ax.hist(truth_counts, bins=bins, histtype="stepfilled", alpha=0.5, label="Truth")
-        ax.hist(pflow_counts, bins=bins, histtype="step", label="PFlow")
+        ax.hist(truth_counts, bins=bins, histtype="stepfilled", alpha=0.5, label=truth_label)
+        ax.hist(pflow_counts, bins=bins, histtype="step", label=pred_label)
         if proxy_counts is not None:
             ax.hist(proxy_counts, bins=bins, histtype="step", linestyle="--", label="Proxy")
 
@@ -1370,7 +1372,12 @@ def plot_feature_distributions(data: dict, ind_threshold: float = 0.5) -> plt.Fi
     return fig
 
 
-def plot_feature_scatter(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
+def plot_feature_scatter(
+    data: dict,
+    ind_threshold: float = 0.5,
+    truth_label: str = "Truth",
+    pred_label: str = "Pred",
+) -> plt.Figure:
     """3×3 density maps: truth vs PFlow for [pt, eta, phi] × [All, Charged, Neutral]."""
     truth_f = data["truth_ptetaphi"].reshape(-1, 3)
     pflow_f = data["pflow_ptetaphi"].reshape(-1, 3)
@@ -1444,10 +1451,10 @@ def plot_feature_scatter(data: dict, ind_threshold: float = 0.5) -> plt.Figure:
             else:
                 ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
 
-            ax.set_xlabel(f"Truth {feat_labels[i]}")
-            ax.set_ylabel(f"Pred {feat_labels[i]}")
+            ax.set_xlabel(f"{truth_label} {feat_labels[i]}")
+            ax.set_ylabel(f"{pred_label} {feat_labels[i]}")
             ax.set_title(row_labels[j])
-    fig.suptitle("Feature density (hist2d): truth vs prediction", y=1.01)
+    fig.suptitle(f"Feature density (hist2d): {truth_label} vs {pred_label}", y=1.01)
     fig.tight_layout()
     return fig
 

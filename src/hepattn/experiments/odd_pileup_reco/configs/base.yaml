@@ -38,7 +38,7 @@ data:
 
   # For backend: mmap this must be the prep_mmap.py output dir (shard_*.pt +
   # shards_index.pt). brk.sh overrides it to the $TMPDIR/mmap staged copy.
-  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu200
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu0_overlay_pu200
   enable_split: true
   train_split: 0.9
   val_split: 0.1
@@ -56,9 +56,9 @@ data:
   num_workers: 8
   num_val_workers: 1
   num_test_workers: 1
-  num_train: 1000
-  num_test: 1000
-  num_val: 1000
+  num_train: -1
+  num_test: -1
+  num_val: -1
 
   batch_size: 32
   incidence_cutval: 0.01
@@ -74,7 +74,7 @@ data:
 trainer:
   max_epochs: 50
   accelerator: gpu
-  devices: 1
+  devices: 4
   # DDP: one process per GPU. find_unused_parameters=true is required for this
   # 3-stream model (some heads/params get no gradient on a given step, e.g.
   # cost_weight=0 / mask-gated tasks). Do NOT add static_graph.
@@ -116,7 +116,7 @@ model:
 
   lrs_config:
     initial: 6.25e-7
-    max: 1.25e-4
+    max: 6.25e-5
     end: 6.25e-7
     pct_start: 0.05
     weight_decay: 0.01
@@ -131,7 +131,7 @@ model:
       target_object: particle
       max_hs_tracks: 190
       num_latent_queries: 16
-      teacher_forcing: true
+      teacher_forcing: false
 
       # Raw variables forwarded through x dict
       raw_variables:
