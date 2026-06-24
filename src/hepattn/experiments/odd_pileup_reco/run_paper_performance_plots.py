@@ -64,7 +64,12 @@ from hepattn.experiments.odd_pileup_reco.puppi_charged_subtract import (
     compute_puppi_weights_charged_subtract,
     load_charged_subtract_events,
 )
-from hepattn.experiments.odd_pileup_reco.reco_analysis import cluster_jets, load_pflow_data
+from hepattn.experiments.odd_pileup_reco.reco_analysis import (
+    CLASS_COLORS,
+    CLASS_LABELS,
+    cluster_jets,
+    load_pflow_data,
+)
 from hepattn.experiments.odd_pileup_reco.run_puppi_jet_resolution_charged_subtract_full import (
     DEFAULT_H5,
     _make_binned_plots,
@@ -73,7 +78,8 @@ from hepattn.experiments.odd_pileup_reco.run_puppi_jet_resolution_charged_subtra
 
 # PUPPI parquet source: the all-vertices "paper" sample the H5 was generated from
 # (the chunked dir does NOT contain these events).
-DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper"
+#DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper"
+DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_paper"
 # PUPPI optuna params (v2, anti-kT R=0.4 tuning).
 DEFAULT_BEST_JSON = (
     "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/"
@@ -102,6 +108,12 @@ CALO_E_BINS = np.logspace(np.log10(0.05), np.log10(2000.0), 60)
 RESIDUAL_KEYS = ("dpt", "dpt_over_truth", "deta", "dphi", "truth_pt")
 IND_THRESHOLD = 0.5
 PARQUET_EVENTS_PER_FILE = 100   # event_ids per parquet shard file (NNNNN = eid // this)
+
+# ── Per-particle-class performance (assumes MATCHED objects: predict_only=False) ─
+N_CLASSES = 5                                            # real classes 0..4 (5 = null)
+PERF_PT_BINS = np.logspace(np.log10(1.0), np.log10(500.0), 16)   # 15 truth-pT bins
+RESP_BINS = np.linspace(0.0, 4.0, 201)                   # pred_pT / truth_pT ratio
+JET_PT_BINS = np.logspace(np.log10(10.0), np.log10(600.0), 13)   # jet matching eff/fake bins
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +214,95 @@ def _jet_energy(jets: dict, prefix: str) -> np.ndarray:
 # MAP — analyse one shard in a worker process (PUPPI events inherited via fork)
 # ---------------------------------------------------------------------------
 
+def _flat_jet_pt(jets: dict, prefix: str) -> np.ndarray:
+    chunks = [np.asarray(a) for a in jets[f"{prefix}_jet_pt"] if len(a) > 0]
+    p = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+    return p[np.isfinite(p) & (p > 0)]
+
+
+def _jet_match_counts(jets: dict, puppi_jets: dict, glow_res: dict, puppi_res: dict) -> dict:
+    """Per-jet-pT-bin counts for jet matching efficiency and fake rate.
+
+    Efficiency = matched / all truth jets (binned by truth-jet pT).
+    Fake rate   = (all reco - matched) / all reco jets (binned by reco-jet pT).
+    Matched truth/reco pT come straight from the residual dicts (no re-matching):
+    matched-truth = res["truth_pt"], matched-reco = res["truth_pt"] + res["dpt"].
+    """
+    def H(x):
+        x = np.asarray(x, dtype=float)
+        x = x[np.isfinite(x) & (x > 0)]
+        return np.histogram(x, bins=JET_PT_BINS)[0].astype(np.int64)
+
+    return {
+        "truth_total": H(_flat_jet_pt(jets, "truth")),
+        "glow_eff_num": H(glow_res["truth_pt"]),
+        "puppi_eff_num": H(puppi_res["truth_pt"]),
+        "glow_total": H(_flat_jet_pt(jets, "pflow")),
+        "puppi_total": H(_flat_jet_pt(puppi_jets, "puppi")),
+        "glow_match_pred": H(glow_res["truth_pt"] + glow_res["dpt"]),
+        "puppi_match_pred": H(puppi_res["truth_pt"] + puppi_res["dpt"]),
+    }
+
+
+def _per_class_counts(data: dict) -> dict:
+    """Matched per-truth-class counts for the per-class performance figures.
+
+    Uses slot-aligned (matched) pred/truth objects. Returns:
+      conf       (5, 6) int : conf[truth_class, pred_class] over truth-valid slots
+                              (pred col 5 = predicted-null = missed)
+      eff_denom  (5, NPT)   : # truth objects of class c per truth-pT bin
+      eff_reco   (5, NPT)   : ... that got a valid (non-null) prediction
+      eff_correct(5, NPT)   : ... predicted with the correct class
+      resp       (5, NPT, NR): pred_pT/truth_pT histogram per (class, pT bin)
+    """
+    tc = np.asarray(data["truth_class"]).ravel()
+    pc = np.asarray(data["pflow_class"]).ravel()
+    tpt = np.asarray(data["truth_ptetaphi"][..., 0]).ravel()
+    ppt = np.asarray(data["pflow_ptetaphi"][..., 0]).ravel()
+
+    tv = tc < N_CLASSES        # truth is a real particle (0..4)
+    pv = pc < N_CLASSES        # pred is a real particle (not null)
+
+    npt = len(PERF_PT_BINS) - 1
+    nr = len(RESP_BINS) - 1
+    conf = np.zeros((N_CLASSES, N_CLASSES + 1), dtype=np.int64)
+    eff_denom = np.zeros((N_CLASSES, npt), dtype=np.int64)
+    eff_reco = np.zeros((N_CLASSES, npt), dtype=np.int64)
+    eff_correct = np.zeros((N_CLASSES, npt), dtype=np.int64)
+    resp = np.zeros((N_CLASSES, npt, nr), dtype=np.int64)
+
+    # Confusion (rows = truth class, cols = pred class with null mapped to col 5).
+    sel = tv
+    np.add.at(conf, (tc[sel], np.clip(pc[sel], 0, N_CLASSES)), 1)
+
+    ptbin = np.digitize(tpt, PERF_PT_BINS) - 1
+    inpt = (ptbin >= 0) & (ptbin < npt)
+    for c in range(N_CLASSES):
+        cm = tv & (tc == c) & inpt
+        eff_denom[c] = np.bincount(ptbin[cm], minlength=npt)[:npt]
+        eff_reco[c] = np.bincount(ptbin[cm & pv], minlength=npt)[:npt]
+        eff_correct[c] = np.bincount(ptbin[cm & (pc == c)], minlength=npt)[:npt]
+        rsel = cm & pv & (tpt > 0) & np.isfinite(ppt)
+        if rsel.any():
+            rb = np.digitize(ppt[rsel] / tpt[rsel], RESP_BINS) - 1
+            pb = ptbin[rsel]
+            ok = (rb >= 0) & (rb < nr)
+            np.add.at(resp[c], (pb[ok], rb[ok]), 1)
+
+    return {"conf": conf, "eff_denom": eff_denom, "eff_reco": eff_reco,
+            "eff_correct": eff_correct, "resp": resp}
+
+
+def _hist_percentile(counts: np.ndarray, edges: np.ndarray, q: float) -> float:
+    """Percentile q (0..100) of a distribution given as histogram counts."""
+    tot = counts.sum()
+    if tot <= 0:
+        return np.nan
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    cdf = np.cumsum(counts) / tot
+    return float(np.interp(q / 100.0, cdf, centers))
+
+
 def _puppi_jets_for_shard(parquet_dir: str, eids: list[int], events_per_file: int,
                           subtract_pu: bool, puppi_params: dict, jet_cfg: dict) -> dict:
     """PUPPI jets for a shard, computed ONE parquet file at a time.
@@ -237,7 +338,8 @@ def _puppi_jets_for_shard(parquet_dir: str, eids: list[int], events_per_file: in
 
 
 def analyze_shard(shard_path: str, parquet_dir: str, events_per_file: int,
-                  jet_cfg: dict, subtract_pu: bool, puppi_params: dict) -> dict:
+                  jet_cfg: dict, subtract_pu: bool, puppi_params: dict,
+                  per_class: bool = True) -> dict:
     shard = Path(shard_path)
     data = load_pflow_data(shard_path, load_incidence=False)
     track_data, cluster_data, _ = load_eval_data_from_h5(shard, load_reco=False)
@@ -257,8 +359,14 @@ def analyze_shard(shard_path: str, parquet_dir: str, events_per_file: int,
     puppi_res = _match_and_residuals(puppi_jets, jets, "puppi")
 
     npart_truth, npart_pred = _npart_counts(data)
+
+    # Per-class performance aggregates (assume matched objects; predict_only=False).
+    per_class_agg = _per_class_counts(data) if per_class else None
+
     return {
         "n_events": n_events,
+        "per_class": per_class_agg,
+        "jet_match": _jet_match_counts(jets, puppi_jets, glow_res, puppi_res),
         "glow_res": {k: np.asarray(glow_res.get(k, []), dtype=np.float32) for k in RESIDUAL_KEYS},
         "puppi_res": {k: np.asarray(puppi_res.get(k, []), dtype=np.float32) for k in RESIDUAL_KEYS},
         "nconst": {
@@ -300,6 +408,13 @@ def merge_aggregates(aggs: list[dict]) -> dict:
     m["feat_hist"] = np.sum([a["feat_hist"] for a in aggs], axis=0)
     m["track"] = {k: np.sum([a["track"][k] for a in aggs], axis=0) for k in ("tp", "fp", "fn", "total")}
     m["calo"] = {k: np.sum([a["calo"][k] for a in aggs], axis=0) for k in ("truth", "recovered", "pred")}
+    if aggs[0].get("per_class") is not None:
+        pcs = [a["per_class"] for a in aggs]
+        m["per_class"] = {k: np.sum([pc[k] for pc in pcs], axis=0)
+                          for k in ("conf", "eff_denom", "eff_reco", "eff_correct", "resp")}
+    if aggs[0].get("jet_match") is not None:
+        jms = [a["jet_match"] for a in aggs]
+        m["jet_match"] = {k: np.sum([jm[k] for jm in jms], axis=0) for k in jms[0]}
     return m
 
 
@@ -372,17 +487,20 @@ def _plot_jet_resolution(merged: dict):
         else:   # dpt
             b = _pct_bins(glow, 90)
 
-        ax.hist(glow, bins=b, histtype="stepfilled", alpha=0.5, density=density,
-                color=GLOWUP_COLOR, label=lbl(GLOWUP, glow))
+        # Only GLOW-UP is filled; PUPPI and Target are distinct outlines so all
+        # three stay readable where they overlap.
+        ax.hist(glow, bins=b, histtype="stepfilled", alpha=0.45, linewidth=1.6,
+                density=density, color=GLOWUP_COLOR, edgecolor=GLOWUP_COLOR,
+                label=lbl(GLOWUP, glow))
         pud = np.asarray(series(key, "puppi"), dtype=float)
         if pud.size:
-            ax.hist(pud, bins=b, histtype="step", linestyle="-.", linewidth=1.8, density=density,
-                    color=PUPPI_COLOR, label=lbl(PUPPI_LABEL, pud))
+            ax.hist(pud, bins=b, histtype="step", linestyle="-", linewidth=2.2,
+                    density=density, color=PUPPI_COLOR, label=lbl(PUPPI_LABEL, pud))
         if key in ("nconst", "energy"):
             td = np.asarray(series(key, "truth"), dtype=float)
             if td.size:
-                ax.hist(td, bins=b, histtype="stepfilled", alpha=0.4, density=density,
-                        color=TARGET_COLOR, label=lbl(TARGET, td))
+                ax.hist(td, bins=b, histtype="step", linestyle="--", linewidth=1.8,
+                        density=density, color="black", label=lbl(TARGET, td))
 
         if logy:
             ax.set_yscale("log")
@@ -507,9 +625,142 @@ def _plot_calo_e_dist_from_hist(calo: dict):
     return fig
 
 
+# ── Per-class performance figures (matched objects) ───────────────────────
+
+def _perf_pt_centers() -> np.ndarray:
+    return np.sqrt(PERF_PT_BINS[:-1] * PERF_PT_BINS[1:])
+
+
+def _plot_class_confusion(pc: dict):
+    conf = pc["conf"].astype(float)
+    rowsum = conf.sum(axis=1, keepdims=True)
+    norm = np.divide(conf, rowsum, out=np.zeros_like(conf), where=rowsum > 0)
+    col_labels = CLASS_LABELS[:N_CLASSES] + ["null/miss"]
+    fig, ax = plt.subplots(figsize=(7.5, 6))
+    im = ax.imshow(norm, cmap="Blues", vmin=0.0, vmax=1.0, aspect="auto")
+    ax.set_xticks(range(N_CLASSES + 1))
+    ax.set_xticklabels(col_labels, rotation=30, ha="right")
+    ax.set_yticks(range(N_CLASSES))
+    ax.set_yticklabels(CLASS_LABELS[:N_CLASSES])
+    ax.set_xlabel(f"{GLOWUP} predicted class")
+    ax.set_ylabel(f"{TARGET} class")
+    for i in range(N_CLASSES):
+        if rowsum[i, 0] == 0:
+            continue
+        for j in range(N_CLASSES + 1):
+            ax.text(j, i, f"{norm[i, j]:.2f}", ha="center", va="center",
+                    color="white" if norm[i, j] > 0.5 else "black", fontsize=8)
+    fig.colorbar(im, ax=ax, label="row-normalized fraction")
+    ax.set_title(f"Class confusion: {GLOWUP} vs {TARGET} (row-normalized)")
+    fig.tight_layout()
+    return fig
+
+
+def _plot_class_pt_response(pc: dict):
+    resp = pc["resp"]
+    centers = _perf_pt_centers()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for c in range(N_CLASSES):
+        med = np.array([_hist_percentile(resp[c, b], RESP_BINS, 50) for b in range(len(centers))])
+        ax.plot(centers, med, marker="o", color=CLASS_COLORS[c], label=CLASS_LABELS[c])
+    ax.axhline(1.0, color="gray", lw=1, ls="--")
+    ax.set_xscale("log")
+    ax.set_xlabel(r"truth $p_T$ [GeV]")
+    ax.set_ylabel(r"median $p_T^{\mathrm{pred}} / p_T^{\mathrm{truth}}$")
+    ax.set_title(f"{GLOWUP} $p_T$ response per class")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def _plot_class_pt_resolution(pc: dict):
+    resp = pc["resp"]
+    centers = _perf_pt_centers()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for c in range(N_CLASSES):
+        iqr = np.array([
+            _hist_percentile(resp[c, b], RESP_BINS, 75) - _hist_percentile(resp[c, b], RESP_BINS, 25)
+            for b in range(len(centers))
+        ])
+        ax.plot(centers, iqr, marker="o", color=CLASS_COLORS[c], label=CLASS_LABELS[c])
+    ax.set_xscale("log")
+    ax.set_xlabel(r"truth $p_T$ [GeV]")
+    ax.set_ylabel(r"IQR of $p_T^{\mathrm{pred}} / p_T^{\mathrm{truth}}$")
+    ax.set_title(f"{GLOWUP} $p_T$ resolution per class")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def _plot_class_efficiency(pc: dict):
+    den = pc["eff_denom"].astype(float)
+    num = pc["eff_reco"].astype(float)
+    centers = _perf_pt_centers()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for c in range(N_CLASSES):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            e = np.where(den[c] > 0, num[c] / den[c], np.nan)
+            err = np.where(den[c] > 0, np.sqrt(np.clip(e * (1 - e), 0, None) / np.where(den[c] > 0, den[c], 1)), np.nan)
+        ax.errorbar(centers, e, yerr=err, marker="o", capsize=2, color=CLASS_COLORS[c], label=CLASS_LABELS[c])
+    ax.axhline(1.0, color="gray", lw=1, ls="--")
+    ax.set_xscale("log")
+    ax.set_ylim(0, 1.1)
+    ax.set_xlabel(r"truth $p_T$ [GeV]")
+    ax.set_ylabel("reconstruction efficiency")
+    ax.set_title(f"{GLOWUP} reconstruction efficiency per class")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def _plot_jet_matching(jm: dict):
+    """Jet matching efficiency (vs truth pT) and fake rate (vs reco pT), per method."""
+    centers = np.sqrt(JET_PT_BINS[:-1] * JET_PT_BINS[1:])
+
+    def ratio_err(num, den):
+        num = num.astype(float)
+        den = den.astype(float)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            r = np.where(den > 0, num / den, np.nan)
+            e = np.where(den > 0, np.sqrt(np.clip(r * (1 - r), 0, None) / np.where(den > 0, den, 1)), np.nan)
+        return r, e
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+    # Efficiency = matched truth / all truth jets
+    for label, col, num in ((GLOWUP, GLOWUP_COLOR, jm["glow_eff_num"]),
+                            (PUPPI_LABEL, PUPPI_COLOR, jm["puppi_eff_num"])):
+        r, e = ratio_err(num, jm["truth_total"])
+        axL.errorbar(centers, r, yerr=e, marker="o", capsize=2, color=col, label=label)
+    axL.axhline(1.0, color="gray", lw=1, ls="--")
+    axL.set_ylim(0, 1.05)
+    axL.set_xlabel(r"truth jet $p_T$ [GeV]")
+    axL.set_ylabel("matched / truth jets")
+    axL.set_title("Jet matching efficiency")
+    # Fake rate = (all reco - matched) / all reco jets
+    for label, col, tot, matched in ((GLOWUP, GLOWUP_COLOR, jm["glow_total"], jm["glow_match_pred"]),
+                                      (PUPPI_LABEL, PUPPI_COLOR, jm["puppi_total"], jm["puppi_match_pred"])):
+        fake = np.clip(tot.astype(float) - matched.astype(float), 0, None)
+        r, e = ratio_err(fake, tot)
+        axR.errorbar(centers, r, yerr=e, marker="o", capsize=2, color=col, label=label)
+    axR.set_ylim(0, None)
+    axR.set_xlabel(r"reco jet $p_T$ [GeV]")
+    axR.set_ylabel("unmatched / reco jets")
+    axR.set_title("Jet fake rate")
+    for ax in (axL, axR):
+        ax.set_xscale("log")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend()
+    fig.suptitle(rf"Jet matching ({GLOWUP} & {PUPPI_LABEL} vs {TARGET}, $\Delta R<0.4$)", y=1.02)
+    fig.tight_layout()
+    return fig
+
+
 def render_all(merged: dict) -> dict:
     methods = [(GLOWUP, merged["glow_res"]), (PUPPI_LABEL, merged["puppi_res"])]
-    return {
+    figs = {
         "jet_resolution": _plot_jet_resolution(merged),
         "jet_resolution_binned": _make_binned_plots(methods),
         "track_f1_vs_pt": _plot_track_f1_from_counts(merged["track"]),
@@ -518,6 +769,17 @@ def render_all(merged: dict) -> dict:
         "calo_recall_vs_pt": _plot_calo_recall_from_counts(merged["calo"]),
         "calo_pred_vs_truth_e_dist": _plot_calo_e_dist_from_hist(merged["calo"]),
     }
+    if merged.get("jet_match") is not None:
+        figs["jet_matching_efficiency"] = _plot_jet_matching(merged["jet_match"])
+    # Per-class figures only when the (matched) per-class aggregates are present
+    # (skipped silently for older caches that predate them — re-run with --force).
+    pc = merged.get("per_class")
+    if pc is not None:
+        figs["class_confusion_matrix"] = _plot_class_confusion(pc)
+        figs["class_pt_response"] = _plot_class_pt_response(pc)
+        figs["class_pt_resolution"] = _plot_class_pt_resolution(pc)
+        figs["class_efficiency_vs_pt"] = _plot_class_efficiency(pc)
+    return figs
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +873,9 @@ def main() -> int:
     p.add_argument("--workers", type=int, default=None,
                    help="Worker processes (default: min(cpu_count, n_shards)).")
     p.add_argument("--force", action="store_true", help="Recompute all shards (ignore cache).")
+    p.add_argument("--no-per-class", dest="per_class", action="store_false", default=True,
+                   help="Skip the per-class figures (confusion / response / resolution / "
+                        "efficiency). They assume matched shards (predict_only=False).")
     p.add_argument("--jet-R", type=float, default=0.4)
     p.add_argument("--min-constituents", type=int, default=3)
     p.add_argument("--min-pt", type=float, default=10.0)
@@ -665,7 +930,8 @@ def main() -> int:
             with ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
                                      initializer=_init_worker) as ex:
                 fut2f = {ex.submit(analyze_shard, str(f), args.parquet_dir,
-                                   args.events_per_file, jet_cfg, subtract_pu, puppi_params): f
+                                   args.events_per_file, jet_cfg, subtract_pu, puppi_params,
+                                   args.per_class): f
                          for f in todo}
                 for fut in as_completed(fut2f):
                     f = fut2f[fut]

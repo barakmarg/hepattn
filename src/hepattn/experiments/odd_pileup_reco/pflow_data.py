@@ -938,6 +938,8 @@ class ODDDatasetPileup(Dataset):
             .collect()
             .item()
         )
+        # patch to run remove pileup particles for preprocessing that include also the pileup particles 
+        # all vertices dataset used for PUPPI comparison
         if n_distinct_vp is not None and n_distinct_vp > 1:
             n_particles_before = int(
                 df_particles.lazy()
