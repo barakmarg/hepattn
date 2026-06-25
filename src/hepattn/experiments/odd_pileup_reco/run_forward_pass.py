@@ -94,7 +94,8 @@ CONFIG = '/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/
 # Evaluation dataset (all-vertices paper sample) — forward pass runs over the
 # first DATA_NUM_EVENTS events in this directory.
 #DATA_DIR = '/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper'
-DATA_DIR = '/storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_paper'
+#DATA_DIR = '/storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_paper'
+DATA_DIR = '/storage/agrp/barakma/PileupODD/data/ggf_pu200_all_vertices_paper'
 DATA_NUM_EVENTS = 10000
 
 
@@ -108,13 +109,13 @@ if __name__ == "__main__":
         config_path=CONFIG,
         data_dir=DATA_DIR,
         num_events=DATA_NUM_EVENTS,
-        batch_size=128,
+        batch_size=48,
         num_workers=8,
         accelerator="gpu",
         devices=1,
         inference_mode=True,
         events_per_file=1000,
-        test_suff="ttbar_pu200_ggf_finetune_paper",
+        test_suff="pu200_ggf_paper",
         predict_only=False,
     )
     print(f"Wrote {len(h5_paths)} shard(s):")
