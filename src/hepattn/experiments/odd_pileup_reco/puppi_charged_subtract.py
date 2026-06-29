@@ -62,6 +62,7 @@ def load_charged_subtract_events(
     event_stop: int | None = None,
     event_ids: list[int] | np.ndarray | None = None,
     events_per_file: int | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Load clusters + tracks + per-cluster charged-energy deps + HS particles.
 
@@ -184,7 +185,20 @@ def load_charged_subtract_events(
         iterator = _stream()
         total = None
 
+    import time as _time
+    _t_load0 = _time.time()
+    _n_loaded = 0
     for rows in iterator:
+        if verbose and (_n_loaded % 500 == 0) and _n_loaded > 0:
+            _dt = _time.time() - _t_load0
+            _rate = _n_loaded / max(_dt, 1e-9)
+            if total is not None:
+                _eta = (total - _n_loaded) / max(_rate, 1e-9)
+                print(f"    loaded {_n_loaded}/{total} events "
+                      f"({_rate:.0f} ev/s, ETA {_eta:.0f}s)", flush=True)
+            else:
+                print(f"    loaded {_n_loaded} events ({_rate:.0f} ev/s)", flush=True)
+        _n_loaded += 1
         row_c, row_t, row_p, row_d = rows
         assert row_c["event_id"] == row_t["event_id"] == \
                row_p["event_id"] == row_d["event_id"], \

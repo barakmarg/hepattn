@@ -149,11 +149,16 @@ def main() -> int:
     p.add_argument("--out-dir",
                    default="/storage/agrp/barakma/hepattn/src/hepattn/experiments/"
                            "odd_pileup_reco/optuna_puppi_charged_subtract")
-    p.add_argument("--study-name", default="puppi_charged_subtract_v1")
+    p.add_argument("--study-name", default="puppi_charged_subtract_v3_10k")
     p.add_argument("--no-subtract-pu", action="store_true", default=False,
                    help="If set, subtract only HS-charged (= puppi_perfect mode) for sanity check.")
     p.add_argument("--jet-algorithm", type=str, default="antikt", choices=["antikt", "kt"],
                    help="FastJet clustering algorithm (default anti-kT, LHC standard).")
+    p.add_argument("--seed-json", type=str, action="append", default=None,
+                   help="Path to a *_best.json (or any json with 'best_params'/"
+                        "'search_best_params'). Its params are enqueued as warm-start "
+                        "trials BEFORE the TPE search, so the optimiser starts from "
+                        "(and is anchored by) a known-good point. Repeatable.")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -166,22 +171,42 @@ def main() -> int:
         load_charged_subtract_events,
     )
 
-    print(f"Loading {args.n_events} search events ...", flush=True)
+    subtract_pu = not args.no_subtract_pu
+    print("=" * 72, flush=True)
+    print("  EXPERIMENT: PUPPI charged-subtract Optuna hyperparameter search", flush=True)
+    print("=" * 72, flush=True)
+    print(f"  study name        : {args.study_name}", flush=True)
+    print(f"  parquet dir       : {args.parquet_dir}", flush=True)
+    print(f"  jet clustering    : {args.jet_algorithm}  R={args.jet_R}  "
+          f"min_pt={args.min_pt}  min_const={args.min_constituents}  dr_cut={args.dr_cut}",
+          flush=True)
+    print(f"  PU charged subtract: {subtract_pu}  "
+          f"({'HS+PU' if subtract_pu else 'HS-only (puppi_perfect mode)'})", flush=True)
+    print(f"  search events     : {args.n_events}  (event_start=0)", flush=True)
+    print(f"  validation events : {args.n_validation_events}  "
+          f"(event_start={args.n_events}, held-out)", flush=True)
+    print(f"  n_trials          : {args.n_trials}    top-k validated: {args.top_k}", flush=True)
+    print(f"  out dir           : {args.out_dir}", flush=True)
+    print("=" * 72, flush=True)
+
+    print(f"\n[1/4] Loading {args.n_events} search events ...", flush=True)
+    _t = time.time()
     events = load_charged_subtract_events(
-        args.parquet_dir, event_start=0, event_stop=args.n_events,
+        args.parquet_dir, event_start=0, event_stop=args.n_events, verbose=True,
     )
-    print(f"  {len(events['node_pt'])} events, "
+    t_load_search = time.time() - _t
+    print(f"  {len(events['node_pt'])} events in {t_load_search:.0f}s, "
           f"tracks/ev mean = {np.mean([t.sum() for t in events['node_is_track']]):.0f}, "
           f"clusters/ev mean = "
           f"{np.mean([len(t) - t.sum() for t in events['node_is_track']]):.0f}",
           flush=True)
 
-    print(f"Clustering truth-HS jets (one-time, {args.jet_algorithm} R={args.jet_R}) ...",
+    print(f"\n[2/4] Clustering truth-HS jets (one-time, {args.jet_algorithm} R={args.jet_R}) ...",
           flush=True)
+    _t = time.time()
     truth = _cluster_truth(events, args)
-    print(f"  Truth jets total = {truth['n'].sum()}", flush=True)
-
-    subtract_pu = not args.no_subtract_pu
+    t_cluster_truth = time.time() - _t
+    print(f"  Truth jets total = {truth['n'].sum()}  ({t_cluster_truth:.0f}s)", flush=True)
 
     def objective(trial: optuna.Trial) -> float:
         params = {
@@ -211,10 +236,64 @@ def main() -> int:
         storage=f"sqlite:///{out_dir / (args.study_name + '.db')}",
         load_if_exists=True,
     )
+
+    # --- Optional warm start: enqueue known-good params before the search ---
+    if args.seed_json:
+        search_param_names = {
+            "R0", "rms_pt_min", "min_neutral_pt", "min_neutral_pt_slope",
+            "min_weight", "eta_max_extrap", "apply_lv_adjust",
+        }
+        for sj in args.seed_json:
+            blob = json.loads(Path(sj).read_text())
+            seed_params = blob.get("best_params") or blob.get("search_best_params")
+            if not seed_params:
+                print(f"  [warm-start] WARNING: no params found in {sj}, skipping.", flush=True)
+                continue
+            seed_params = {k: v for k, v in seed_params.items() if k in search_param_names}
+            study.enqueue_trial(seed_params, skip_if_exists=True)
+            print(f"  [warm-start] enqueued trial from {Path(sj).name}: {seed_params}",
+                  flush=True)
+
+    def _fmt_hms(s: float) -> str:
+        s = int(round(s))
+        h, r = divmod(s, 3600)
+        m, sec = divmod(r, 60)
+        return f"{h:d}h{m:02d}m{sec:02d}s" if h else f"{m:d}m{sec:02d}s"
+
+    print(f"\n[3/4] Running TPE search: {args.n_trials} trials on {args.n_events} events ...",
+          flush=True)
+    print("      (per-trial ETA appears after the first trial completes)", flush=True)
+
     t0 = time.time()
-    study.optimize(objective, n_trials=args.n_trials, show_progress_bar=False)
+    n_target = args.n_trials
+
+    def _progress_cb(study_, trial_):
+        done = trial_.number + 1
+        elapsed = time.time() - t0
+        per_trial = elapsed / max(1, done)
+        remaining = max(0, n_target - done)
+        eta = per_trial * remaining
+        best = study_.best_value if study_.best_trial is not None else float("nan")
+        # One time, after the first trial: project total wall-clock for the full run.
+        if done == 1:
+            # search = n_trials * per_trial; validation ≈ top_k trials on
+            # n_validation_events (cost scales ~ with event count vs search).
+            val_load = t_load_search * (args.n_validation_events / max(1, args.n_events))
+            val_eval = per_trial * args.top_k * (args.n_validation_events / max(1, args.n_events))
+            full = per_trial * n_target + val_load + val_eval
+            print(f"      ~{per_trial:.1f}s/trial  =>  EST. FULL RUN "
+                  f"~{_fmt_hms(full)} "
+                  f"(search ~{_fmt_hms(per_trial * n_target)}, "
+                  f"validation ~{_fmt_hms(val_load + val_eval)})", flush=True)
+        if done % 10 == 0 or done == n_target:
+            print(f"      trial {done:>4d}/{n_target}  "
+                  f"val={trial_.value:.4f}  best={best:.4f}  "
+                  f"elapsed={_fmt_hms(elapsed)}  ETA={_fmt_hms(eta)}", flush=True)
+
+    study.optimize(objective, n_trials=args.n_trials, show_progress_bar=False,
+                   callbacks=[_progress_cb])
     elapsed = time.time() - t0
-    print(f"\nDone: {len(study.trials)} trials in {elapsed:.0f}s "
+    print(f"\nDone: {len(study.trials)} trials in {_fmt_hms(elapsed)} "
           f"({elapsed/max(1,len(study.trials)):.1f}s/trial)")
 
     # --- Search-best summary ---
@@ -232,12 +311,13 @@ def main() -> int:
                  and t.value is not None and t.value < 1e5]
     completed.sort(key=lambda t: t.value)
     top = completed[:args.top_k]
-    print(f"\nLoading {args.n_validation_events} validation events "
+    print(f"\n[4/4] Loading {args.n_validation_events} validation events "
           f"(event_start={args.n_events}) ...", flush=True)
     val_events = load_charged_subtract_events(
         args.parquet_dir,
         event_start=args.n_events,
         event_stop=args.n_events + args.n_validation_events,
+        verbose=True,
     )
     print(f"  {len(val_events['node_pt'])} validation events loaded.", flush=True)
     print(f"Clustering validation truth-HS jets ...", flush=True)

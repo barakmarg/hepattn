@@ -80,8 +80,8 @@ from hepattn.experiments.odd_pileup_reco.run_puppi_jet_resolution_charged_subtra
 
 # PUPPI parquet source: the all-vertices "paper" sample the H5 was generated from
 # (the chunked dir does NOT contain these events).
-DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper"
-#DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_paper"
+#DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper"
+DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_paper"
 # PUPPI optuna params (v2, anti-kT R=0.4 tuning).
 DEFAULT_BEST_JSON = (
     "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/"
@@ -103,7 +103,7 @@ FEAT_BINS = [
     np.linspace(-4.0, 4.0, 70),        # eta
     np.linspace(-np.pi, np.pi, 70),    # phi
 ]
-FEAT_LABELS = ["pt [GeV]", "eta", "phi [rad]"]
+FEAT_LABELS = [r"$p_T$ [GeV]", r"$\eta$", r"$\phi$ [rad]"]
 FEAT_ROWS = ["All", "Charged", "Neutral"]
 NPART_PT_BINS = (0.0, 2.0, 5.0, 10.0, 20.0, 50.0, 200.0)   # 0-1 and 1-2 merged into 0-2
 CALO_E_BINS = np.logspace(np.log10(0.05), np.log10(2000.0), 60)
@@ -118,6 +118,8 @@ RESP_BINS = np.linspace(0.0, 4.0, 201)                   # pred_pT / truth_pT ra
 JET_PT_BINS = np.logspace(np.log10(10.0), np.log10(600.0), 13)   # jet matching eff/fake bins
 DPTREL_BINS = np.linspace(-1.0, 2.0, 151)    # (reco-truth)/truth, per-class residual figure
 DANG_BINS = np.linspace(-0.25, 0.25, 151)    # delta-eta / delta-phi, per-class residual figure
+# Jet-vs-pT bin edges for the binned/IQR/box jet figures (300-500-inf merged into 300-inf).
+JET_RES_PT_EDGES = (10.0, 20.0, 50.0, 90.0, 150.0, 300.0, float("inf"))
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +287,8 @@ def _per_class_counts(data: dict) -> dict:
     eff_reco = np.zeros((N_CLASSES, npt), dtype=np.int64)
     eff_correct = np.zeros((N_CLASSES, npt), dtype=np.int64)
     resp = np.zeros((N_CLASSES, npt, nr), dtype=np.int64)
+    fake_pred_n = np.zeros((N_CLASSES, npt), dtype=np.int64)    # predicted class c, by PRED pT
+    fake_wrong_n = np.zeros((N_CLASSES, npt), dtype=np.int64)   # ... whose truth class != c (fake/misID)
 
     # Confusion (rows = truth class, cols = pred class with null mapped to col 5).
     sel = tv
@@ -294,6 +298,10 @@ def _per_class_counts(data: dict) -> dict:
     inpt = (ptbin >= 0) & (ptbin < npt)
     sel_pt = tv & inpt
     np.add.at(conf_pt, (tc[sel_pt], np.clip(pc[sel_pt], 0, N_CLASSES), ptbin[sel_pt]), 1)
+
+    # Fake rate is over PREDICTED objects, binned by PREDICTED pT.
+    pred_ptbin = np.digitize(ppt, PERF_PT_BINS) - 1
+    pinpt = (pred_ptbin >= 0) & (pred_ptbin < npt)
     for c in range(N_CLASSES):
         cm = tv & (tc == c) & inpt
         eff_denom[c] = np.bincount(ptbin[cm], minlength=npt)[:npt]
@@ -305,9 +313,13 @@ def _per_class_counts(data: dict) -> dict:
             pb = ptbin[rsel]
             ok = (rb >= 0) & (rb < nr)
             np.add.at(resp[c], (pb[ok], rb[ok]), 1)
+        psel = pv & (pc == c) & pinpt
+        fake_pred_n[c] = np.bincount(pred_ptbin[psel], minlength=npt)[:npt]
+        fake_wrong_n[c] = np.bincount(pred_ptbin[psel & (tc != c)], minlength=npt)[:npt]
 
     return {"conf": conf, "conf_pt": conf_pt, "eff_denom": eff_denom,
-            "eff_reco": eff_reco, "eff_correct": eff_correct, "resp": resp}
+            "eff_reco": eff_reco, "eff_correct": eff_correct, "resp": resp,
+            "fake_pred_n": fake_pred_n, "fake_wrong_n": fake_wrong_n}
 
 
 def _class_residual_counts(data: dict) -> dict:
@@ -493,8 +505,8 @@ def _pct_bins(d: np.ndarray, n: int, positive: bool = False) -> np.ndarray:
 
 # Jet-resolution panels: key -> (xlabel, fixed bins | None, density?, log-y?)
 JET_PANELS = {
-    "deta": (r"Jet $\Delta\eta$", np.linspace(-0.2, 0.2, 50), True, False),
-    "dphi": (r"Jet $\Delta\phi$", np.linspace(-0.2, 0.2, 50), True, False),
+    "deta": (r"Jet $\Delta\eta$", np.linspace(-0.15, 0.15, 50), True, False),
+    "dphi": (r"Jet $\Delta\phi$", np.linspace(-0.15, 0.15, 50), True, False),
     "nconst": ("Jet # Constituents", None, True, False),
     "dpt": (r"Jet absolute $\Delta p_T$ [GeV]", None, True, False),
     "dpt_over_truth": (r"Jet relative $\Delta p_T / p_T^{\mathrm{Target}}$", np.linspace(-1.0, 4.0, 110), False, True),
@@ -502,7 +514,7 @@ JET_PANELS = {
 }
 
 
-def _draw_jet_panel(ax, merged: dict, key: str) -> None:
+def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11) -> None:
     """Draw one jet-resolution panel onto ``ax`` (shared by the 3x2 grid and the
     standalone single-panel figures so they stay identical)."""
     from scipy.stats import iqr
@@ -578,9 +590,12 @@ def _draw_jet_panel(ax, merged: dict, key: str) -> None:
     else:
         ylo, yhi = ax.get_ylim()
         ax.set_ylim(ylo, yhi * 1.5)
+    if key in ("deta", "dphi"):
+        ax.set_xlim(-0.15, 0.15)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Density" if density else "Count")
-    ax.legend(fontsize=8, loc="upper right", framealpha=0.9)
+    ax.legend(fontsize=legend_fontsize, loc="upper right", framealpha=0.9,
+              markerscale=1.6, handlelength=2.2)
 
 
 def _plot_jet_resolution(merged: dict):
@@ -597,7 +612,7 @@ def _plot_jet_resolution(merged: dict):
 def _plot_jet_single(merged: dict, key: str):
     """Standalone single-panel version of one jet-resolution distribution."""
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
-    _draw_jet_panel(ax, merged, key)
+    _draw_jet_panel(ax, merged, key, legend_fontsize=14)
     fig.tight_layout()
     return fig
 
@@ -605,7 +620,7 @@ def _plot_jet_single(merged: dict, key: str):
 def _plot_jet_iqr_binned(methods):
     """IQR vs truth-jet-pT for the three residuals (the IQR row of the binned
     figure on its own), GLOW-UP vs PUPPI."""
-    edges = PT_BIN_EDGES
+    edges = JET_RES_PT_EDGES
     centers = np.arange(len(edges) - 1)
     labels_x = [
         f"[{int(edges[i])},{('∞' if np.isinf(edges[i + 1]) else int(edges[i + 1]))})"
@@ -636,6 +651,62 @@ def _plot_jet_iqr_binned(methods):
     return fig
 
 
+def _plot_jet_residual_boxes(methods):
+    """Jet residuals as box-per-pT-bin, GLOW-UP & PUPPI. The per-bin jet count is
+    annotated on top of each box (N=...)."""
+    edges = JET_RES_PT_EDGES
+    nbin = len(edges) - 1
+    labels_x = [
+        f"[{int(edges[i])},{('∞' if np.isinf(edges[i + 1]) else int(edges[i + 1]))})"
+        for i in range(nbin)
+    ]
+    residual_keys = [
+        ("dpt_over_truth", r"Jet $\Delta p_T / p_T^{\mathrm{Target}}$", (-1.0, 1.2)),
+        ("deta", r"Jet $\Delta\eta$", (-0.15, 0.15)),
+        ("dphi", r"Jet $\Delta\phi$", (-0.15, 0.15)),
+    ]
+    method_colors = {GLOWUP: GLOWUP_COLOR, PUPPI_LABEL: PUPPI_COLOR}
+    offsets = {0: -0.2, 1: 0.2}
+    width = 0.32
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
+    for col, (key, ylab, ylim) in enumerate(residual_keys):
+        ax = axes[col]
+        trans = ax.get_xaxis_transform()
+        for mi, (label, res) in enumerate(methods):
+            vals = np.asarray(res.get(key, []), dtype=float)
+            tpt = np.asarray(res.get("truth_pt", []), dtype=float)
+            if vals.size == 0:
+                continue
+            idx = np.digitize(tpt, edges) - 1
+            pb = [vals[(idx == b) & np.isfinite(vals)] for b in range(nbin)]
+            counts = [v.size for v in pb]
+            data = [v if v.size else np.array([np.nan]) for v in pb]
+            off = offsets.get(mi, 0.0)
+            bx = ax.boxplot(data, positions=np.arange(nbin) + off, widths=width,
+                            patch_artist=True, showfliers=False, medianprops={"color": "black"})
+            for b in bx["boxes"]:
+                b.set_facecolor(method_colors.get(label, "gray"))
+                b.set_alpha(0.65)
+            for b in range(nbin):
+                if counts[b] > 0:
+                    ax.text(b + off, 0.985, f"N={counts[b]:,}", transform=trans, rotation=90,
+                            va="top", ha="center", fontsize=11, color=method_colors.get(label, "gray"))
+        if ylim:
+            ax.set_ylim(*ylim)
+        ax.axhline(0.0, color="gray", lw=1, ls=":")
+        ax.set_ylabel(ylab)
+        ax.set_xlabel(r"truth jet $p_T$ bin [GeV]")
+        ax.set_xticks(np.arange(nbin))
+        ax.set_xticklabels(labels_x, rotation=30, ha="right")
+        ax.grid(True, axis="y", alpha=0.3)
+    handles = [plt.Rectangle((0, 0), 1, 1, facecolor=method_colors[m], alpha=0.65, label=m)
+               for m, _ in methods]
+    axes[0].legend(handles=handles, fontsize=10, loc="lower left")
+    fig.suptitle(rf"Jet residual box plots vs truth $p_T$ (N = jets per bin): {GLOWUP} vs {PUPPI_LABEL}", y=1.02)
+    fig.tight_layout()
+    return fig
+
+
 def _plot_track_f1_from_counts(track: dict):
     edges = TRACK_PT_BINS
     centers = np.sqrt(edges[:-1] * edges[1:])
@@ -651,7 +722,7 @@ def _plot_track_f1_from_counts(track: dict):
     ax.errorbar(centers, f1, yerr=err, fmt="o-", capsize=3, color="steelblue")
     ax.axhline(1.0, color="gray", lw=1, ls="--")
     ax.set_xscale("log")
-    ax.set_xlabel("Track pT [GeV]")
+    ax.set_xlabel(r"Track $p_T$ [GeV]")
     ax.set_ylabel("F1 Score")
     ax.set_ylim(0, 1.1)
     ax.set_title("Track F1 vs pT")
@@ -661,25 +732,38 @@ def _plot_track_f1_from_counts(track: dict):
 
 
 def _plot_n_particles_from_counts(npart_truth: np.ndarray, npart_pred: np.ndarray):
-    n_panels = len(NPART_PT_BINS) - 1
-    n_cols = 2
-    n_rows = int(np.ceil(n_panels / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 3.8 * n_rows), squeeze=False)
-    axes_flat = axes.ravel()
-    for i in range(n_panels):
-        ax = axes_flat[i]
-        tcol, pcol = npart_truth[:, i], npart_pred[:, i]
-        max_count = max(1, int(tcol.max(initial=0)), int(pcol.max(initial=0)))
-        bins = np.arange(-0.5, max_count + 1.5, 1.0)
-        ax.hist(tcol, bins=bins, histtype="stepfilled", alpha=0.5, label=TARGET, color=TARGET_COLOR)
-        ax.hist(pcol, bins=bins, histtype="step", label=GLOWUP, color=GLOWUP_COLOR)
-        ax.set_title(f"{NPART_PT_BINS[i]:g} <= pt < {NPART_PT_BINS[i + 1]:g} GeV")
-        ax.set_xlabel("Particles / event")
-        ax.set_ylabel("Events")
-        ax.legend(fontsize=8)
-    for ax in axes_flat[n_panels:]:
-        ax.axis("off")
-    fig.suptitle(f"Particle multiplicity per event by pt bin ({GLOWUP} vs {TARGET})", y=1.01)
+    """Per-event particle multiplicity per pT bin as grouped box plots
+    (Target vs GLOW-UP), one pair of boxes per pT bin."""
+    n_bins = len(NPART_PT_BINS) - 1
+    bin_labels = [
+        f"{NPART_PT_BINS[i]:g}-{NPART_PT_BINS[i + 1]:g}" for i in range(n_bins)
+    ]
+    fig, ax = plt.subplots(figsize=(1.6 * n_bins + 3, 5.5))
+    width = 0.32
+    pos = np.arange(n_bins)
+    box_t = ax.boxplot([npart_truth[:, i] for i in range(n_bins)],
+                       positions=pos - width / 2 - 0.02, widths=width, patch_artist=True,
+                       showfliers=False, medianprops={"color": "black"})
+    box_p = ax.boxplot([npart_pred[:, i] for i in range(n_bins)],
+                       positions=pos + width / 2 + 0.02, widths=width, patch_artist=True,
+                       showfliers=False, medianprops={"color": "black"})
+    for b in box_t["boxes"]:
+        b.set_facecolor(TARGET_COLOR)
+        b.set_alpha(0.7)
+    for b in box_p["boxes"]:
+        b.set_facecolor(GLOWUP_COLOR)
+        b.set_alpha(0.7)
+    ax.set_xticks(pos)
+    ax.set_xticklabels(bin_labels)
+    ax.set_xlabel(r"Particle $p_T$ bin [GeV]")
+    ax.set_ylabel("Particles / event")
+    ax.set_title(f"Particle multiplicity per event by $p_T$ bin ({GLOWUP} vs {TARGET})")
+    ax.grid(True, axis="y", alpha=0.3)
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=TARGET_COLOR, alpha=0.7, label=TARGET),
+        plt.Rectangle((0, 0), 1, 1, facecolor=GLOWUP_COLOR, alpha=0.7, label=GLOWUP),
+    ]
+    ax.legend(handles=handles, fontsize=11)
     fig.tight_layout()
     return fig
 
@@ -692,19 +776,21 @@ def _plot_feature_scatter_from_hist(feat_hist: np.ndarray):
             h = feat_hist[j, i]
             edges = FEAT_BINS[i]
             if h.sum() > 0:
-                ax.pcolormesh(edges, edges, np.ma.masked_where(h.T == 0, h.T),
-                              norm=LogNorm(vmin=1), cmap="viridis")
+                im = ax.pcolormesh(edges, edges, np.ma.masked_where(h.T == 0, h.T),
+                                   norm=LogNorm(vmin=1), cmap="viridis")
                 lo, hi = edges[0], edges[-1]
                 ax.plot([lo, hi], [lo, hi], ls="--", color="red", lw=1.0)
-                ax.text(0.03, 0.97, f"n={int(h.sum())}", transform=ax.transAxes,
+                ax.text(0.03, 0.97, f"n={int(h.sum()):,}", transform=ax.transAxes,
                         va="top", ha="left", fontsize=8, color="white",
                         bbox={"facecolor": "black", "alpha": 0.35, "pad": 2})
+                cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label("counts (log scale)", fontsize=8)
             else:
                 ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
             ax.set_xlabel(f"{TARGET} {FEAT_LABELS[i]}")
             ax.set_ylabel(f"{GLOWUP} {FEAT_LABELS[i]}")
             ax.set_title(FEAT_ROWS[j])
-    fig.suptitle(f"Feature density (hist2d): {TARGET} vs {GLOWUP}", y=1.01)
+    fig.suptitle(f"Feature density (hist2d, log color scale): {TARGET} vs {GLOWUP}", y=1.01)
     fig.tight_layout()
     return fig
 
@@ -717,7 +803,7 @@ def _plot_calo_recall_from_counts(calo: dict):
     use_hs = "hs_truth" in calo and calo["hs_truth"].sum() > 0
     truth = (calo["hs_truth"] if use_hs else calo["truth"]).astype(float)
     rec = (calo["hs_recovered"] if use_hs else calo["recovered"]).astype(float)
-    xlabel = "HS energy in cluster [GeV]" if use_hs else "calorimeter cluster energy [GeV]"
+    xlabel = "HS energy in cluster [GeV]" if use_hs else "Calorimeter cluster energy [GeV]"
 
     def _ratio_err(num, den):
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -739,7 +825,7 @@ def _plot_calo_recall_from_counts(calo: dict):
     if use_hs:
         ax.set_xlim(left=0.15)   # clip sub-threshold (degenerate) HS-energy bins
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("fraction")
+    ax.set_ylabel("Fraction")
     ax.set_ylim(0, 1.1)
     ax.set_title(f"{GLOWUP} pileup removal: recall & precision vs cluster HS energy")
     ax.grid(True, which="both", alpha=0.3)
@@ -752,12 +838,12 @@ def _plot_calo_e_dist_from_hist(calo: dict):
     edges = CALO_E_BINS
     truth, pred = calo["truth"].astype(float), calo["pred"].astype(float)
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.stairs(truth, edges, color=TARGET_COLOR, linewidth=2.0, label=f"{TARGET} (truth HS)  n={int(truth.sum())}")
-    ax.stairs(pred, edges, color=GLOWUP_COLOR, linewidth=2.0, label=f"{GLOWUP} (pred HS)  n={int(pred.sum())}")
+    ax.stairs(truth, edges, color=TARGET_COLOR, linewidth=2.0, label=f"{TARGET} (truth HS)  n={int(truth.sum()):,}")
+    ax.stairs(pred, edges, color=GLOWUP_COLOR, linewidth=2.0, label=f"{GLOWUP} (pred HS)  n={int(pred.sum()):,}")
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("calorimeter cluster energy [GeV]")
-    ax.set_ylabel("clusters")
+    ax.set_xlabel("Calorimeter cluster energy [GeV]")
+    ax.set_ylabel("Clusters")
     ax.set_title("Calorimeter cluster energy in pileup removal: pred vs truth HS")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
@@ -882,35 +968,62 @@ def _plot_class_efficiency(pc: dict):
     return fig
 
 
+def _plot_class_fake_rate_vs_pt(pc: dict):
+    """Per-class fake rate vs predicted pT: predicted-class-c objects whose truth
+    class != c (fakes / mis-ID) divided by all predicted class c, per pred-pT bin."""
+    den = pc["fake_pred_n"].astype(float)
+    num = pc["fake_wrong_n"].astype(float)
+    centers = _perf_pt_centers()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for c in range(N_CLASSES):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            fr = np.where(den[c] > 0, num[c] / den[c], np.nan)
+            err = np.where(den[c] > 0, np.sqrt(np.clip(fr * (1 - fr), 0, None) / np.where(den[c] > 0, den[c], 1)), np.nan)
+        ax.errorbar(centers, fr, yerr=err, marker="o", capsize=2, color=CLASS_COLORS[c], label=CLASS_LABELS[c])
+    ax.set_xscale("log")
+    ax.set_ylim(0, 1.05)
+    ax.set_xlabel(r"Pred $p_T$ [GeV]")
+    ax.set_ylabel("Fake rate")
+    ax.set_title(f"{GLOWUP} per-class fake rate vs $p_T$")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
 def _plot_class_residuals(pc: dict):
-    """Per-class GLOW-UP kinematic residuals: rows = class, cols = (dpT/pT, deta, dphi)."""
+    """GLOW-UP kinematic residuals grouped Charged / Neutral, overlaying the
+    classes as normalized (density) step histograms. Rows = Charged / Neutral,
+    cols = (dpT/pT, deta, dphi)."""
     cols = [
         ("res_dptrel", DPTREL_BINS, r"$(p_T^{\mathrm{reco}} - p_T^{\mathrm{truth}}) / p_T^{\mathrm{truth}}$"),
         ("res_deta", DANG_BINS, r"$\eta^{\mathrm{reco}} - \eta^{\mathrm{truth}}$"),
         ("res_dphi", DANG_BINS, r"$\phi^{\mathrm{reco}} - \phi^{\mathrm{truth}}$"),
     ]
+    groups = [("Charged", [0, 1, 2]), ("Neutral", [3, 4])]   # class indices
     truth_n = pc["res_truth_n"]
-    fig, axes = plt.subplots(N_CLASSES, 3, figsize=(15, 3.0 * N_CLASSES), squeeze=False)
-    for r in range(N_CLASSES):
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8), squeeze=False)
+    for gi, (gname, classes) in enumerate(groups):
         for ci, (key, bins, xlab) in enumerate(cols):
-            ax = axes[r][ci]
-            h = pc[key][r].astype(float)
-            if h.sum() > 0:
+            ax = axes[gi][ci]
+            for c in classes:
+                h = pc[key][c].astype(float)
+                if h.sum() <= 0:
+                    continue
                 med = _hist_percentile(h, bins, 50)
                 iqrv = _hist_percentile(h, bins, 75) - _hist_percentile(h, bins, 25)
-                f = pc["res_n"][r] / truth_n[r] if truth_n[r] > 0 else np.nan
-                ax.stairs(h, bins, color=GLOWUP_COLOR, linewidth=1.8, fill=True, alpha=0.35)
-                ax.stairs(h, bins, color=GLOWUP_COLOR, linewidth=1.8,
-                          label=f"{GLOWUP} (M={med:.3f}, IQR={iqrv:.3f}, f={f:.3f})")
-                ax.legend(fontsize=8)
-            else:
-                ax.text(0.5, 0.5, "no entries", ha="center", va="center", transform=ax.transAxes)
+                f = pc["res_n"][c] / truth_n[c] if truth_n[c] > 0 else np.nan
+                widths = np.diff(bins)
+                dens = h / (h.sum() * widths)     # normalize to unit area
+                ax.stairs(dens, bins, color=CLASS_COLORS[c], linewidth=1.8,
+                          label=f"{CLASS_LABELS[c]} (M={med:.3f}, IQR={iqrv:.3f}, f={f:.3f})")
             ax.set_xlabel(xlab)
             ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
             if ci == 0:
-                ax.set_ylabel("Particles")
+                ax.set_ylabel(f"{gname}\nDensity")
             if ci == 1:
-                ax.set_title(CLASS_LABELS[r])
+                ax.set_title(gname)
     fig.suptitle(f"{GLOWUP} per-class kinematic residuals (matched objects)", y=1.005)
     fig.tight_layout()
     return fig
@@ -962,8 +1075,9 @@ def render_all(merged: dict) -> dict:
     methods = [(GLOWUP, merged["glow_res"]), (PUPPI_LABEL, merged["puppi_res"])]
     figs = {
         "jet_resolution": _plot_jet_resolution(merged),
-        "jet_resolution_binned": _make_binned_plots(methods),
+        "jet_resolution_binned": _make_binned_plots(methods, edges=JET_RES_PT_EDGES),
         "jet_resolution_iqr_binned": _plot_jet_iqr_binned(methods),
+        "jet_residual_boxes": _plot_jet_residual_boxes(methods),
         # Same panels as jet_resolution, each as its own standalone figure.
         "jet_relative_pt": _plot_jet_single(merged, "dpt_over_truth"),
         "jet_delta_eta": _plot_jet_single(merged, "deta"),
@@ -986,6 +1100,8 @@ def render_all(merged: dict) -> dict:
         figs["class_pt_resolution"] = _plot_class_pt_resolution(pc)
         figs["class_efficiency_vs_pt"] = _plot_class_efficiency(pc)
         figs["class_f1_vs_pt"] = _plot_class_f1_vs_pt(pc)
+        if "fake_pred_n" in pc:
+            figs["class_fake_rate_vs_pt"] = _plot_class_fake_rate_vs_pt(pc)
         if "res_truth_n" in pc:
             figs["class_residuals"] = _plot_class_residuals(pc)
     return figs
