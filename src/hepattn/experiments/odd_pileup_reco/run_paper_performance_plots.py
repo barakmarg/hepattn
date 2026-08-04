@@ -9,6 +9,10 @@ Produces the paper figure set from one or more prediction-writer H5 shards
   2. jet_resolution_binned     — mean & IQR vs Target jet pT, GLOW-UP vs PUPPI
   3. track_f1_vs_pt            — track-classifier F1 vs pT
   4. n_particles_by_pt_bin     — per-event multiplicity by pT bin (GLOW-UP/Target)
+  4b. class_counts_*           — per-class particle counts (bar chart, log y),
+                                 GLOW-UP vs Target; nocut / pt0p5 / pt1 / pt2
+  4c. class_pt_spectrum        — per-class particle pT spectrum (count vs pT, log-log),
+                                 GLOW-UP (solid) vs Target (dashed), 5 classes
   5. feature_scatter           — pT/eta/phi density, GLOW-UP vs Target
   6. calo_recall_vs_pt         — HS cluster recall vs cluster energy
   7. calo_pred_vs_truth_e_dist — per-cluster energy, pred-HS vs truth-HS
@@ -53,6 +57,41 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+# Enlarge all plot text, with the biggest bump on the axis labels (bottom) and
+# titles (top). Legends set an explicit fontsize per-plot and are unaffected here.
+matplotlib.rcParams["axes.labelsize"] = 17.0    # x/y axis labels (bottom/side)
+matplotlib.rcParams["axes.titlesize"] = 18.0    # per-axes title (top)
+matplotlib.rcParams["figure.titlesize"] = 19.0  # fig.suptitle
+matplotlib.rcParams["xtick.labelsize"] = 15.0
+matplotlib.rcParams["ytick.labelsize"] = 15.0
+matplotlib.rcParams["legend.fontsize"] = 13.0   # only legends without an explicit size
+
+# Grid on every figure, but only at the MAJOR ticks (minor ticks stay bare).
+# Set here rather than per-plot: there are no explicit ax.grid() calls any more,
+# so this is the single switch for all figures.
+matplotlib.rcParams["axes.grid"] = True
+matplotlib.rcParams["axes.grid.which"] = "major"
+matplotlib.rcParams["axes.grid.axis"] = "both"
+matplotlib.rcParams["grid.alpha"] = 0.3
+matplotlib.rcParams["grid.linestyle"] = "-"
+matplotlib.rcParams["grid.linewidth"] = 0.8
+
+# HEP publication tick style: inward ticks on all four sides, plus minor ticks.
+matplotlib.rcParams["xtick.direction"] = "in"
+matplotlib.rcParams["ytick.direction"] = "in"
+matplotlib.rcParams["xtick.top"] = True
+matplotlib.rcParams["ytick.right"] = True
+matplotlib.rcParams["xtick.minor.visible"] = True
+matplotlib.rcParams["ytick.minor.visible"] = True
+matplotlib.rcParams["xtick.major.size"] = 7.0
+matplotlib.rcParams["ytick.major.size"] = 7.0
+matplotlib.rcParams["xtick.minor.size"] = 3.5
+matplotlib.rcParams["ytick.minor.size"] = 3.5
+matplotlib.rcParams["xtick.major.width"] = 1.1
+matplotlib.rcParams["ytick.major.width"] = 1.1
+matplotlib.rcParams["xtick.minor.width"] = 0.8
+matplotlib.rcParams["ytick.minor.width"] = 0.8
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -80,8 +119,8 @@ from hepattn.experiments.odd_pileup_reco.run_puppi_jet_resolution_charged_subtra
 
 # PUPPI parquet source: the all-vertices "paper" sample the H5 was generated from
 # (the chunked dir does NOT contain these events).
-#DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper"
-DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_paper"
+DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper"
+#DEFAULT_PARQUET_DIR = "/storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_paper"
 # PUPPI optuna params (v2, anti-kT R=0.4 tuning).
 DEFAULT_BEST_JSON = (
     "/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/"
@@ -91,13 +130,14 @@ DEFAULT_BEST_JSON = (
 # ── Paper labels & palette ────────────────────────────────────────────────
 GLOWUP = "GLOW-UP"
 TARGET = "Target"
-PUPPI_LABEL = "PUPPI"
+PUPPI_LABEL = "PUPPI (truth-assisted)"
 GLOWUP_COLOR = "tomato"
 TARGET_COLOR = "darkorange"
 PUPPI_COLOR = "seagreen"
 
 # ── Fixed bin edges (kept constant so per-shard partials are mergeable) ─────
 TRACK_PT_BINS = np.logspace(np.log10(0.3), np.log10(200), 25)            # 24 bins
+PR_SCORE_BINS = np.linspace(0.0, 1.0, 1001)   # 1000 bins for the threshold-free track PR/AP curve
 FEAT_BINS = [
     np.linspace(0.0, 200.0, 70),       # pt
     np.linspace(-4.0, 4.0, 70),        # eta
@@ -114,6 +154,9 @@ PARQUET_EVENTS_PER_FILE = 100   # event_ids per parquet shard file (NNNNN = eid 
 # ── Per-particle-class performance (assumes MATCHED objects: predict_only=False) ─
 N_CLASSES = 5                                            # real classes 0..4 (5 = null)
 PERF_PT_BINS = np.logspace(np.log10(1.0), np.log10(500.0), 16)   # 15 truth-pT bins
+CLASS_PT_DIST_BINS = np.logspace(np.log10(0.1), np.log10(500.0), 61)   # per-class truth-pT spectrum
+# Per-class particle counts (bar chart, GLOW-UP vs Target), one figure per pT cut.
+CLASS_COUNT_PT_CUTS = (0.0, 0.5, 1.0, 2.0)   # >0 GeV (no cut), >0.5 GeV, >1 GeV, >2 GeV
 RESP_BINS = np.linspace(0.0, 4.0, 201)                   # pred_pT / truth_pT ratio
 JET_PT_BINS = np.logspace(np.log10(10.0), np.log10(600.0), 13)   # jet matching eff/fake bins
 DPTREL_BINS = np.linspace(-1.0, 2.0, 151)    # (reco-truth)/truth, per-class residual figure
@@ -163,13 +206,63 @@ def _npart_counts(data: dict) -> tuple[np.ndarray, np.ndarray]:
     return nt, npr
 
 
+def _class_count_by_cut(data: dict) -> dict:
+    """Per-class particle counts at each pT cut, Target (truth) vs GLOW-UP (pflow).
+
+    A slot is a real particle of class c when class == c (< N_CLASSES; null = 5 is
+    dropped), matching the ``tv``/``pv`` convention in ``_per_class_counts``. Returns
+    (N_CLASSES, n_cuts) count arrays: entry [c, k] = # class-c particles with
+    pT > CLASS_COUNT_PT_CUTS[k]. Directly summable across shards.
+    """
+    tc = np.asarray(data["truth_class"]).ravel()
+    pc = np.asarray(data["pflow_class"]).ravel()
+    tpt = np.asarray(data["truth_ptetaphi"][..., 0]).ravel()
+    ppt = np.asarray(data["pflow_ptetaphi"][..., 0]).ravel()
+    ncut = len(CLASS_COUNT_PT_CUTS)
+    truth = np.zeros((N_CLASSES, ncut), dtype=np.int64)
+    pflow = np.zeros((N_CLASSES, ncut), dtype=np.int64)
+    for c in range(N_CLASSES):
+        tm = (tc == c) & np.isfinite(tpt)
+        pm = (pc == c) & np.isfinite(ppt)
+        for k, cut in enumerate(CLASS_COUNT_PT_CUTS):
+            truth[c, k] = int((tm & (tpt > cut)).sum())
+            pflow[c, k] = int((pm & (ppt > cut)).sum())
+    return {"truth": truth, "pflow": pflow}
+
+
+def _class_pt_spectrum(data: dict) -> dict:
+    """Per-class particle pT spectrum (count vs pT), Target (truth) vs GLOW-UP (pflow).
+
+    Returns (N_CLASSES, nbins) count arrays over CLASS_PT_DIST_BINS for each source
+    (real classes only; null = 5 dropped). Directly summable across shards.
+    """
+    tc = np.asarray(data["truth_class"]).ravel()
+    pc = np.asarray(data["pflow_class"]).ravel()
+    tpt = np.asarray(data["truth_ptetaphi"][..., 0]).ravel()
+    ppt = np.asarray(data["pflow_ptetaphi"][..., 0]).ravel()
+    nb = len(CLASS_PT_DIST_BINS) - 1
+    truth = np.zeros((N_CLASSES, nb), dtype=np.int64)
+    pflow = np.zeros((N_CLASSES, nb), dtype=np.int64)
+    for c in range(N_CLASSES):
+        tm = (tc == c) & np.isfinite(tpt)
+        pm = (pc == c) & np.isfinite(ppt)
+        truth[c] = np.histogram(tpt[tm], bins=CLASS_PT_DIST_BINS)[0]
+        pflow[c] = np.histogram(ppt[pm], bins=CLASS_PT_DIST_BINS)[0]
+    return {"truth": truth, "pflow": pflow}
+
+
 def _track_counts(track_data: dict) -> dict:
     nb = len(TRACK_PT_BINS) - 1
+    nps = len(PR_SCORE_BINS) - 1
     out = {k: np.zeros(nb, dtype=np.int64) for k in ("tp", "fp", "fn", "total")}
+    # Score histograms split by truth label feed the threshold-free PR/AP curve.
+    out["score_pos"] = np.zeros(nps, dtype=np.int64)
+    out["score_neg"] = np.zeros(nps, dtype=np.int64)
     probs = track_data.get("probs")
     if probs is None or len(probs) == 0:
         return out
-    is_pred = np.asarray(probs) > 0.5
+    probs = np.asarray(probs, dtype=float)
+    is_pred = probs > 0.5
     is_true = np.asarray(track_data["truth"]) == 1
     pt = np.asarray(track_data["pt"])
     idx = np.digitize(pt, TRACK_PT_BINS) - 1
@@ -178,6 +271,8 @@ def _track_counts(track_data: dict) -> dict:
     out["fp"] = np.bincount(idx[inb & is_pred & ~is_true], minlength=nb)[:nb]
     out["fn"] = np.bincount(idx[inb & ~is_pred & is_true], minlength=nb)[:nb]
     out["total"] = np.bincount(idx[inb], minlength=nb)[:nb]
+    out["score_pos"] = np.histogram(probs[is_true], bins=PR_SCORE_BINS)[0]
+    out["score_neg"] = np.histogram(probs[~is_true], bins=PR_SCORE_BINS)[0]
     return out
 
 
@@ -289,6 +384,8 @@ def _per_class_counts(data: dict) -> dict:
     resp = np.zeros((N_CLASSES, npt, nr), dtype=np.int64)
     fake_pred_n = np.zeros((N_CLASSES, npt), dtype=np.int64)    # predicted class c, by PRED pT
     fake_wrong_n = np.zeros((N_CLASSES, npt), dtype=np.int64)   # ... whose truth class != c (fake/misID)
+    nptd = len(CLASS_PT_DIST_BINS) - 1
+    class_pt = np.zeros((N_CLASSES, nptd), dtype=np.int64)      # truth-pT spectrum per class
 
     # Confusion (rows = truth class, cols = pred class with null mapped to col 5).
     sel = tv
@@ -316,10 +413,11 @@ def _per_class_counts(data: dict) -> dict:
         psel = pv & (pc == c) & pinpt
         fake_pred_n[c] = np.bincount(pred_ptbin[psel], minlength=npt)[:npt]
         fake_wrong_n[c] = np.bincount(pred_ptbin[psel & (tc != c)], minlength=npt)[:npt]
+        class_pt[c] = np.histogram(tpt[tv & (tc == c)], bins=CLASS_PT_DIST_BINS)[0]
 
     return {"conf": conf, "conf_pt": conf_pt, "eff_denom": eff_denom,
             "eff_reco": eff_reco, "eff_correct": eff_correct, "resp": resp,
-            "fake_pred_n": fake_pred_n, "fake_wrong_n": fake_wrong_n}
+            "fake_pred_n": fake_pred_n, "fake_wrong_n": fake_wrong_n, "class_pt": class_pt}
 
 
 def _class_residual_counts(data: dict) -> dict:
@@ -447,6 +545,8 @@ def analyze_shard(shard_path: str, parquet_dir: str, events_per_file: int,
         },
         "npart_truth": npart_truth,
         "npart_pred": npart_pred,
+        "class_count": _class_count_by_cut(data),
+        "class_pt_spec": _class_pt_spectrum(data),
         "feat_hist": _feature_hist(data),
         "track": _track_counts(track_data),
         "calo": _calo_counts(cluster_data),
@@ -471,8 +571,17 @@ def merge_aggregates(aggs: list[dict]) -> dict:
     m["energy"] = {src: np.concatenate([a["energy"][src] for a in aggs]) for src in ("pflow", "puppi", "truth")}
     m["npart_truth"] = np.vstack([a["npart_truth"] for a in aggs])
     m["npart_pred"] = np.vstack([a["npart_pred"] for a in aggs])
+    if aggs[0].get("class_count") is not None:
+        m["class_count"] = {k: np.sum([a["class_count"][k] for a in aggs], axis=0)
+                            for k in ("truth", "pflow")}
+    if aggs[0].get("class_pt_spec") is not None:
+        m["class_pt_spec"] = {k: np.sum([a["class_pt_spec"][k] for a in aggs], axis=0)
+                              for k in ("truth", "pflow")}
     m["feat_hist"] = np.sum([a["feat_hist"] for a in aggs], axis=0)
+    nps = len(PR_SCORE_BINS) - 1
     m["track"] = {k: np.sum([a["track"][k] for a in aggs], axis=0) for k in ("tp", "fp", "fn", "total")}
+    for k in ("score_pos", "score_neg"):
+        m["track"][k] = np.sum([a["track"].get(k, np.zeros(nps, dtype=np.int64)) for a in aggs], axis=0)
     nb_calo = len(CALO_E_BINS) - 1
     m["calo"] = {k: np.sum([a["calo"].get(k, np.zeros(nb_calo, dtype=np.int64)) for a in aggs], axis=0)
                  for k in ("truth", "recovered", "pred", "hs_truth", "hs_recovered", "hs_pred")}
@@ -514,7 +623,9 @@ JET_PANELS = {
 }
 
 
-def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11) -> None:
+def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11,
+                    legend_loc: str = "upper right", logy_headroom: float = 1.6,
+                    liny_headroom: float = 1.5) -> None:
     """Draw one jet-resolution panel onto ``ax`` (shared by the 3x2 grid and the
     standalone single-panel figures so they stay identical)."""
     from scipy.stats import iqr
@@ -546,7 +657,9 @@ def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11) -> 
         d = d[np.isfinite(d)]
         if d.size == 0:
             return name
-        s = rf"{name}  $\mu$={np.mean(d):.3f}, IQR={iqr(d):.3f}"
+        # Median (not mean) so the centre is as outlier-robust as the IQR beside it,
+        # and consistent with the M= labels on the per-class residual figures.
+        s = rf"{name}  M={np.median(d):.3f}, IQR={iqr(d):.3f}"
         f = frac.get(name)
         if f is not None and np.isfinite(f):
             s += f", f={f:.3f}"
@@ -586,15 +699,15 @@ def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11) -> 
     if logy:
         ax.set_yscale("log")
         ylo, yhi = ax.get_ylim()
-        ax.set_ylim(max(ylo, 1e-4), yhi * 1.6)
+        ax.set_ylim(max(ylo, 1e-4), yhi * logy_headroom)
     else:
         ylo, yhi = ax.get_ylim()
-        ax.set_ylim(ylo, yhi * 1.5)
+        ax.set_ylim(ylo, yhi * liny_headroom)
     if key in ("deta", "dphi"):
         ax.set_xlim(-0.15, 0.15)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Density" if density else "Count")
-    ax.legend(fontsize=legend_fontsize, loc="upper right", framealpha=0.9,
+    ax.legend(fontsize=legend_fontsize, loc=legend_loc, framealpha=0.9,
               markerscale=1.6, handlelength=2.2)
 
 
@@ -612,7 +725,10 @@ def _plot_jet_resolution(merged: dict):
 def _plot_jet_single(merged: dict, key: str):
     """Standalone single-panel version of one jet-resolution distribution."""
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
-    _draw_jet_panel(ax, merged, key, legend_fontsize=14)
+    # The full-width 2-line legend can't dodge a central peak horizontally, so give
+    # generous top headroom (~1.2 decades on log) to seat it clear of the bars.
+    _draw_jet_panel(ax, merged, key, legend_fontsize=14, legend_loc="upper right",
+                    logy_headroom=16.0, liny_headroom=1.5)
     fig.tight_layout()
     return fig
 
@@ -641,7 +757,6 @@ def _plot_jet_iqr_binned(methods):
             _, iqrs, _ = _binned_mean_iqr(res[key], res["truth_pt"], edges=edges)
             ax.plot(centers, iqrs, marker="o", color=colors.get(label), label=label)
         ax.set_title(f"IQR {latex} vs truth $p_T$")
-        ax.grid(alpha=0.3)
         ax.set_xlabel(r"truth jet $p_T$ bin [GeV]")
         ax.set_xticks(centers)
         ax.set_xticklabels(labels_x, rotation=30, ha="right")
@@ -698,7 +813,7 @@ def _plot_jet_residual_boxes(methods):
         ax.set_xlabel(r"truth jet $p_T$ bin [GeV]")
         ax.set_xticks(np.arange(nbin))
         ax.set_xticklabels(labels_x, rotation=30, ha="right")
-        ax.grid(True, axis="y", alpha=0.3)
+        ax.tick_params(axis="x", which="minor", bottom=False, top=False)   # categorical x
     handles = [plt.Rectangle((0, 0), 1, 1, facecolor=method_colors[m], alpha=0.65, label=m)
                for m, _ in methods]
     axes[0].legend(handles=handles, fontsize=10, loc="lower left")
@@ -726,7 +841,52 @@ def _plot_track_f1_from_counts(track: dict):
     ax.set_ylabel("F1 Score")
     ax.set_ylim(0, 1.1)
     ax.set_title("Track F1 vs pT")
-    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
+def _plot_track_pr_curve(track: dict):
+    """Threshold-free track-classifier PR curve + Average Precision (AP / PR-AUC),
+    reconstructed from the per-score positive/negative count histograms.
+
+    AP is the standard interpolated-free weighted-mean-of-precisions estimator,
+    AP = sum_k (R_k - R_{k-1}) * P_k, the most widely reported threshold-free
+    metric under extreme class imbalance."""
+    pos = track.get("score_pos")
+    neg = track.get("score_neg")
+    if pos is None or neg is None or (pos.sum() + neg.sum()) == 0:
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.text(0.5, 0.5, "no track score data\n(re-run with --force)", ha="center", va="center",
+                transform=ax.transAxes)
+        return fig
+    pos = pos.astype(float)
+    neg = neg.astype(float)
+    P = pos.sum()           # total real (positive) tracks
+    # Sweep the threshold from high score to low. tp[k]/fp[k] are the positives /
+    # negatives passing the k-th cut, ordered so recall is ASCENDING in k: the
+    # tightest cut (top score bin only) first, the loosest (everything) last.
+    tp = np.cumsum(pos[::-1])           # tp[k] = positives with score >= (N-k)-th edge
+    fp = np.cumsum(neg[::-1])           # fp[k] = negatives with score >= same edge
+    with np.errstate(invalid="ignore", divide="ignore"):
+        precision = np.where(tp + fp > 0, tp / (tp + fp), 1.0)
+        recall = tp / P if P > 0 else np.zeros_like(tp)
+    # AP = sum_k (R_k - R_{k-1}) * P_k with recall ascending; prepend the R=0 origin.
+    rec = np.concatenate([[0.0], recall])
+    ap = np.sum(np.diff(rec) * precision)
+    # Prevalence = baseline AP of a random classifier under this imbalance.
+    baseline = P / (P + neg.sum()) if (P + neg.sum()) > 0 else 0.0
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.plot(recall, precision, "-", color="steelblue", lw=2.0,
+            label=f"{GLOWUP} (AP = {ap:.4f})")
+    ax.axhline(baseline, color="gray", lw=1, ls="--",
+               label=f"random baseline (prevalence = {baseline:.3f})")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.02)
+    ax.set_title(f"Track classifier Precision-Recall ({int(P):,} real / {int(neg.sum()):,} fake)")
+    ax.legend(fontsize=12, loc="lower left")
     fig.tight_layout()
     return fig
 
@@ -754,11 +914,11 @@ def _plot_n_particles_from_counts(npart_truth: np.ndarray, npart_pred: np.ndarra
         b.set_facecolor(GLOWUP_COLOR)
         b.set_alpha(0.7)
     ax.set_xticks(pos)
-    ax.set_xticklabels(bin_labels)
+    ax.set_xticklabels(bin_labels, rotation=30, ha="right")
+    ax.tick_params(axis="x", which="minor", bottom=False, top=False)   # categorical x
     ax.set_xlabel(r"Particle $p_T$ bin [GeV]")
     ax.set_ylabel("Particles / event")
     ax.set_title(f"Particle multiplicity per event by $p_T$ bin ({GLOWUP} vs {TARGET})")
-    ax.grid(True, axis="y", alpha=0.3)
     handles = [
         plt.Rectangle((0, 0), 1, 1, facecolor=TARGET_COLOR, alpha=0.7, label=TARGET),
         plt.Rectangle((0, 0), 1, 1, facecolor=GLOWUP_COLOR, alpha=0.7, label=GLOWUP),
@@ -828,7 +988,6 @@ def _plot_calo_recall_from_counts(calo: dict):
     ax.set_ylabel("Fraction")
     ax.set_ylim(0, 1.1)
     ax.set_title(f"{GLOWUP} pileup removal: recall & precision vs cluster HS energy")
-    ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()
     return fig
@@ -845,8 +1004,11 @@ def _plot_calo_e_dist_from_hist(calo: dict):
     ax.set_xlabel("Calorimeter cluster energy [GeV]")
     ax.set_ylabel("Clusters")
     ax.set_title("Calorimeter cluster energy in pileup removal: pred vs truth HS")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend()
+    # Stretch the y-axis one full decade upward (log scale) so the legend clears
+    # the distribution.
+    ylo, yhi = ax.get_ylim()
+    ax.set_ylim(ylo, yhi * 10.0)
+    ax.legend(loc="upper right", framealpha=0.9)
     fig.tight_layout()
     return fig
 
@@ -868,6 +1030,7 @@ def _plot_class_confusion(pc: dict):
     ax.set_xticklabels(col_labels, rotation=30, ha="right")
     ax.set_yticks(range(N_CLASSES))
     ax.set_yticklabels(CLASS_LABELS[:N_CLASSES])
+    ax.tick_params(which="minor", bottom=False, top=False, left=False, right=False)
     ax.set_xlabel(f"{GLOWUP} predicted class")
     ax.set_ylabel(f"{TARGET} class")
     for i in range(N_CLASSES):
@@ -894,7 +1057,6 @@ def _plot_class_pt_response(pc: dict):
     ax.set_xlabel(r"truth $p_T$ [GeV]")
     ax.set_ylabel(r"median $p_T^{\mathrm{pred}} / p_T^{\mathrm{truth}}$")
     ax.set_title(f"{GLOWUP} $p_T$ response per class")
-    ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()
     return fig
@@ -914,8 +1076,99 @@ def _plot_class_pt_resolution(pc: dict):
     ax.set_xlabel(r"truth $p_T$ [GeV]")
     ax.set_ylabel(r"IQR of $(p_T^{\mathrm{pred}} - p_T^{\mathrm{truth}}) / p_T^{\mathrm{truth}}$")
     ax.set_title(f"{GLOWUP} $p_T$ resolution per class")
-    ax.grid(True, which="both", alpha=0.3)
     ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def _plot_class_pt_distribution(pc: dict):
+    """Truth particle pT spectrum, one step histogram per class (counts, log-log)."""
+    cpt = pc.get("class_pt")
+    bins = CLASS_PT_DIST_BINS
+    if cpt is None:
+        fig, ax = plt.subplots(figsize=(8, 5.5))
+        ax.text(0.5, 0.5, "no class_pt data\n(re-run with --force)", ha="center", va="center",
+                transform=ax.transAxes)
+        return fig
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for c in range(N_CLASSES):
+        h = cpt[c].astype(float)
+        if h.sum() <= 0:
+            continue
+        ax.stairs(h, bins, color=CLASS_COLORS[c], linewidth=1.8,
+                  label=f"{CLASS_LABELS[c]} (N={int(h.sum()):,})")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(1.0, 200.0)
+    ax.set_xlabel(r"Particle $p_T$ [GeV]")
+    ax.set_ylabel("Particles")
+    ax.set_title(f"{TARGET} particle $p_T$ spectrum per class")
+    ax.legend(fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def _plot_class_counts(cc: dict, cut_idx: int):
+    """Per-class particle count bar chart (log y), Target vs GLOW-UP, for one pT cut.
+
+    x-axis = the N_CLASSES real particle classes (Ch Had / e / mu / Neu Had / gamma);
+    two bars per class (Target, GLOW-UP); the count above each cut CLASS_COUNT_PT_CUTS[cut_idx].
+    """
+    cut = CLASS_COUNT_PT_CUTS[cut_idx]
+    truth = cc["truth"][:, cut_idx].astype(float)
+    pflow = cc["pflow"][:, cut_idx].astype(float)
+    x = np.arange(N_CLASSES)
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    ax.bar(x - width / 2, truth, width, color=TARGET_COLOR, alpha=0.85,
+           label=f"{TARGET} (N={int(truth.sum()):,})")
+    ax.bar(x + width / 2, pflow, width, color=GLOWUP_COLOR, alpha=0.85,
+           label=f"{GLOWUP} (N={int(pflow.sum()):,})")
+    # Annotate each bar with its count (skip empties so log-scale gaps stay clean).
+    for xpos, val in [*zip(x - width / 2, truth), *zip(x + width / 2, pflow)]:
+        if val > 0:
+            ax.text(xpos, val, f"{int(val):,}", ha="center", va="bottom", fontsize=8, rotation=90)
+    ax.set_yscale("log")
+    ax.set_xticks(x)
+    ax.set_xticklabels(CLASS_LABELS[:N_CLASSES])
+    ax.set_xlabel("Particle class")
+    ax.set_ylabel("Particles")
+    title = f"Particle count per class: {GLOWUP} vs {TARGET}"
+    if cut > 0:
+        title += rf" ($p_T > {cut:g}$ GeV)"
+    ax.set_title(title)
+    ax.legend(fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+def _plot_class_pt_spectrum(sp: dict):
+    """Per-class particle pT spectrum (count vs pT), log-log; one color per class,
+    Target dashed vs GLOW-UP solid."""
+    bins = CLASS_PT_DIST_BINS
+    truth = sp["truth"].astype(float)     # (N_CLASSES, nbins)
+    pflow = sp["pflow"].astype(float)
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for c in range(N_CLASSES):
+        if truth[c].sum() > 0:
+            ax.stairs(truth[c], bins, color=CLASS_COLORS[c], linestyle="--", linewidth=1.6)
+        if pflow[c].sum() > 0:
+            ax.stairs(pflow[c], bins, color=CLASS_COLORS[c], linestyle="-", linewidth=1.9,
+                      label=f"{CLASS_LABELS[c]} (N={int(pflow[c].sum()):,})")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(0.15, 200.0)
+    ax.set_xlabel(r"Particle $p_T$ [GeV]")
+    ax.set_ylabel("Particles")
+    ax.set_title(f"Particle $p_T$ spectrum per class: {GLOWUP} vs {TARGET}")
+    # Class colors (solid = GLOW-UP) + a line-style key for the source.
+    leg1 = ax.legend(fontsize=11, loc="upper right", title="class")
+    ax.add_artist(leg1)
+    style_handles = [
+        plt.Line2D([], [], color="black", linestyle="-", linewidth=1.9, label=GLOWUP),
+        plt.Line2D([], [], color="black", linestyle="--", linewidth=1.6, label=TARGET),
+    ]
+    ax.legend(handles=style_handles, fontsize=11, loc="lower left")
     fig.tight_layout()
     return fig
 
@@ -940,7 +1193,6 @@ def _plot_class_f1_vs_pt(pc: dict):
     ax.set_xlabel(r"truth $p_T$ [GeV]")
     ax.set_ylabel("classification F1")
     ax.set_title(f"{GLOWUP} per-class classification F1 vs pT")
-    ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()
     return fig
@@ -958,11 +1210,11 @@ def _plot_class_efficiency(pc: dict):
         ax.errorbar(centers, e, yerr=err, marker="o", capsize=2, color=CLASS_COLORS[c], label=CLASS_LABELS[c])
     ax.axhline(1.0, color="gray", lw=1, ls="--")
     ax.set_xscale("log")
+    ax.set_xlim(None, 200.0)
     ax.set_ylim(0, 1.1)
     ax.set_xlabel(r"truth $p_T$ [GeV]")
     ax.set_ylabel("reconstruction efficiency")
     ax.set_title(f"{GLOWUP} reconstruction efficiency per class")
-    ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()
     return fig
@@ -981,11 +1233,11 @@ def _plot_class_fake_rate_vs_pt(pc: dict):
             err = np.where(den[c] > 0, np.sqrt(np.clip(fr * (1 - fr), 0, None) / np.where(den[c] > 0, den[c], 1)), np.nan)
         ax.errorbar(centers, fr, yerr=err, marker="o", capsize=2, color=CLASS_COLORS[c], label=CLASS_LABELS[c])
     ax.set_xscale("log")
+    ax.set_xlim(None, 200.0)
     ax.set_ylim(0, 1.05)
     ax.set_xlabel(r"Pred $p_T$ [GeV]")
     ax.set_ylabel("Fake rate")
     ax.set_title(f"{GLOWUP} per-class fake rate vs $p_T$")
-    ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()
     return fig
@@ -996,15 +1248,15 @@ def _plot_class_residuals(pc: dict):
     classes as normalized (density) step histograms. Rows = Charged / Neutral,
     cols = (dpT/pT, deta, dphi)."""
     cols = [
-        ("res_dptrel", DPTREL_BINS, r"$(p_T^{\mathrm{reco}} - p_T^{\mathrm{truth}}) / p_T^{\mathrm{truth}}$"),
-        ("res_deta", DANG_BINS, r"$\eta^{\mathrm{reco}} - \eta^{\mathrm{truth}}$"),
-        ("res_dphi", DANG_BINS, r"$\phi^{\mathrm{reco}} - \phi^{\mathrm{truth}}$"),
+        ("res_dptrel", DPTREL_BINS, r"$(p_T^{\mathrm{reco}} - p_T^{\mathrm{target}}) / p_T^{\mathrm{target}}$", (-1.0, 1.0)),
+        ("res_deta", DANG_BINS, r"$\eta^{\mathrm{reco}} - \eta^{\mathrm{target}}$", (-0.15, 0.15)),
+        ("res_dphi", DANG_BINS, r"$\phi^{\mathrm{reco}} - \phi^{\mathrm{target}}$", (-0.15, 0.15)),
     ]
     groups = [("Charged", [0, 1, 2]), ("Neutral", [3, 4])]   # class indices
     truth_n = pc["res_truth_n"]
     fig, axes = plt.subplots(2, 3, figsize=(16, 8), squeeze=False)
     for gi, (gname, classes) in enumerate(groups):
-        for ci, (key, bins, xlab) in enumerate(cols):
+        for ci, (key, bins, xlab, xlim) in enumerate(cols):
             ax = axes[gi][ci]
             for c in classes:
                 h = pc[key][c].astype(float)
@@ -1018,8 +1270,13 @@ def _plot_class_residuals(pc: dict):
                 ax.stairs(dens, bins, color=CLASS_COLORS[c], linewidth=1.8,
                           label=f"{CLASS_LABELS[c]} (M={med:.3f}, IQR={iqrv:.3f}, f={f:.3f})")
             ax.set_xlabel(xlab)
-            ax.grid(alpha=0.3)
-            ax.legend(fontsize=8)
+            if gi == 0:   # clip only the Charged row; Neutral keeps full range
+                ax.set_xlim(*xlim)
+            # Stretch the y-axis upward so the legend sits above the peak instead
+            # of on top of it (histograms keep their shape, just occupy less height).
+            ax.set_ylim(top=ax.get_ylim()[1] * 1.4)
+            ax.legend(fontsize=10.4, loc="upper right", framealpha=0.9)
+            
             if ci == 0:
                 ax.set_ylabel(f"{gname}\nDensity")
             if ci == 1:
@@ -1064,7 +1321,6 @@ def _plot_jet_matching(jm: dict):
     axR.set_title("Jet fake rate")
     for ax in (axL, axR):
         ax.set_xscale("log")
-        ax.grid(True, which="both", alpha=0.3)
         ax.legend()
     fig.suptitle(rf"Jet matching ({GLOWUP} & {PUPPI_LABEL} vs {TARGET}, $\Delta R<0.4$)", y=1.02)
     fig.tight_layout()
@@ -1084,8 +1340,16 @@ def render_all(merged: dict) -> dict:
         "jet_delta_phi": _plot_jet_single(merged, "dphi"),
         "jet_energy": _plot_jet_single(merged, "energy"),
         "track_f1_vs_pt": _plot_track_f1_from_counts(merged["track"]),
+        "track_pr_curve": _plot_track_pr_curve(merged["track"]),
         "n_particles_by_pt_bin": _plot_n_particles_from_counts(merged["npart_truth"], merged["npart_pred"]),
         "feature_scatter": _plot_feature_scatter_from_hist(merged["feat_hist"]),
+        **({
+            f"class_counts_{('nocut' if c <= 0 else 'pt' + format(c, 'g').replace('.', 'p'))}":
+                _plot_class_counts(merged["class_count"], k)
+            for k, c in enumerate(CLASS_COUNT_PT_CUTS)
+        } if merged.get("class_count") is not None else {}),
+        **({"class_pt_spectrum": _plot_class_pt_spectrum(merged["class_pt_spec"])}
+           if merged.get("class_pt_spec") is not None else {}),
         "calo_recall_vs_pt": _plot_calo_recall_from_counts(merged["calo"]),
         "calo_pred_vs_truth_e_dist": _plot_calo_e_dist_from_hist(merged["calo"]),
     }
@@ -1098,6 +1362,8 @@ def render_all(merged: dict) -> dict:
         figs["class_confusion_matrix"] = _plot_class_confusion(pc)
         figs["class_pt_response"] = _plot_class_pt_response(pc)
         figs["class_pt_resolution"] = _plot_class_pt_resolution(pc)
+        if "class_pt" in pc:
+            figs["class_pt_distribution"] = _plot_class_pt_distribution(pc)
         figs["class_efficiency_vs_pt"] = _plot_class_efficiency(pc)
         figs["class_f1_vs_pt"] = _plot_class_f1_vs_pt(pc)
         if "fake_pred_n" in pc:
