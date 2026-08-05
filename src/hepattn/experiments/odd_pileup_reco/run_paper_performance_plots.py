@@ -692,7 +692,7 @@ def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11,
         td = np.asarray(series("truth"), dtype=float)
         if td.size:
             ax.hist(td, bins=b, histtype="step", linestyle="--", linewidth=1.8,
-                    density=density, color="black", label=lbl(TARGET, td))
+                    density=density, color=TARGET_COLOR, label=lbl(TARGET, td))
 
     # Top headroom so the upper-right legend never hides the central peak
     # (this was missing for the linear deta/dphi panels).
@@ -807,7 +807,11 @@ def _plot_jet_residual_boxes(methods):
                     ax.text(b + off, 0.985, f"N={counts[b]:,}", transform=trans, rotation=90,
                             va="top", ha="center", fontsize=11, color=method_colors.get(label, "gray"))
         if ylim:
-            ax.set_ylim(*ylim)
+            # Keep the tuned data window, but extend the top by 30% of the span to
+            # reserve a clear strip for the rotated N= labels, so whiskers reaching
+            # the top of the data range no longer cross the text.
+            lo, hi = ylim
+            ax.set_ylim(lo, hi + 0.30 * (hi - lo))
         ax.axhline(0.0, color="gray", lw=1, ls=":")
         ax.set_ylabel(ylab)
         ax.set_xlabel(r"truth jet $p_T$ bin [GeV]")
@@ -816,7 +820,7 @@ def _plot_jet_residual_boxes(methods):
         ax.tick_params(axis="x", which="minor", bottom=False, top=False)   # categorical x
     handles = [plt.Rectangle((0, 0), 1, 1, facecolor=method_colors[m], alpha=0.65, label=m)
                for m, _ in methods]
-    axes[0].legend(handles=handles, fontsize=10, loc="lower left")
+    axes[0].legend(handles=handles, fontsize=10, loc="upper left", bbox_to_anchor=(0.4,0.7))
     fig.suptitle(rf"Jet residual box plots vs truth $p_T$ (N = jets per bin): {GLOWUP} vs {PUPPI_LABEL}", y=1.02)
     fig.tight_layout()
     return fig
@@ -834,13 +838,15 @@ def _plot_track_f1_from_counts(track: dict):
     f1 = np.where(n > 0, f1, np.nan)
     err = np.where(n > 0, err, np.nan)
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.errorbar(centers, f1, yerr=err, fmt="o-", capsize=3, color="steelblue")
+    ax.errorbar(centers, f1, yerr=err, fmt="o-", capsize=3, color=GLOWUP_COLOR)
     ax.axhline(1.0, color="gray", lw=1, ls="--")
     ax.set_xscale("log")
-    ax.set_xlabel(r"Track $p_T$ [GeV]")
-    ax.set_ylabel("F1 Score")
+    # Matched to calo_pred_vs_truth_e_dist, since the two are shown side by side.
+    ax.set_xlabel(r"Track $p_T$ [GeV]", fontsize=21.25)
+    ax.set_ylabel("F1 Score", fontsize=21.25)
+    ax.tick_params(axis="both", which="major", labelsize=22)
     ax.set_ylim(0, 1.1)
-    ax.set_title("Track F1 vs pT")
+    ax.set_title("Track F1 vs pT", fontsize=22.5)
     fig.tight_layout()
     return fig
 
@@ -877,7 +883,7 @@ def _plot_track_pr_curve(track: dict):
     baseline = P / (P + neg.sum()) if (P + neg.sum()) > 0 else 0.0
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    ax.plot(recall, precision, "-", color="steelblue", lw=2.0,
+    ax.plot(recall, precision, "-", color=GLOWUP_COLOR, lw=2.0,
             label=f"{GLOWUP} (AP = {ap:.4f})")
     ax.axhline(baseline, color="gray", lw=1, ls="--",
                label=f"random baseline (prevalence = {baseline:.3f})")
@@ -901,10 +907,11 @@ def _plot_n_particles_from_counts(npart_truth: np.ndarray, npart_pred: np.ndarra
     fig, ax = plt.subplots(figsize=(1.6 * n_bins + 3, 5.5))
     width = 0.32
     pos = np.arange(n_bins)
-    box_t = ax.boxplot([npart_truth[:, i] for i in range(n_bins)],
+    # GLOW-UP is always the LEFT box of each pair, matching jet_residual_boxes.
+    box_p = ax.boxplot([npart_pred[:, i] for i in range(n_bins)],
                        positions=pos - width / 2 - 0.02, widths=width, patch_artist=True,
                        showfliers=False, medianprops={"color": "black"})
-    box_p = ax.boxplot([npart_pred[:, i] for i in range(n_bins)],
+    box_t = ax.boxplot([npart_truth[:, i] for i in range(n_bins)],
                        positions=pos + width / 2 + 0.02, widths=width, patch_artist=True,
                        showfliers=False, medianprops={"color": "black"})
     for b in box_t["boxes"]:
@@ -916,20 +923,24 @@ def _plot_n_particles_from_counts(npart_truth: np.ndarray, npart_pred: np.ndarra
     ax.set_xticks(pos)
     ax.set_xticklabels(bin_labels, rotation=30, ha="right")
     ax.tick_params(axis="x", which="minor", bottom=False, top=False)   # categorical x
-    ax.set_xlabel(r"Particle $p_T$ bin [GeV]")
-    ax.set_ylabel("Particles / event")
-    ax.set_title(f"Particle multiplicity per event by $p_T$ bin ({GLOWUP} vs {TARGET})")
+    # Matched to calo_pred_vs_truth_e_dist / track_f1_vs_pt sizing.
+    ax.tick_params(axis="both", which="major", labelsize=22)
+    ax.set_xlabel(r"Particle $p_T$ bin [GeV]", fontsize=21.25)
+    ax.set_ylabel("Particles / event", fontsize=21.25)
+    
+    ax.set_title(f"Particle multiplicity per event by $p_T$ bin ({GLOWUP} vs {TARGET})",
+                 fontsize=22.5)
     handles = [
-        plt.Rectangle((0, 0), 1, 1, facecolor=TARGET_COLOR, alpha=0.7, label=TARGET),
         plt.Rectangle((0, 0), 1, 1, facecolor=GLOWUP_COLOR, alpha=0.7, label=GLOWUP),
+        plt.Rectangle((0, 0), 1, 1, facecolor=TARGET_COLOR, alpha=0.7, label=TARGET),
     ]
-    ax.legend(handles=handles, fontsize=11)
+    ax.legend(handles=handles, fontsize=16.25)
     fig.tight_layout()
     return fig
 
 
 def _plot_feature_scatter_from_hist(feat_hist: np.ndarray):
-    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
     for i in range(3):
         for j in range(3):
             ax = axes[j, i]
@@ -940,17 +951,17 @@ def _plot_feature_scatter_from_hist(feat_hist: np.ndarray):
                                    norm=LogNorm(vmin=1), cmap="viridis")
                 lo, hi = edges[0], edges[-1]
                 ax.plot([lo, hi], [lo, hi], ls="--", color="red", lw=1.0)
-                ax.text(0.03, 0.97, f"n={int(h.sum()):,}", transform=ax.transAxes,
-                        va="top", ha="left", fontsize=8, color="white",
-                        bbox={"facecolor": "black", "alpha": 0.35, "pad": 2})
                 cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                cbar.set_label("counts (log scale)", fontsize=8)
+                cbar.ax.tick_params(labelsize=25)
             else:
-                ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
-            ax.set_xlabel(f"{TARGET} {FEAT_LABELS[i]}")
-            ax.set_ylabel(f"{GLOWUP} {FEAT_LABELS[i]}")
-            ax.set_title(FEAT_ROWS[j])
-    fig.suptitle(f"Feature density (hist2d, log color scale): {TARGET} vs {GLOWUP}", y=1.01)
+                ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes,
+                        fontsize=22.5)
+            ax.set_xlabel(f"{TARGET} {FEAT_LABELS[i]}", fontsize=27.5)
+            ax.set_ylabel(f"{GLOWUP} {FEAT_LABELS[i]}", fontsize=27.5)
+            ax.set_title(FEAT_ROWS[j], fontsize=30)
+            ax.tick_params(axis="both", which="major", labelsize=25)
+    fig.suptitle(f"Feature density: {TARGET} vs {GLOWUP}",
+                 fontsize=32.5, y=1.02)
     fig.tight_layout()
     return fig
 
@@ -1001,14 +1012,17 @@ def _plot_calo_e_dist_from_hist(calo: dict):
     ax.stairs(pred, edges, color=GLOWUP_COLOR, linewidth=2.0, label=f"{GLOWUP} (pred HS)  n={int(pred.sum()):,}")
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Calorimeter cluster energy [GeV]")
-    ax.set_ylabel("Clusters")
-    ax.set_title("Calorimeter cluster energy in pileup removal: pred vs truth HS")
+    # 25% over the global sizes (labels 17, title 18, ticks 15) for this figure.
+    ax.set_xlabel("Calorimeter cluster energy [GeV]", fontsize=21.25)
+    ax.set_ylabel("Clusters", fontsize=21.25)
+    ax.set_title("Calorimeter cluster energy in\npileup removal: pred vs truth HS",
+                 fontsize=22.5)
+    ax.tick_params(axis="both", which="major", labelsize=22)   # the 10^x tick text
     # Stretch the y-axis one full decade upward (log scale) so the legend clears
     # the distribution.
     ylo, yhi = ax.get_ylim()
-    ax.set_ylim(ylo, yhi * 10.0)
-    ax.legend(loc="upper right", framealpha=0.9)
+    ax.set_ylim(ylo, yhi * 100.0)
+    ax.legend(loc="upper right", framealpha=0.9, fontsize=16.25)   # 25% over the 13pt default
     fig.tight_layout()
     return fig
 
