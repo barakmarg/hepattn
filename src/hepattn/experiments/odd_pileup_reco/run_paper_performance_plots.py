@@ -618,14 +618,16 @@ JET_PANELS = {
     "dphi": (r"Jet $\Delta\phi$", np.linspace(-0.15, 0.15, 50), True, False),
     "nconst": ("Jet # Constituents", None, True, False),
     "dpt": (r"Jet absolute $\Delta p_T$ [GeV]", None, True, False),
-    "dpt_over_truth": (r"Jet relative $\Delta p_T / p_T^{\mathrm{Target}}$", np.linspace(-1.0, 4.0, 110), False, True),
+    "dpt_over_truth": (r"Jet $(p_T^{\mathrm{reco}} - p_T^{\mathrm{target}}) / p_T^{\mathrm{target}}$",
+                       np.linspace(-1.0, 4.0, 110), False, True),
     "energy": ("Jet energy [GeV]", None, False, True),
 }
 
 
 def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11,
                     legend_loc: str = "upper right", logy_headroom: float = 1.6,
-                    liny_headroom: float = 1.5) -> None:
+                    liny_headroom: float = 1.5, tick_labelsize: float | None = None,
+                    axis_label_fontsize: float | None = None) -> None:
     """Draw one jet-resolution panel onto ``ax`` (shared by the 3x2 grid and the
     standalone single-panel figures so they stay identical)."""
     from scipy.stats import iqr
@@ -653,13 +655,13 @@ def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11,
             return pu.get(key, np.array([]))
         return np.array([])     # truth has no matched residual
 
-    def lbl(name, d):
+    def stats(name, d):
         d = d[np.isfinite(d)]
         if d.size == 0:
-            return name
+            return None
         # Median (not mean) so the centre is as outlier-robust as the IQR beside it,
         # and consistent with the M= labels on the per-class residual figures.
-        s = rf"{name}  M={np.median(d):.3f}, IQR={iqr(d):.3f}"
+        s = rf"M={np.median(d):.3f}, IQR={iqr(d):.3f}"
         f = frac.get(name)
         if f is not None and np.isfinite(f):
             s += f", f={f:.3f}"
@@ -681,18 +683,40 @@ def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11,
     else:   # dpt
         b = _pct_bins(glow, 90)
 
+    # Legend handles/labels are built manually (rather than via each hist's `label=`)
+    # so PUPPI's caveat line can be its own row with an invisible handle: that keeps
+    # the "PUPPI  M=..." row's own handle - the green box - aligned with that row's
+    # text, instead of matplotlib centering a 2-line label against a single marker.
+    handles, labels = [], []
+
     # Only GLOW-UP is filled; PUPPI and Target are distinct outlines.
     ax.hist(glow, bins=b, histtype="stepfilled", alpha=0.45, linewidth=1.6,
-            density=density, color=GLOWUP_COLOR, edgecolor=GLOWUP_COLOR, label=lbl(GLOWUP, glow))
+            density=density, color=GLOWUP_COLOR, edgecolor=GLOWUP_COLOR)
+    glow_stats = stats(GLOWUP, glow)
+    handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=GLOWUP_COLOR, edgecolor=GLOWUP_COLOR, alpha=0.45))
+    labels.append(f"{GLOWUP}  {glow_stats}" if glow_stats else GLOWUP)
+
     pud = np.asarray(series("puppi"), dtype=float)
     if pud.size:
         ax.hist(pud, bins=b, histtype="step", linestyle="-", linewidth=2.2,
-                density=density, color=PUPPI_COLOR, label=lbl(PUPPI_LABEL, pud))
+                density=density, color=PUPPI_COLOR)
+
     if key in ("nconst", "energy"):
         td = np.asarray(series("truth"), dtype=float)
         if td.size:
             ax.hist(td, bins=b, histtype="step", linestyle="--", linewidth=1.8,
-                    density=density, color=TARGET_COLOR, label=lbl(TARGET, td))
+                    density=density, color=TARGET_COLOR)
+            td_stats = stats(TARGET, td)
+            handles.append(plt.Line2D([], [], color=TARGET_COLOR, linestyle="--", linewidth=1.8))
+            labels.append(f"{TARGET}  {td_stats}" if td_stats else TARGET)
+
+    # PUPPI last, per request.
+    if pud.size:
+        puppi_stats = stats(PUPPI_LABEL, pud)
+        handles.append(plt.Line2D([], [], color=PUPPI_COLOR, linestyle="-", linewidth=2.2))
+        labels.append(f"PUPPI  {puppi_stats}" if puppi_stats else "PUPPI")
+        handles.append(plt.Line2D([], [], color="none"))   # invisible: own row, no marker
+        labels.append("PUPPI - ideal truth-assisted")
 
     # Top headroom so the upper-right legend never hides the central peak
     # (this was missing for the linear deta/dphi panels).
@@ -705,10 +729,12 @@ def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11,
         ax.set_ylim(ylo, yhi * liny_headroom)
     if key in ("deta", "dphi"):
         ax.set_xlim(-0.15, 0.15)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Density" if density else "Count")
-    ax.legend(fontsize=legend_fontsize, loc=legend_loc, framealpha=0.9,
-              markerscale=1.6, handlelength=2.2)
+    ax.set_xlabel(xlabel, fontsize=axis_label_fontsize)
+    ax.set_ylabel("Density" if density else "Count", fontsize=axis_label_fontsize)
+    if tick_labelsize is not None:
+        ax.tick_params(axis="both", which="major", labelsize=tick_labelsize)
+    ax.legend(handles=handles, labels=labels, fontsize=legend_fontsize, loc=legend_loc,
+              framealpha=0.9, markerscale=1.6, handlelength=2.2)
 
 
 def _plot_jet_resolution(merged: dict):
@@ -725,10 +751,11 @@ def _plot_jet_resolution(merged: dict):
 def _plot_jet_single(merged: dict, key: str):
     """Standalone single-panel version of one jet-resolution distribution."""
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
-    # The full-width 2-line legend can't dodge a central peak horizontally, so give
-    # generous top headroom (~1.2 decades on log) to seat it clear of the bars.
-    _draw_jet_panel(ax, merged, key, legend_fontsize=14, legend_loc="upper right",
-                    logy_headroom=16.0, liny_headroom=1.5)
+    # The full-width 3-row legend can't dodge a central peak horizontally, so give
+    # generous top headroom (log scale: 5x more than before) to seat it clear of the bars.
+    _draw_jet_panel(ax, merged, key, legend_fontsize=16.8, legend_loc="upper right",
+                    logy_headroom=80.0, liny_headroom=1.5, tick_labelsize=22,
+                    axis_label_fontsize=20.4)   # 20% over the inherited 17
     fig.tight_layout()
     return fig
 
@@ -766,63 +793,53 @@ def _plot_jet_iqr_binned(methods):
     return fig
 
 
-def _plot_jet_residual_boxes(methods):
-    """Jet residuals as box-per-pT-bin, GLOW-UP & PUPPI. The per-bin jet count is
-    annotated on top of each box (N=...)."""
+def _plot_jet_residual_box_single(methods, key, ylab, ylim):
+    """One standalone box-per-pT-bin residual figure (GLOW-UP & PUPPI) for a single
+    variable. Kept as three separate figures (rather than one multi-panel grid) and
+    laid out with minimal padding, so they can be packed tightly side by side in the
+    paper at whatever size/arrangement fits."""
     edges = JET_RES_PT_EDGES
     nbin = len(edges) - 1
     labels_x = [
         f"[{int(edges[i])},{('∞' if np.isinf(edges[i + 1]) else int(edges[i + 1]))})"
         for i in range(nbin)
     ]
-    residual_keys = [
-        ("dpt_over_truth", r"Jet $\Delta p_T / p_T^{\mathrm{Target}}$", (-1.0, 1.2)),
-        ("deta", r"Jet $\Delta\eta$", (-0.15, 0.15)),
-        ("dphi", r"Jet $\Delta\phi$", (-0.15, 0.15)),
-    ]
     method_colors = {GLOWUP: GLOWUP_COLOR, PUPPI_LABEL: PUPPI_COLOR}
     offsets = {0: -0.2, 1: 0.2}
     width = 0.32
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
-    for col, (key, ylab, ylim) in enumerate(residual_keys):
-        ax = axes[col]
-        trans = ax.get_xaxis_transform()
-        for mi, (label, res) in enumerate(methods):
-            vals = np.asarray(res.get(key, []), dtype=float)
-            tpt = np.asarray(res.get("truth_pt", []), dtype=float)
-            if vals.size == 0:
-                continue
-            idx = np.digitize(tpt, edges) - 1
-            pb = [vals[(idx == b) & np.isfinite(vals)] for b in range(nbin)]
-            counts = [v.size for v in pb]
-            data = [v if v.size else np.array([np.nan]) for v in pb]
-            off = offsets.get(mi, 0.0)
-            bx = ax.boxplot(data, positions=np.arange(nbin) + off, widths=width,
-                            patch_artist=True, showfliers=False, medianprops={"color": "black"})
-            for b in bx["boxes"]:
-                b.set_facecolor(method_colors.get(label, "gray"))
-                b.set_alpha(0.65)
-            for b in range(nbin):
-                if counts[b] > 0:
-                    ax.text(b + off, 0.985, f"N={counts[b]:,}", transform=trans, rotation=90,
-                            va="top", ha="center", fontsize=11, color=method_colors.get(label, "gray"))
-        if ylim:
-            # Keep the tuned data window, but extend the top by 30% of the span to
-            # reserve a clear strip for the rotated N= labels, so whiskers reaching
-            # the top of the data range no longer cross the text.
-            lo, hi = ylim
-            ax.set_ylim(lo, hi + 0.30 * (hi - lo))
-        ax.axhline(0.0, color="gray", lw=1, ls=":")
-        ax.set_ylabel(ylab)
-        ax.set_xlabel(r"truth jet $p_T$ bin [GeV]")
-        ax.set_xticks(np.arange(nbin))
-        ax.set_xticklabels(labels_x, rotation=30, ha="right")
-        ax.tick_params(axis="x", which="minor", bottom=False, top=False)   # categorical x
+    fig, ax = plt.subplots(figsize=(6.2, 5.4))
+    for mi, (label, res) in enumerate(methods):
+        vals = np.asarray(res.get(key, []), dtype=float)
+        tpt = np.asarray(res.get("truth_pt", []), dtype=float)
+        if vals.size == 0:
+            continue
+        idx = np.digitize(tpt, edges) - 1
+        pb = [vals[(idx == b) & np.isfinite(vals)] for b in range(nbin)]
+        data = [v if v.size else np.array([np.nan]) for v in pb]
+        off = offsets.get(mi, 0.0)
+        bx = ax.boxplot(data, positions=np.arange(nbin) + off, widths=width,
+                        patch_artist=True, showfliers=False, medianprops={"color": "black"})
+        for b in bx["boxes"]:
+            b.set_facecolor(method_colors.get(label, "gray"))
+            b.set_alpha(0.65)
+    if ylim:
+        # Keep the tuned data window, but extend the top by 8% of the span so the
+        # tallest whisker tips get some clear air below the axis edge.
+        lo, hi = ylim
+        ax.set_ylim(lo, hi + 0.08 * (hi - lo))
+    ax.axhline(0.0, color="gray", lw=1, ls=":")
+    ax.set_ylabel(ylab, fontsize=20.4)
+    ax.set_xlabel(r"truth jet $p_T$ bin [GeV]", fontsize=20.4)
+    ax.set_xticks(np.arange(nbin))
+    ax.set_xticklabels(labels_x, rotation=30, ha="right")
+    ax.tick_params(axis="x", which="minor", bottom=False, top=False)   # categorical x
+    ax.tick_params(axis="both", which="major", labelsize=18)
     handles = [plt.Rectangle((0, 0), 1, 1, facecolor=method_colors[m], alpha=0.65, label=m)
                for m, _ in methods]
-    axes[0].legend(handles=handles, fontsize=10, loc="upper left", bbox_to_anchor=(0.4,0.7))
-    fig.suptitle(rf"Jet residual box plots vs truth $p_T$ (N = jets per bin): {GLOWUP} vs {PUPPI_LABEL}", y=1.02)
-    fig.tight_layout()
+    # Legend sits just above the frame, not inside the plot area.
+    ax.legend(handles=handles, fontsize=15.6, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2)
+    # Small pad: minimal whitespace border so several of these tile compactly.
+    fig.tight_layout(pad=0.3)
     return fig
 
 
@@ -907,7 +924,7 @@ def _plot_n_particles_from_counts(npart_truth: np.ndarray, npart_pred: np.ndarra
     fig, ax = plt.subplots(figsize=(1.6 * n_bins + 3, 5.5))
     width = 0.32
     pos = np.arange(n_bins)
-    # GLOW-UP is always the LEFT box of each pair, matching jet_residual_boxes.
+    # GLOW-UP is always the LEFT box of each pair, matching the jet_residual_box_* figures.
     box_p = ax.boxplot([npart_pred[:, i] for i in range(n_bins)],
                        positions=pos - width / 2 - 0.02, widths=width, patch_artist=True,
                        showfliers=False, medianprops={"color": "black"})
@@ -1259,19 +1276,19 @@ def _plot_class_fake_rate_vs_pt(pc: dict):
 
 def _plot_class_residuals(pc: dict):
     """GLOW-UP kinematic residuals grouped Charged / Neutral, overlaying the
-    classes as normalized (density) step histograms. Rows = Charged / Neutral,
-    cols = (dpT/pT, deta, dphi)."""
-    cols = [
-        ("res_dptrel", DPTREL_BINS, r"$(p_T^{\mathrm{reco}} - p_T^{\mathrm{target}}) / p_T^{\mathrm{target}}$", (-1.0, 1.0)),
-        ("res_deta", DANG_BINS, r"$\eta^{\mathrm{reco}} - \eta^{\mathrm{target}}$", (-0.15, 0.15)),
-        ("res_dphi", DANG_BINS, r"$\phi^{\mathrm{reco}} - \phi^{\mathrm{target}}$", (-0.15, 0.15)),
+    classes as normalized (density) step histograms. Rows = (dpT/pT, deta, dphi),
+    cols = Charged / Neutral (2-wide, so it fits the paper column)."""
+    rows = [
+        ("res_dptrel", DPTREL_BINS, r"$(p_T^{\mathrm{reco}} - p_T^{\mathrm{target}}) / p_T^{\mathrm{target}}$", (-0.5, 0.5)),
+        ("res_deta", DANG_BINS, r"$\eta^{\mathrm{reco}} - \eta^{\mathrm{target}}$", (-0.1, 0.1)),
+        ("res_dphi", DANG_BINS, r"$\phi^{\mathrm{reco}} - \phi^{\mathrm{target}}$", (-0.1, 0.1)),
     ]
     groups = [("Charged", [0, 1, 2]), ("Neutral", [3, 4])]   # class indices
     truth_n = pc["res_truth_n"]
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8), squeeze=False)
+    fig, axes = plt.subplots(3, 2, figsize=(11, 13), squeeze=False)
     for gi, (gname, classes) in enumerate(groups):
-        for ci, (key, bins, xlab, xlim) in enumerate(cols):
-            ax = axes[gi][ci]
+        for ri, (key, bins, xlab, xlim) in enumerate(rows):
+            ax = axes[ri][gi]
             for c in classes:
                 h = pc[key][c].astype(float)
                 if h.sum() <= 0:
@@ -1284,18 +1301,19 @@ def _plot_class_residuals(pc: dict):
                 ax.stairs(dens, bins, color=CLASS_COLORS[c], linewidth=1.8,
                           label=f"{CLASS_LABELS[c]} (M={med:.3f}, IQR={iqrv:.3f}, f={f:.3f})")
             ax.set_xlabel(xlab)
-            if gi == 0:   # clip only the Charged row; Neutral keeps full range
+            if gi == 0:   # clip only the Charged column; Neutral keeps full range
                 ax.set_xlim(*xlim)
             # Stretch the y-axis upward so the legend sits above the peak instead
             # of on top of it (histograms keep their shape, just occupy less height).
-            ax.set_ylim(top=ax.get_ylim()[1] * 1.4)
-            ax.legend(fontsize=10.4, loc="upper right", framealpha=0.9)
-            
-            if ci == 0:
-                ax.set_ylabel(f"{gname}\nDensity")
-            if ci == 1:
+            ax.set_ylim(top=ax.get_ylim()[1] * 1.54)   # 10% taller than the prior 1.4
+            ax.legend(fontsize=12.4, loc="upper right", framealpha=0.9)   # 20% over 12.0
+            ax.tick_params(axis="both", which="major", labelsize=19)
+
+            if gi == 0:
+                ax.set_ylabel("Density")
+            if ri == 0:
                 ax.set_title(gname)
-    fig.suptitle(f"{GLOWUP} per-class kinematic residuals (matched objects)", y=1.005)
+    fig.suptitle(f"{GLOWUP} per-class kinematic residuals", y=1.005)
     fig.tight_layout()
     return fig
 
@@ -1347,7 +1365,12 @@ def render_all(merged: dict) -> dict:
         "jet_resolution": _plot_jet_resolution(merged),
         "jet_resolution_binned": _make_binned_plots(methods, edges=JET_RES_PT_EDGES),
         "jet_resolution_iqr_binned": _plot_jet_iqr_binned(methods),
-        "jet_residual_boxes": _plot_jet_residual_boxes(methods),
+        "jet_residual_box_dpt": _plot_jet_residual_box_single(
+            methods, "dpt_over_truth", r"Jet $\Delta p_T / p_T^{\mathrm{Target}}$", (-1.0, 1.2)),
+        "jet_residual_box_deta": _plot_jet_residual_box_single(
+            methods, "deta", r"Jet $\Delta\eta$", (-0.15, 0.15)),
+        "jet_residual_box_dphi": _plot_jet_residual_box_single(
+            methods, "dphi", r"Jet $\Delta\phi$", (-0.15, 0.15)),
         # Same panels as jet_resolution, each as its own standalone figure.
         "jet_relative_pt": _plot_jet_single(merged, "dpt_over_truth"),
         "jet_delta_eta": _plot_jet_single(merged, "deta"),
