@@ -130,9 +130,9 @@ DEFAULT_BEST_JSON = (
 # ── Paper labels & palette ────────────────────────────────────────────────
 GLOWUP = "GLOW-UP"
 TARGET = "Target"
-PUPPI_LABEL = "PUPPI (truth-assisted)"
+PUPPI_LABEL = "Ideal PUPPI with truth information"
 GLOWUP_COLOR = "tomato"
-TARGET_COLOR = "darkorange"
+TARGET_COLOR = "cornflowerblue"
 PUPPI_COLOR = "seagreen"
 
 # ── Fixed bin edges (kept constant so per-shard partials are mergeable) ─────
@@ -145,7 +145,7 @@ FEAT_BINS = [
 ]
 FEAT_LABELS = [r"$p_T$ [GeV]", r"$\eta$", r"$\phi$ [rad]"]
 FEAT_ROWS = ["All", "Charged", "Neutral"]
-NPART_PT_BINS = (0.0, 2.0, 5.0, 10.0, 20.0, 50.0, 200.0)   # 0-1 and 1-2 merged into 0-2
+NPART_PT_BINS = (0.0, 2.0, 5.0, 10.0, 20.0, 200.0)   # 0-1/1-2 merged into 0-2; 20-50/50-200 merged into 20-200
 CALO_E_BINS = np.logspace(np.log10(0.05), np.log10(2000.0), 60)
 RESIDUAL_KEYS = ("dpt", "dpt_over_truth", "deta", "dphi", "truth_pt")
 IND_THRESHOLD = 0.5
@@ -716,7 +716,7 @@ def _draw_jet_panel(ax, merged: dict, key: str, legend_fontsize: float = 11,
         handles.append(plt.Line2D([], [], color=PUPPI_COLOR, linestyle="-", linewidth=2.2))
         labels.append(f"PUPPI  {puppi_stats}" if puppi_stats else "PUPPI")
         handles.append(plt.Line2D([], [], color="none"))   # invisible: own row, no marker
-        labels.append("PUPPI - ideal truth-assisted")
+        labels.append("(Ideal PUPPI with truth information)")
 
     # Top headroom so the upper-right legend never hides the central peak
     # (this was missing for the linear deta/dphi panels).
@@ -921,7 +921,7 @@ def _plot_n_particles_from_counts(npart_truth: np.ndarray, npart_pred: np.ndarra
     bin_labels = [
         f"{NPART_PT_BINS[i]:g}-{NPART_PT_BINS[i + 1]:g}" for i in range(n_bins)
     ]
-    fig, ax = plt.subplots(figsize=(1.6 * n_bins + 3, 5.5))
+    fig, ax = plt.subplots(figsize=(1.6 * n_bins + 3, 7.15))   # height 30% taller (5.5 -> 7.15)
     width = 0.32
     pos = np.arange(n_bins)
     # GLOW-UP is always the LEFT box of each pair, matching the jet_residual_box_* figures.
@@ -1025,8 +1025,10 @@ def _plot_calo_e_dist_from_hist(calo: dict):
     edges = CALO_E_BINS
     truth, pred = calo["truth"].astype(float), calo["pred"].astype(float)
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.stairs(truth, edges, color=TARGET_COLOR, linewidth=2.0, label=f"{TARGET} (truth HS)  n={int(truth.sum()):,}")
-    ax.stairs(pred, edges, color=GLOWUP_COLOR, linewidth=2.0, label=f"{GLOWUP} (pred HS)  n={int(pred.sum()):,}")
+    h_truth = ax.stairs(truth, edges, color=TARGET_COLOR, linewidth=2.0,
+                        label=f"{TARGET} (truth HS)  n={int(truth.sum()):,}")
+    h_pred = ax.stairs(pred, edges, color=GLOWUP_COLOR, linewidth=2.0,
+                       label=f"{GLOWUP} (pred HS)  n={int(pred.sum()):,}")
     ax.set_xscale("log")
     ax.set_yscale("log")
     # 25% over the global sizes (labels 17, title 18, ticks 15) for this figure.
@@ -1039,7 +1041,9 @@ def _plot_calo_e_dist_from_hist(calo: dict):
     # the distribution.
     ylo, yhi = ax.get_ylim()
     ax.set_ylim(ylo, yhi * 100.0)
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=16.25)   # 25% over the 13pt default
+    # GLOW-UP listed first (draw order keeps Target behind it).
+    ax.legend(handles=[h_pred, h_truth], loc="upper right", framealpha=0.9,
+              fontsize=16.25)   # 25% over the 13pt default
     fig.tight_layout()
     return fig
 
@@ -1107,7 +1111,7 @@ def _plot_class_pt_resolution(pc: dict):
     ax.set_xlabel(r"truth $p_T$ [GeV]")
     ax.set_ylabel(r"IQR of $(p_T^{\mathrm{pred}} - p_T^{\mathrm{truth}}) / p_T^{\mathrm{truth}}$")
     ax.set_title(f"{GLOWUP} $p_T$ resolution per class")
-    ax.legend()
+    ax.legend(fontsize=18.59)
     fig.tight_layout()
     return fig
 
@@ -1126,15 +1130,20 @@ def _plot_class_pt_distribution(pc: dict):
         h = cpt[c].astype(float)
         if h.sum() <= 0:
             continue
-        ax.stairs(h, bins, color=CLASS_COLORS[c], linewidth=1.8,
-                  label=f"{CLASS_LABELS[c]} (N={int(h.sum()):,})")
+        ax.stairs(h, bins, color=CLASS_COLORS[c], linewidth=1.8, label=CLASS_LABELS[c])
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(1.0, 200.0)
-    ax.set_xlabel(r"Particle $p_T$ [GeV]")
-    ax.set_ylabel("Particles")
-    ax.set_title(f"{TARGET} particle $p_T$ spectrum per class")
-    ax.legend(fontsize=11)
+    # Stretch the log y-axis 5x upward to give the legend clear air above the curves.
+    ylo, yhi = ax.get_ylim()
+    ax.set_ylim(ylo, yhi * 5.0)
+    # All text 30% over the global sizes (labels 17, title 18, ticks 15) and the
+    # previous 11pt legend.
+    ax.set_xlabel(r"Particle $p_T$ [GeV]", fontsize=22.1)
+    ax.set_ylabel("Particles", fontsize=22.1)
+    ax.set_title(f"{TARGET} particle $p_T$ spectrum per class", fontsize=23.4)
+    ax.tick_params(axis="both", which="major", labelsize=19.5)
+    ax.legend(fontsize=18.59)
     fig.tight_layout()
     return fig
 
@@ -1237,16 +1246,17 @@ def _plot_class_efficiency(pc: dict):
     for c in range(N_CLASSES):
         with np.errstate(invalid="ignore", divide="ignore"):
             e = np.where(den[c] > 0, num[c] / den[c], np.nan)
-            err = np.where(den[c] > 0, np.sqrt(np.clip(e * (1 - e), 0, None) / np.where(den[c] > 0, den[c], 1)), np.nan)
-        ax.errorbar(centers, e, yerr=err, marker="o", capsize=2, color=CLASS_COLORS[c], label=CLASS_LABELS[c])
+        ax.plot(centers, e, marker="o", color=CLASS_COLORS[c], label=CLASS_LABELS[c])
     ax.axhline(1.0, color="gray", lw=1, ls="--")
     ax.set_xscale("log")
     ax.set_xlim(None, 200.0)
     ax.set_ylim(0, 1.1)
-    ax.set_xlabel(r"truth $p_T$ [GeV]")
-    ax.set_ylabel("reconstruction efficiency")
-    ax.set_title(f"{GLOWUP} reconstruction efficiency per class")
-    ax.legend()
+    # Text sizes matched to class_pt_distribution.
+    ax.set_xlabel(r"truth $p_T$ [GeV]", fontsize=22.1)
+    ax.set_ylabel("reconstruction efficiency", fontsize=22.1)
+    ax.set_title(f"{GLOWUP} reconstruction efficiency per class", fontsize=23.4)
+    ax.tick_params(axis="both", which="major", labelsize=19.5)
+    ax.legend(fontsize=14.3)
     fig.tight_layout()
     return fig
 
@@ -1261,15 +1271,16 @@ def _plot_class_fake_rate_vs_pt(pc: dict):
     for c in range(N_CLASSES):
         with np.errstate(invalid="ignore", divide="ignore"):
             fr = np.where(den[c] > 0, num[c] / den[c], np.nan)
-            err = np.where(den[c] > 0, np.sqrt(np.clip(fr * (1 - fr), 0, None) / np.where(den[c] > 0, den[c], 1)), np.nan)
-        ax.errorbar(centers, fr, yerr=err, marker="o", capsize=2, color=CLASS_COLORS[c], label=CLASS_LABELS[c])
+        ax.plot(centers, fr, marker="o", color=CLASS_COLORS[c], label=CLASS_LABELS[c])
     ax.set_xscale("log")
     ax.set_xlim(None, 200.0)
     ax.set_ylim(0, 1.05)
-    ax.set_xlabel(r"Pred $p_T$ [GeV]")
-    ax.set_ylabel("Fake rate")
-    ax.set_title(f"{GLOWUP} per-class fake rate vs $p_T$")
-    ax.legend()
+    # Text sizes matched to class_pt_distribution.
+    ax.set_xlabel(r"Pred $p_T$ [GeV]", fontsize=22.1)
+    ax.set_ylabel("Fake rate", fontsize=22.1)
+    ax.set_title(f"{GLOWUP} per-class fake rate vs $p_T$", fontsize=23.4)
+    ax.tick_params(axis="both", which="major", labelsize=19.5)
+    ax.legend(fontsize=18.59)
     fig.tight_layout()
     return fig
 
