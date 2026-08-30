@@ -5,7 +5,7 @@ from torch import Tensor, nn
 from torch.nn.attention.flex_attention import create_block_mask, create_mask
 
 from hepattn.flex import relative_position, relative_position_wrapped
-from hepattn.flex.sliding_window import sliding_window_mask, sliding_window_mask_wrapped
+from hepattn.flex.sliding_window import global_token_window_mask, sliding_window_mask, sliding_window_mask_wrapped
 from hepattn.models.attention import Attention, repad_from_flash_varlen, unpad_for_flash_varlen
 from hepattn.models.dense import Dense
 
@@ -223,7 +223,7 @@ class Encoder(nn.Module):
         for layer in self.layers:
             self.attn_type = layer.attn.fn.set_backend(self.attn_type)
 
-    def forward(self, x: Tensor, x_sort_value: Tensor | None = None, **kwargs) -> Tensor:
+    def forward(self, x: Tensor, x_sort_value: Tensor | None = None, n_global_tokens: int = 0, **kwargs) -> Tensor:
         batch_size = x.shape[0]
         seq_len = x.shape[-2]
 
@@ -254,19 +254,29 @@ class Encoder(nn.Module):
             raise ValueError("kv_mask must be provided for flash-varlen attention.")
 
         # Initialise sliding window mask
-        if self.mask_mod is None and self.attn_type != "flash" and self.window_size:
+        # When global tokens are present (n_global_tokens > 0) we use a per-call mask
+        # so that the correct seq_len and n_global_tokens are encoded in the mask.
+        if n_global_tokens > 0 and self.window_size:
+            # Global token mask: window for regular tokens + full attention for global tokens
+            mask_mod = global_token_window_mask(self.window_size, n_global_tokens, seq_len)
+        elif self.mask_mod is None and self.attn_type != "flash" and self.window_size:
             self.seq_len = torch.tensor([1], device=x.device)
             self.mask_mod = (
                 sliding_window_mask(self.window_size) if not self.window_wrap else sliding_window_mask_wrapped(self.window_size, self.seq_len)
             )
+            mask_mod = self.mask_mod
+        else:
+            mask_mod = self.mask_mod
 
         # Handle masking
         attn_mask = None
-        if self.attn_type == "torch" and self.mask_mod:
-            attn_mask = create_mask(self.mask_mod, 1, 1, seq_len, seq_len, device=x.device)
-        elif self.attn_type == "flex" and self.mask_mod:
+        if self.attn_type == "torch" and mask_mod:
+            attn_mask = create_mask(mask_mod, 1, 1, seq_len, seq_len, device=x.device)
+        elif self.attn_type == "flex" and mask_mod:
+            if self.seq_len is None:
+                self.seq_len = torch.tensor([seq_len], device=x.device)
             self.seq_len[0] = seq_len
-            attn_mask = create_block_mask(self.mask_mod, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=x.device)
+            attn_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=x.device)
 
         # Add wrapping for flash attention with sliding window
         if self.attn_type == "flash" and self.window_wrap:

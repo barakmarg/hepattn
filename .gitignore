@@ -160,6 +160,7 @@ pytest-temp
 *.zip
 *.parquet
 *.pickle
+*.pkl
 *.h5
 *.csv
 *.npy

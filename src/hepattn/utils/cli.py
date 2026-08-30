@@ -1,3 +1,4 @@
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -70,8 +71,15 @@ class CLI(LightningCLI):
         sc = self.config[self.subcommand]
 
         if self.subcommand == "fit":
-            # Get timestamped output dir for this run
-            timestamp = datetime.now().strftime("%Y%m%d-T%H%M%S")  # noqa: DTZ005
+            # Get timestamped output dir for this run.
+            # Under DDP, Lightning re-runs this CLI in each subprocess; without
+            # sharing the timestamp, every rank would pick a different one and
+            # land in a different run dir. Generate once and pass via env (the
+            # subprocess launcher inherits os.environ), so all ranks agree.
+            timestamp = os.environ.get("HEPATTN_RUN_TS")
+            if timestamp is None:
+                timestamp = datetime.now().strftime("%Y%m%d-T%H%M%S")  # noqa: DTZ005
+                os.environ["HEPATTN_RUN_TS"] = timestamp
             log = "trainer.logger"
             name = sc["name"]
             log_dir = Path(sc["trainer.default_root_dir"])

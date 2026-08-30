@@ -1,0 +1,416 @@
+# ODD Three-Stream MaskFormer: Pileup Removal + Reconstruction
+# Stream A: Track MaskFormer (isolated, protects Track F1)
+# Stream B: Calo MaskFormer (hybrid queries from HS tracks + latent queries)
+# Stream C: Reconstruction (standard MaskFormerDecoder with Hungarian matching)
+
+name: odd_pflow_reco
+seed_everything: 42
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  inputs:
+    node:
+      - "d0"
+      - "z0"
+      - "phi"
+      - "theta"
+      - "qop"
+      - "energy"
+      - "eta"
+      - "is_track"
+
+  targets:
+    particle:
+      - e
+      - pt
+      - eta
+      - sinphi
+      - cosphi
+
+  # Maximum number of reconstructed particles (for incidence matrix / queries)
+  num_objects: &num_reco_particles 400
+
+  train_path: /storage/agrp/barakma/PileupODD/data/fervefvef
+  valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
+  test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
+
+  # For backend: mmap this must be the prep_mmap.py output dir (shard_*.pt +
+  # shards_index.pt). train_job.sh overrides it to the $TMPDIR/mmap staged copy.
+  unify_path: /storage/agrp/barakma/PileupODD/data/ttbar_pu0_overlay_pu200
+  enable_split: true
+  train_split: 0.9
+  val_split: 0.1
+  test_split: 0.1
+  val_and_test_split_same: true
+  overtrain: false
+
+  # Data loading backend:
+  #   eager : read all parquet shards into RAM at startup (single-GPU; high RAM).
+  #   mmap  : per-shard memory-mapped .pt files (large datasets / multi-GPU).
+  #           For mmap, point unify_path at the dir built by prep_mmap.py
+  #           (contains shard_*.pt + shards_index.pt), ideally staged on $TMPDIR.
+  backend: eager
+
+  num_workers: 8
+  num_val_workers: 1
+  num_test_workers: 1
+  num_train: -1
+  num_test: -1
+  num_val: -1
+
+  batch_size: 32
+  incidence_cutval: 0.01
+  hard_scatter_energy_threshold: 0.1
+
+  scale_dict_path: &scale_dict_path /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/configs/odd_var_transform.yaml
+  max_nodes: 5500
+  window_size: 256
+
+# =============================================================================
+# Trainer Configuration
+# =============================================================================
+trainer:
+  max_epochs: 50
+  accelerator: gpu
+  devices: 4
+  # DDP: one process per GPU. find_unused_parameters=true is required for this
+  # 3-stream model (some heads/params get no gradient on a given step, e.g.
+  # cost_weight=0 / mask-gated tasks). Do NOT add static_graph.
+  strategy:
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args:
+      find_unused_parameters: true
+  precision: bf16-mixed
+  gradient_clip_val: 0.1
+  log_every_n_steps: 50
+  default_root_dir: logs
+  enable_progress_bar: True
+
+  logger:
+    class_path: hepattn.experiments.odd_pileup_reco.logger_utils.FixedCometLogger
+    init_args:
+      project: odd-pflow-reco
+
+  callbacks:
+    - class_path: hepattn.callbacks.Compile
+    - class_path: hepattn.callbacks.InferenceTimer
+    - class_path: hepattn.callbacks.SaveConfig
+    - class_path: hepattn.experiments.odd_pileup_reco.PflowPredictionWriter
+    - class_path: hepattn.callbacks.Checkpoint
+      init_args:
+        monitor: val/loss
+        save_last: true
+    - class_path: lightning.pytorch.callbacks.ModelSummary
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+    - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 50
+
+# =============================================================================
+# Model Configuration — Three-Stream MaskFormer
+# =============================================================================
+model:
+  optimizer: AdamW
+
+  lrs_config:
+    initial: 6.25e-7
+    max: 6.25e-5
+    end: 6.25e-7
+    pct_start: 0.05
+    weight_decay: 0.01
+    skip_scheduler: false
+
+  mtl: false
+
+  model:
+    class_path: hepattn.experiments.odd_pileup_reco.model.TwoStreamMaskFormer
+    init_args:
+      dim: &dim 256
+      target_object: particle
+      max_hs_tracks: 190
+      num_latent_queries: 16
+      teacher_forcing: false
+
+      # Raw variables forwarded through x dict
+      raw_variables:
+        - "node_e"
+        - "node_pt"
+        - "node_eta"
+        - "node_sinphi"
+        - "node_cosphi"
+        - "node_is_track"
+        - "tracks_mask"
+
+      # Input network: embed all nodes (tracks + clusters) into dim-D space
+      input_nets:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            - class_path: hepattn.models.InputNet
+              init_args:
+                input_name: node
+                fields:
+                  - features
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: 24
+                    output_size: *dim
+                posenc:
+                  class_path: hepattn.models.posenc.FourierPositionEncoder
+                  init_args:
+                    input_name: node
+                    dim: *dim
+                    fields: [eta, phi]
+                    scale: 0.1
+
+      # Sort field for windowed attention
+      input_sort_field: deltaR_idx
+
+      # Shared encoder: windowed attention over all nodes
+      encoder:
+        class_path: hepattn.models.Encoder
+        init_args:
+          num_layers: 8
+          dim: *dim
+          attn_type: flash-varlen
+          window_size: 256
+          window_wrap: false
+          hybrid_norm: true
+          value_residual: true
+          attn_kwargs:
+            num_heads: 16
+
+      # =====================================================================
+      # Stream A: Track Decoder + Tasks
+      # =====================================================================
+      track_decoder:
+        class_path: hepattn.experiments.odd_pileup_reco.pileup_maskformer_decoder.PileupMaskFormerDecoder
+        init_args:
+          prior_mask_key: "node_is_track"
+          num_decoder_layers: 4
+          num_queries: 1
+          mask_attention: true
+          use_query_masks: false
+          decoder_layer_config:
+            dim: *dim
+            hybrid_norm: true
+            bidirectional_ca: true
+            attn_kwargs:
+              num_heads: 16
+
+      track_tasks:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            - class_path: hepattn.models.task.ObjectHitMaskTask
+              init_args:
+                name: mask
+                input_hit: node
+                input_object: query
+                output_object: pflow
+                target_object: particle
+                pred_threshold: 0.5
+                logit_scale: 4
+                losses:
+                  mask_bce: 5.0
+                  mask_dice: 1.0
+                costs: {}
+                dim: *dim
+                null_weight: 0.06
+                has_intermediate_loss: true
+
+            - class_path: hepattn.models.task.ObjectRegressionTask
+              init_args:
+                name: vz_regression
+                input_object: query
+                output_object: pflow
+                target_object: particle
+                fields: [vz]
+                loss_weight: 0.01179
+                cost_weight: 0.0
+                dim: *dim
+                loss: smooth_l1
+                has_intermediate_loss: false
+
+      # =====================================================================
+      # Stream B: Calo Decoder + Tasks
+      # =====================================================================
+      calo_decoder:
+        class_path: hepattn.experiments.odd_pileup_reco.decoder.CaloFlashCrossAttentionDecoder
+        init_args:
+          dim: *dim
+          num_decoder_layers: 4
+          hybrid_norm: true
+          attn_kwargs:
+            num_heads: 16
+            attn_type: flash-varlen
+
+      calo_tasks:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            - class_path: hepattn.experiments.odd_pileup_reco.tasks.CaloNodeMaskTask
+              init_args:
+                name: calo_mask
+                input_hit: node
+                losses:
+                  mask_bce: 5.0
+                  mask_tversky: 5.0
+                dim: *dim
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    output_size: 1
+                    hidden_layers: [128, 64, 32]
+                    activation:
+                      class_path: torch.nn.SiLU
+                null_weight: 0.05
+                pred_threshold: 0.3
+                hs_energy_threshold: 0.15
+                hs_frac_threshold: 0.10
+                has_intermediate_loss: false
+
+      # =====================================================================
+      # Stream C: Reconstruction Decoder + Tasks
+      # =====================================================================
+      max_reco_calo_nodes: 1200
+      max_reco_nodes: 1400
+      num_reco_queries: *num_reco_particles
+      reco_target_object: reco_particle
+      calo_hs_frac_threshold: 0.10
+      calo_hs_energy_threshold: 0.15
+      calo_pred_threshold: 0.3
+      # Distribution-matched teacher forcing for Stream C (reproduces the inference
+      # selection: purity/recall/size/energy-spectrum). FP count ~ N(mean, std) per event.
+      reco_calo_noise_mean: 170      # mean FP pileup calo nodes added per event
+      reco_calo_noise_std: 100.0     # per-event Gaussian spread of the FP count
+      reco_calo_fn_frac: 0.10        # random fraction of true HS calo dropped (false negatives)
+      reco_track_fn_frac: 0.10       # random fraction of true HS tracks dropped
+      reco_track_fp_frac: 0.10       # FP tracks added ~ frac * (#true HS tracks)
+
+      reco_decoder:
+        class_path: hepattn.models.decoder.MaskFormerDecoder
+        init_args:
+          num_decoder_layers: 4
+          num_queries: *num_reco_particles
+          mask_attention: true
+          use_query_masks: false
+          decoder_layer_config:
+            dim: *dim
+            hybrid_norm: true
+            bidirectional_ca: true
+            attn_kwargs:
+              num_heads: 16
+
+      reco_matcher:
+        class_path: hepattn.models.matcher.Matcher
+        init_args:
+          default_solver: scipy
+          adaptive_solver: false
+          parallel_solver: true
+          n_jobs: 16
+
+      reco_tasks:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            # 1. Classification task (6 classes: 0-4 real + 5 null)
+            - class_path: hepattn.models.task.ObjectClassificationTask
+              init_args:
+                name: classification
+                input_object: query
+                output_object: reco_pflow
+                target_object: reco_particle
+                num_classes: 5
+                losses:
+                  object_ce: 2
+                costs:
+                  object_ce: 2
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    activation: torch.nn.SiLU
+                    output_size: 6
+                    hidden_layers: [128, 64, 32]
+                null_weight: 0.8
+                loss_class_weights: [1.0, 3.0, 8.0, 1.5, 1.0]
+                mask_queries: false
+                has_intermediate_loss: true
+
+            # 2. Mask task (object-hit association)
+            - class_path: hepattn.models.task.ObjectHitMaskTask
+              init_args:
+                name: mask
+                input_hit: node
+                input_object: query
+                output_object: reco_pflow
+                target_object: reco_particle
+                pred_threshold: 0.1
+                logit_scale: 4
+                losses:
+                  mask_bce: 5.0
+                  mask_dice: 1.0
+                costs:
+                  mask_dice: 1.0
+                dim: *dim
+                null_weight: 1.0
+                has_intermediate_loss: true
+
+            # 3. Incidence regression (energy-weighted particle-node assignment)
+            - class_path: hepattn.models.task.IncidenceRegressionTask
+              init_args:
+                name: incidence
+                input_hit: node
+                input_object: query
+                output_object: reco_pflow
+                target_object: reco_particle
+                losses:
+                  kl_div: 1.0
+                costs:
+                  kl_div: 1.0
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    activation: torch.nn.SiLU
+                    output_size: *dim
+                    hidden_layers: [*dim, *dim]
+                node_net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    output_size: *dim
+                    hidden_layers: [*dim]
+                has_intermediate_loss: false
+
+            # 4. Incidence-based regression (particle kinematics)
+            - class_path: hepattn.models.task.IncidenceBasedRegressionTask
+              init_args:
+                name: regression
+                fields: ["e", "pt", "eta", "sinphi", "cosphi"]
+                input_hit: node
+                input_object: query
+                output_object: reco_pflow
+                target_object: reco_particle
+                loss: l1
+                loss_weight: 10.0
+                cost_weight: 10.0
+                use_incidence: true
+                use_nodes: true
+                cost: new
+                mode: scale
+                scale_dict_path: *scale_dict_path
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    # Input: 2*dim + num_raw_vars = 2*128 + 6 = 262
+                    input_size: 518
+                    activation: torch.nn.SiLU
+                    output_size: 5
+                    hidden_layers: [256, 128, 64, 32]
+                has_intermediate_loss: false

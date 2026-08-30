@@ -317,7 +317,7 @@ class ObjectHitMaskTask(Task):
         object_hit_logit = self.logit_scale * torch.einsum("bnc,bmc->bnm", x_object, x_hit)
 
         # Zero out entries for any hit slots that are not valid
-        object_hit_logit[~x[self.input_hit + "_valid"].unsqueeze(-2).expand_as(object_hit_logit)] = torch.finfo(object_hit_logit.dtype).min
+        object_hit_logit[~x[self.input_hit + "_valid"].unsqueeze(-2).expand_as(object_hit_logit)] = -100.0
 
         return {self.output_object_hit + "_logit": object_hit_logit}
 
@@ -335,7 +335,11 @@ class ObjectHitMaskTask(Task):
 
     def predict(self, outputs: dict[str, Tensor]) -> dict[str, Tensor]:
         # Object-hit pairs that have a predicted probability above the threshold are predicted as being associated to one-another
-        return {self.output_object_hit + "_valid": outputs[self.output_object_hit + "_logit"].detach().sigmoid() >= self.pred_threshold}
+        prob = outputs[self.output_object_hit + "_logit"].detach().sigmoid()
+        return {
+            self.output_object_hit + "_valid": prob >= self.pred_threshold,
+            self.output_object_hit + "_prob": prob,
+        }
 
     def cost(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
         output = outputs[self.output_object_hit + "_logit"].detach().to(torch.float32)
@@ -1043,6 +1047,12 @@ class IncidenceRegressionTask(Task):
         output = outputs[self.output_object + "_incidence"].detach().to(torch.float32)
         target = targets[self.target_object + "_incidence"].to(torch.float32)
 
+        # Mask out padded node positions in the target so they don't pollute the
+        # matching cost. Pred is already zeroed at padded positions by forward().
+        node_valid_key = self.input_hit + "_valid"
+        if node_valid_key in targets:
+            target = target * targets[node_valid_key].to(target.dtype).unsqueeze(1)
+
         costs = {}
         for cost_fn, cost_weight in self.costs.items():
             costs[cost_fn] = cost_weight * cost_fns[cost_fn](output, target)
@@ -1123,7 +1133,13 @@ class IncidenceBasedRegressionTask(RegressionTask):
         # get the predictions
         if self.use_incidence:
             inc = x["incidence"].detach()
+            #print('x:',x)
+
             proxy_feats, is_charged = self.get_proxy_feats(inc, x, class_probs=x["class_probs"].detach())
+            #print("Proxy features shape:", proxy_feats.shape)
+            #print(proxy_feats)
+            #print("Is charged shape:", is_charged.shape)
+            #print(is_charged)
             input_data = torch.cat(
                 [
                     x[self.input_object + "_embed"],
@@ -1242,15 +1258,37 @@ class IncidenceBasedRegressionTask(RegressionTask):
         charged_inc_top2 = (topk_attn(charged_inc, 2, dim=-2) & (charged_inc > 0)).float()
         charged_inc_max = charged_inc.max(-2, keepdim=True)[0]
         charged_inc_new = (charged_inc == charged_inc_max) & (charged_inc > 0)
+        # ------------------------
+        particle_max_idx = charged_inc.argmax(dim=-1, keepdim=True)
+        # Create a mask that is True only at that specific index
+        is_first_max_particle = torch.zeros_like(charged_inc, dtype=torch.bool).scatter_(-1, particle_max_idx, True)
+        # Apply the filter
+        charged_inc_new = charged_inc_new & is_first_max_particle
+        # ---------------------
         # TODO: check this
         # charged_inc_new = charged_inc.float()
         zero_track_mask = charged_inc_new.sum(-1, keepdim=True) == 0
         charged_inc = torch.where(zero_track_mask, charged_inc_top2, charged_inc_new)
 
+        # -------------------------
+        # --- ADDED: Final Cleanup (Fixes the Top2/Recovery duplicates) ---
+        # 1. Look at the incidence scores ONLY for the tracks we have currently selected
+        current_scores = incidence * charged_inc
+        # 2. Find the single best track among the selected ones
+        final_best_idx = current_scores.argmax(dim=-1, keepdim=True)
+        # 3. Create a strict mask for that one track
+        final_strict_mask = torch.zeros_like(charged_inc, dtype=torch.bool).scatter_(-1, final_best_idx, True)
+        # 4. Apply the mask. 
+        # Note: If charged_inc was all zeros, intersection with final_strict_mask remains zeros.
+        charged_inc = charged_inc * final_strict_mask.float()
+
+        #-----------------
         # Split charged and neutral
         is_charged = class_probs.argmax(-1) < 3
-
+        #print(torch.max(torch.abs(proxy_feats[..., 2])), 'max eta before proxy scaling')
         proxy_feats_charged = torch.bmm(charged_inc, proxy_feats)
+        #print(torch.max(torch.abs(proxy_feats_charged[..., 2])), 'max eta after bmm')
+        
         proxy_feats_charged[..., 0] = proxy_feats_charged[..., 1] * torch.cosh(proxy_feats_charged[..., 2])
         proxy_feats_charged = self.scale_proxy_feats(proxy_feats_charged) * is_charged.unsqueeze(-1)
 

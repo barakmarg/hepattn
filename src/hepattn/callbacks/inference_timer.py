@@ -46,8 +46,14 @@ class InferenceTimer(Callback):
 
     def on_test_end(self, trainer, pl_module):
         pl_module.forward = self.old_forward
-        self.times = self.times[self.n_warm_start :]  # ensure warm start
-        self.dims = self.dims[self.n_warm_start :]
+        if len(self.times) > self.n_warm_start:
+            self.times = self.times[self.n_warm_start :]  # ensure warm start
+            self.dims = self.dims[self.n_warm_start :]
+        else:
+            warnings.warn(
+                f"Number of batches ({len(self.times)}) is less than or equal to n_warm_start ({self.n_warm_start}). "
+                "Using all batches for timing."
+            )
 
         if not len(self.times):
             raise ValueError("No times recorded.")

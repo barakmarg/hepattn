@@ -22,13 +22,13 @@ data:
 
   num_objects: &num_particles 150
 
-  train_path: /share/gpu1/syw24/dmitrii_clic/train_clic_fix.root
-  valid_path: /share/gpu1/syw24/dmitrii_clic/val_clic_fix.root
-  test_path: /share/gpu1/syw24/dmitrii_clic/test_clic_fix.root
+  train_path: /storage/agrp/dmitrykl/hgpf/hepformer/data/nilo/train_clic_fix.root
+  valid_path: /storage/agrp/dmitrykl/hgpf/hepformer/data/nilo/val_clic_fix.root
+  test_path: /storage/agrp/dmitrykl/hgpf/hepformer/data/nilo/test_clic_fix.root
 
   num_workers: 16
-  num_train: -1
-  num_test: -1
+  num_train: 1024
+  num_test: 1024
   num_val: 5000
 
   batch_size: 512
@@ -39,7 +39,7 @@ data:
 trainer:
   max_epochs: 200
   accelerator: gpu
-  devices: 2
+  devices: 1
   precision: bf16-mixed
   gradient_clip_val: 0.1
   log_every_n_steps: 50
@@ -49,7 +49,7 @@ trainer:
   logger:
     class_path: lightning.pytorch.loggers.CometLogger
     init_args:
-      project_name: hepattn-clic
+      project: clic-trial
 
   callbacks:
     - class_path: hepattn.callbacks.Compile

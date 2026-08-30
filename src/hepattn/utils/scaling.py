@@ -36,6 +36,8 @@ class VarTransform:
             x = torch.log1p(x)
         elif self.fn == "sqrt":
             x = torch.sqrt(x)
+        elif self.fn == 'sqrt4':
+            x = torch.pow(x, 1/4)
 
         return (x - shift) / scale
 
