@@ -1,6 +1,8 @@
 # train_job.sh — 4-GPU DDP training job body (submitted by start.sh). Builds the mmap dataset on the node (into the
 # node-local NVMe $TMPDIR) straight from the Lustre parquet, then trains.
-export COMET_API_KEY=rw9qVay7dAEGfWtM0hgakSmIh
+# Comet key: from ~/.comet.env (see comet_env.sh). Overridden by a key passed
+# as an argument, or by COMET_KEY_OVERRIDE, which start.sh forwards via qsub -v.
+source /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/comet_env.sh --require ${COMET_KEY_OVERRIDE:-} "$@" || exit 1
 source /usr/wipp/conda/24.5.0u/bin/activate /usr/wipp/conda/24.5.0u/envs/common
 pushd /storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco
 

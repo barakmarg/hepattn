@@ -8,6 +8,12 @@ set -euo pipefail
 
 WORKDIR=/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco
 
+# Comet key. Each job reads ~/.comet.env on the compute node (see comet_env.sh),
+# so the key is never written into the job script PBS spools. Pass a key as the
+# first argument to override -- note that a key given this way *is* embedded in
+# the submitted script.
+COMET_KEY_ARG="${1:-}"
+
 CKPTS=(
   "${WORKDIR}/logs/odd_pflow_reco_20260615-T105829/ckpts/epoch=072-val_loss=12.74524.ckpt"
   "${WORKDIR}/logs/odd_pflow_reco_20260615-T233516/ckpts/epoch=083-val_loss=11.27779.ckpt"
@@ -22,7 +28,7 @@ for CKPT in "${CKPTS[@]}"; do
     -e "${WORKDIR}/fwd_ggf_${i}.err.log" \
     -l walltime=07:00:00,mem=48gb,ncpus=16,ngpus=1,io=1,gputype=A6000 \
     <<EOF
-export COMET_API_KEY=rw9qVay7dAEGfWtM0hgakSmIh
+source ${WORKDIR}/comet_env.sh --require ${COMET_KEY_ARG} || exit 1
 source /usr/wipp/conda/24.5.0u/bin/activate /usr/wipp/conda/24.5.0u/envs/common
 cd ${WORKDIR}
 export IOTHROTTLE_LIMIT=100
