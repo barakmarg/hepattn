@@ -202,6 +202,23 @@ Edit `run_forward_pass.py` to choose the sample and size:
 CPU-only; runs on a login node. Map-reduce over the H5 shards, cached and
 resumable.
 
+**Use `make_paper_plots.sh`.** It reproduces the paper figures directly — both
+evaluation samples, with the exact arguments the published figures came from,
+writing the 14 figures per sample that the paper actually uses:
+
+```bash
+./make_paper_plots.sh                    # -> ./ttbar/ and ./dihiggs/
+./make_paper_plots.sh $HOME/my_plots     # -> anywhere you can write
+```
+
+The output directory is the only argument, and it is optional; everything else
+is pinned, so a re-run cannot silently give you a re-tuned or re-binned variant
+of a published figure. The script activates the environment of §1 itself, and
+sidesteps the one-line-paste trap of §8. Its header comments document every
+argument, the defaults left alone, and when `--force` is needed.
+
+To plot a **different** run or sample, call the underlying script directly:
+
 ```bash
 python run_paper_performance_plots.py \
   --h5 "logs/<run>/ckpts/<ckpt-stem>__test<suff>" \
@@ -224,8 +241,15 @@ The PUPPI comparison is mandatory: if the parquet dir does not contain the
 events referenced by the H5, the run **fails loudly** rather than quietly
 dropping PUPPI.
 
-The exact figures used in the paper, with their cached aggregates, are archived
-at `/storage/agrp/barakma/odd_paper/` (§2).
+**Backups.** Everything the paper results came from is archived at
+`/storage/agrp/barakma/odd_paper/` (§2), outside the repo and independent of
+`logs/`: the `epoch=028` checkpoint under `models/`, the PUPPI tuning in use
+under `puppi/`, and the original ttbar and dihiggs figure sets. Those two figure
+directories keep their `merged_aggregate.pkl` and `state/`, so if you only want
+to restyle a figure, copy one somewhere writable and point
+`run_paper_performance_plots.py --out-dir` at the copy — it re-renders in
+seconds without touching the H5 shards or re-running PUPPI. Use
+`make_paper_plots.sh` when you want the figures recomputed from the predictions.
 
 ## 7. PUPPI baseline & tuning
 

@@ -1371,53 +1371,75 @@ def _plot_jet_matching(jm: dict):
 
 
 def render_all(merged: dict) -> dict:
+    """Render the figure set.
+
+    Entries commented out below are diagnostics that no figure in the paper
+    references; the plotting functions are kept, so re-enabling one is a matter
+    of uncommenting its line. The shard aggregates they consume are still
+    computed in :func:`analyze_shard`, so nothing about the map/reduce cost
+    changes -- only what gets rendered and written.
+    """
     methods = [(GLOWUP, merged["glow_res"]), (PUPPI_LABEL, merged["puppi_res"])]
     figs = {
-        "jet_resolution": _plot_jet_resolution(merged),
-        "jet_resolution_binned": _make_binned_plots(methods, edges=JET_RES_PT_EDGES),
-        "jet_resolution_iqr_binned": _plot_jet_iqr_binned(methods),
+        # app:eff_fake / sec:res_jets box plots
         "jet_residual_box_dpt": _plot_jet_residual_box_single(
             methods, "dpt_over_truth", r"Jet $\Delta p_T / p_T^{\mathrm{Target}}$", (-1.0, 1.2)),
         "jet_residual_box_deta": _plot_jet_residual_box_single(
             methods, "deta", r"Jet $\Delta\eta$", (-0.15, 0.15)),
         "jet_residual_box_dphi": _plot_jet_residual_box_single(
             methods, "dphi", r"Jet $\Delta\phi$", (-0.15, 0.15)),
-        # Same panels as jet_resolution, each as its own standalone figure.
+        # sec:res_jets -- the four panels of fig:jetres_top / fig:jetres_higgs
+        # (copied into the paper with a dihiggs_ prefix for the OOD sample).
         "jet_relative_pt": _plot_jet_single(merged, "dpt_over_truth"),
         "jet_delta_eta": _plot_jet_single(merged, "deta"),
         "jet_delta_phi": _plot_jet_single(merged, "dphi"),
         "jet_energy": _plot_jet_single(merged, "energy"),
+        # Fig. 2a (sec:res_pileup)
         "track_f1_vs_pt": _plot_track_f1_from_counts(merged["track"]),
-        "track_pr_curve": _plot_track_pr_curve(merged["track"]),
+        # Fig. 3 (sec:res_particles)
         "n_particles_by_pt_bin": _plot_n_particles_from_counts(merged["npart_truth"], merged["npart_pred"]),
-        "feature_scatter": _plot_feature_scatter_from_hist(merged["feat_hist"]),
-        **({
-            f"class_counts_{('nocut' if c <= 0 else 'pt' + format(c, 'g').replace('.', 'p'))}":
-                _plot_class_counts(merged["class_count"], k)
-            for k, c in enumerate(CLASS_COUNT_PT_CUTS)
-        } if merged.get("class_count") is not None else {}),
-        **({"class_pt_spectrum": _plot_class_pt_spectrum(merged["class_pt_spec"])}
-           if merged.get("class_pt_spec") is not None else {}),
-        "calo_recall_vs_pt": _plot_calo_recall_from_counts(merged["calo"]),
+        # Fig. 2b (sec:res_pileup)
         "calo_pred_vs_truth_e_dist": _plot_calo_e_dist_from_hist(merged["calo"]),
+
+        # --- not in the paper ---------------------------------------------
+        # jet_resolution is the 3x2 composite of the four panels kept above;
+        # the paper uses the standalone panels instead.
+        # "jet_resolution": _plot_jet_resolution(merged),
+        # "jet_resolution_binned": _make_binned_plots(methods, edges=JET_RES_PT_EDGES),
+        # "jet_resolution_iqr_binned": _plot_jet_iqr_binned(methods),
+        # "track_pr_curve": _plot_track_pr_curve(merged["track"]),
+        # "feature_scatter": _plot_feature_scatter_from_hist(merged["feat_hist"]),
+        # **({
+        #     f"class_counts_{('nocut' if c <= 0 else 'pt' + format(c, 'g').replace('.', 'p'))}":
+        #         _plot_class_counts(merged["class_count"], k)
+        #     for k, c in enumerate(CLASS_COUNT_PT_CUTS)
+        # } if merged.get("class_count") is not None else {}),
+        # **({"class_pt_spectrum": _plot_class_pt_spectrum(merged["class_pt_spec"])}
+        #    if merged.get("class_pt_spec") is not None else {}),
+        # "calo_recall_vs_pt": _plot_calo_recall_from_counts(merged["calo"]),
     }
-    if merged.get("jet_match") is not None:
-        figs["jet_matching_efficiency"] = _plot_jet_matching(merged["jet_match"])
+    # Not in the paper:
+    # if merged.get("jet_match") is not None:
+    #     figs["jet_matching_efficiency"] = _plot_jet_matching(merged["jet_match"])
     # Per-class figures only when the (matched) per-class aggregates are present
     # (skipped silently for older caches that predate them — re-run with --force).
     pc = merged.get("per_class")
     if pc is not None:
-        figs["class_confusion_matrix"] = _plot_class_confusion(pc)
-        figs["class_pt_response"] = _plot_class_pt_response(pc)
-        figs["class_pt_resolution"] = _plot_class_pt_resolution(pc)
-        if "class_pt" in pc:
-            figs["class_pt_distribution"] = _plot_class_pt_distribution(pc)
+        if "res_truth_n" in pc:
+            # sec:res_particles, fig:ptrel_class
+            figs["class_residuals"] = _plot_class_residuals(pc)
+        # app:eff_fake, fig:class_eff / fig:class_fake / fig:class_pt
         figs["class_efficiency_vs_pt"] = _plot_class_efficiency(pc)
-        figs["class_f1_vs_pt"] = _plot_class_f1_vs_pt(pc)
         if "fake_pred_n" in pc:
             figs["class_fake_rate_vs_pt"] = _plot_class_fake_rate_vs_pt(pc)
-        if "res_truth_n" in pc:
-            figs["class_residuals"] = _plot_class_residuals(pc)
+        if "class_pt" in pc:
+            figs["class_pt_distribution"] = _plot_class_pt_distribution(pc)
+
+        # --- not in the paper ---------------------------------------------
+        # figs["class_confusion_matrix"] = _plot_class_confusion(pc)
+        # figs["class_pt_response"] = _plot_class_pt_response(pc)
+        # figs["class_pt_resolution"] = _plot_class_pt_resolution(pc)
+        # figs["class_f1_vs_pt"] = _plot_class_f1_vs_pt(pc)
     return figs
 
 
@@ -1430,7 +1452,9 @@ def save_fig(fig, out_dir: Path, name: str, dpi: int) -> None:
         print(f"  [skip] {name}: figure is None")
         return
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ext in ("pdf", "png"):
+    # PDF only -- that is what the paper includes. Add "png" back to the tuple
+    # if a raster copy is wanted for slides.
+    for ext in ("pdf",):
         path = out_dir / f"{name}.{ext}"
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
         print(f"  saved {path}")
