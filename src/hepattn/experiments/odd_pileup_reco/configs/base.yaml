@@ -32,9 +32,13 @@ data:
   # Maximum number of reconstructed particles (for incidence matrix / queries)
   num_objects: &num_reco_particles 400
 
-  train_path: /storage/agrp/barakma/PileupODD/data/fervefvef
-  valid_path: /storage/agrp/barakma/PileupODD/data/vdfvdfdfv
-  test_path: /storage/agrp/barakma/PileupODD/data/vfdfvdf
+  
+  # Depricated ################
+  train_path: /storage/agrp/barakma/PileupODD/data/notused_ignore
+  valid_path: /storage/agrp/barakma/PileupODD/data/notused_ignore
+  test_path: /storage/agrp/barakma/PileupODD/data/notused_ignore
+  ###############################
+
 
   # For backend: mmap this must be the prep_mmap.py output dir (shard_*.pt +
   # shards_index.pt). train_job.sh overrides it to the $TMPDIR/mmap staged copy.
