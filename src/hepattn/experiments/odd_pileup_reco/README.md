@@ -4,6 +4,11 @@ This document is a deep-dive into `TwoStreamMaskFormer` ([model.py](model.py)), 
 `MaskFormer` ([../../models/maskformer.py](../../models/maskformer.py)) and the experiment-local custom copy
 ([maskformer.py](maskformer.py)). Code excerpts are adapted from those files for clarity.
 
+> **Looking for how to *run* this? See [RUNNING.md](RUNNING.md).** It is the only doc that
+> covers operations: environment setup, training, inference, the paper plots
+> (`make_paper_plots.sh`), PUPPI tuning, where the paper artifacts are archived, and the
+> gotchas worth reading before a first run. This document explains only what the model *is*.
+
 ---
 
 ## Table of Contents
