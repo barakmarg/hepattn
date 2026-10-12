@@ -688,6 +688,7 @@ class ODDDatasetPileup(Dataset):
             "node_eta": torch.cat([t_eta, c_eta], -1),
             "node_phi": torch.cat([t_phi, c_phi], -1),
             "node_z0":  torch.cat([t_z0,  torch.zeros(n_clusters, device=t_z0.device)], -1),
+            "node_d0":  torch.cat([t_d0,  torch.zeros(n_clusters, device=t_d0.device)], -1),
             "calo_hs_neutral_energy": torch.cat([torch.zeros(n_tracks), hs_neutral_energy], -1),
             "calo_hs_charged_energy": torch.cat([torch.zeros(n_tracks), hs_charged_energy], -1),
         }
@@ -869,6 +870,7 @@ class ODDDatasetPileup(Dataset):
         labels["node_eta"] = data_dict["node_raw_features"]["node_eta"]
         labels["node_phi"] = data_dict["node_raw_features"]["node_phi"]
         labels["node_z0"]  = data_dict["node_raw_features"]["node_z0"]
+        labels["node_d0"]  = data_dict["node_raw_features"]["node_d0"]
         labels["calo_hs_neutral_energy"] = data_dict["node_raw_features"]["calo_hs_neutral_energy"]
         labels["calo_hs_charged_energy"] = data_dict["node_raw_features"]["calo_hs_charged_energy"]
 

@@ -46,6 +46,12 @@ from hepattn.experiments.odd_pileup_reco.puppi import compute_puppi_weights
 # Loader
 # ---------------------------------------------------------------------------
 
+#: Training loader's data.hard_scatter_energy_threshold (configs/base.yaml, and
+#: the epoch-28 run's frozen config): per-cluster HS target energy at or below
+#: this is treated as zero.
+HS_TARGET_ENERGY_THRESHOLD = 0.1
+
+
 def _pad_to_2d(arr_list, dtype, max_len):
     n = len(arr_list)
     out = np.zeros((n, max_len), dtype=dtype)
@@ -107,7 +113,7 @@ def load_charged_subtract_events(
     out: dict[str, list] = {
         "node_pt": [], "node_eta": [], "node_phi": [], "node_e": [],
         "node_is_track": [], "node_valid": [], "tracks_mask": [],
-        "calo_hs_charged_e": [], "calo_pu_charged_e": [],
+        "calo_hs_charged_e": [], "calo_pu_charged_e": [], "calo_hs_target_e": [],
         "hs_part_pt": [], "hs_part_eta": [], "hs_part_phi": [],
         "event_id": [],
     }
@@ -244,6 +250,18 @@ def load_charged_subtract_events(
         if pu_ch.any():
             np.add.at(cluster_pu_e, deps_c[pu_ch], deps_e[pu_ch])
 
+        # Truth-HS cluster energy exactly as the training loader defines it
+        # (pflow_data.py, calo_hard_scatter_energy): deposits of HS TARGET
+        # particles only -- charged and neutral -- summed per cluster, and zeroed
+        # where that sum is <= HS_TARGET_ENERGY_THRESHOLD. This is what the
+        # network is trained to reconstruct, and the truth-HS calo jet built from
+        # it is the reference of the calo jet comparison. Not used by PUPPI.
+        hs_all = vp_per_dep == 1
+        cluster_hs_target_e = np.zeros(n_cl, dtype=np.float32)
+        if hs_all.any():
+            np.add.at(cluster_hs_target_e, deps_c[hs_all], deps_e[hs_all])
+        cluster_hs_target_e[cluster_hs_target_e <= HS_TARGET_ENERGY_THRESHOLD] = 0.0
+
         # ---- combined node arrays [tracks then clusters] ----
         node_pt   = np.concatenate([tr_pt,  cl_pt])
         node_eta  = np.concatenate([tr_eta, cl_eta])
@@ -259,6 +277,7 @@ def load_charged_subtract_events(
         ])
         calo_hs   = np.concatenate([np.zeros(n_tr, dtype=np.float32), cluster_hs_e])
         calo_pu   = np.concatenate([np.zeros(n_tr, dtype=np.float32), cluster_pu_e])
+        calo_hs_t = np.concatenate([np.zeros(n_tr, dtype=np.float32), cluster_hs_target_e])
 
         # ---- HS truth particles (vertex_primary==1) for truth-jet clustering ----
         hs_mask = (p_vp == 1)
@@ -275,6 +294,7 @@ def load_charged_subtract_events(
         out["tracks_mask"].append(tracks_msk)
         out["calo_hs_charged_e"].append(calo_hs)
         out["calo_pu_charged_e"].append(calo_pu)
+        out["calo_hs_target_e"].append(calo_hs_t)
         out["hs_part_pt"].append(hs_pt)
         out["hs_part_eta"].append(hs_eta)
         out["hs_part_phi"].append(hs_phi)
@@ -419,6 +439,87 @@ def cluster_puppi_charged_subtract_jets(
         "puppi_jet_mass":   np.array(m_l, dtype=object),
         "puppi_jet_nconst": np.array(nc_l, dtype=object),
     }
+
+
+def cluster_puppi_calo_hs_charged_jets(
+    events: dict,
+    weights: np.ndarray,
+    jet_R: float = 0.4,
+    min_constituents: int = 3,
+    min_pt: float = 10.0,
+    *,
+    subtract_pu_charged: bool = True,
+    jet_algorithm: str = "antikt",
+) -> dict:
+    """Calorimeter-only PUPPI jets with the hard-scatter charged energy put back.
+
+    Constituents are the calorimeter clusters alone -- no tracks. Each cluster
+    carries
+
+        E = w_PUPPI * E_neutral_residual  +  E_HS_charged(truth)
+
+    where E_neutral_residual is the same charged-subtracted residual the
+    standard PUPPI weights are computed on, and E_HS_charged is the truth
+    deposit of hard-scatter charged particles in that cluster. So the jet holds
+    the true HS charged calorimeter energy plus PUPPI's estimate of the HS
+    neutral energy: a calo-level jet directly comparable to calo jets built
+    from the model's predicted HS clusters, rather than the track+cluster
+    particle-level PUPPI jet.
+
+    ``weights`` must be the PUPPI weights for these same events (computed once
+    by the caller and shared with the standard PUPPI jets). Returns
+    ``puppicalo_jet_*``.
+    """
+    from hepattn.experiments.odd_pileup_reco.reco_analysis import _cluster_jets_single
+
+    out = {k: [] for k in ("pt", "eta", "phi", "mass", "nconst")}
+    for i in range(len(events["node_pt"])):
+        is_t = events["node_is_track"][i].astype(bool)
+        valid = events["node_valid"][i].astype(bool)
+        eta = events["node_eta"][i].astype(np.float32)
+        phi = events["node_phi"][i].astype(np.float32)
+        e = events["node_e"][i].astype(np.float32)
+        hs_c = events["calo_hs_charged_e"][i].astype(np.float32)
+        pu_c = (events["calo_pu_charged_e"][i].astype(np.float32)
+                if subtract_pu_charged else np.zeros_like(hs_c))
+        residual_e = np.maximum(e - hs_c - pu_c, 0.0)
+        w = np.asarray(weights[i, : len(is_t)], dtype=np.float32)
+        calo_e = w * residual_e + hs_c
+        pt = calo_e / np.cosh(np.clip(eta, -10.0, 10.0))
+        sel = (valid & ~is_t & np.isfinite(pt) & np.isfinite(eta) & np.isfinite(phi) & (pt > 0))
+        res = _cluster_jets_single(np.stack([pt, eta, phi], axis=-1), sel.astype(np.float32),
+                                   0.5, jet_R, min_constituents, min_pt, jet_algorithm=jet_algorithm)
+        for k, v in zip(out, res):
+            out[k].append(v)
+    return {f"puppicalo_jet_{k}": np.array(v, dtype=object) for k, v in out.items()}
+
+
+def cluster_truth_hs_calo_jets_from_events(
+    events: dict,
+    jet_R: float = 0.4,
+    min_constituents: int = 3,
+    min_pt: float = 10.0,
+    jet_algorithm: str = "antikt",
+) -> dict:
+    """Truth-HS calorimeter jets: every cluster at its truth HS target energy
+    (``calo_hs_target_e``), clustered. The reference of the calo comparison --
+    the same jets run_paper_performance_plots builds from the H5
+    ``calo_hs_energy``. Returns ``truth_jet_*``.
+    """
+    from hepattn.experiments.odd_pileup_reco.reco_analysis import _cluster_jets_single
+
+    out = {k: [] for k in ("pt", "eta", "phi", "mass", "nconst")}
+    for i in range(len(events["node_pt"])):
+        is_t = events["node_is_track"][i].astype(bool)
+        eta = events["node_eta"][i].astype(np.float32)
+        phi = events["node_phi"][i].astype(np.float32)
+        pt = events["calo_hs_target_e"][i].astype(np.float32) / np.cosh(np.clip(eta, -10.0, 10.0))
+        sel = events["node_valid"][i].astype(bool) & ~is_t & np.isfinite(pt) & (pt > 0)
+        res = _cluster_jets_single(np.stack([pt, eta, phi], axis=-1), sel.astype(np.float32),
+                                   0.5, jet_R, min_constituents, min_pt, jet_algorithm=jet_algorithm)
+        for k, v in zip(out, res):
+            out[k].append(v)
+    return {f"truth_jet_{k}": np.array(v, dtype=object) for k, v in out.items()}
 
 
 def cluster_truth_hs_jets_from_events(

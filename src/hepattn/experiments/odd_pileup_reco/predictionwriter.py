@@ -296,6 +296,7 @@ class PflowPredictionWriter(Callback):
             ("node_eta", "node_eta", np.float32),
             ("node_phi", "node_phi", np.float32),
             ("node_z0", "node_z0", np.float32),
+            ("node_d0", "node_d0", np.float32),
             ("node_e", "node_e", np.float32),
             ("calo_hs_energy", "calo_hard_scatter_energy", np.float32),
             ("calo_hs_frac", "calo_hard_scatter_energy_frac", np.float32),

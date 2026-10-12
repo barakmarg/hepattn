@@ -429,7 +429,11 @@ def _load_track(f: h5py.File, event_sel: EventSelector) -> dict:
     if "tracks_mask" in nm.dtype.names:
         track_data["truth"] = _read_struct_field(nm, "tracks_mask", np.int32, event_sel)[track_node_mask]
 
-    for field, nm_field in [("pt", "node_pt"), ("eta", "node_eta"), ("z0", "node_z0")]:
+    # d0 is only present in H5s written after node_d0 was added to the writer;
+    # the membership test below keeps older shards loading unchanged.
+    for field, nm_field in [("pt", "node_pt"), ("eta", "node_eta"),
+                            ("phi", "node_phi"), ("z0", "node_z0"),
+                            ("d0", "node_d0")]:
         if nm_field in nm.dtype.names:
             track_data[field] = _read_struct_field(nm, nm_field, np.float32, event_sel)[track_node_mask]
 

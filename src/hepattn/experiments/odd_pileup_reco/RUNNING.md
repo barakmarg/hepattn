@@ -78,7 +78,7 @@ and is referenced from `base.yaml:67` (`scale_dict_path`) — do not delete it.
 
 ### Paper artifacts — `/storage/agrp/barakma/odd_paper/`
 
-**Everything the paper results were produced from is archived here** (385 MB),
+**Everything the paper results were produced from is archived here**,
 outside the repo and outside the churn of `logs/`. Start here if you want to
 reproduce or check a published number.
 
@@ -87,12 +87,36 @@ reproduce or check a published number.
 ├── models/
 │   └── epoch=028-val_loss=10.15650.ckpt          the paper checkpoint (326 MB)
 ├── puppi/
-│   ├── puppi_charged_subtract_v2_antikt_R04_best.{json,db}   <- the one in use
+│   ├── puppi_charged_subtract_v2_antikt_R04_best.{json,db}   <- in use: particle-level PUPPI
+│   ├── puppi_calo_v3setup_best.json, .db, .log              <- in use: PUPPI calo jets
 │   ├── puppi_charged_subtract_v3_10k_best.{json,db}          newer tunings,
 │   └── puppi_charged_subtract_v4_10k_seeded_best.{json,db}   not used for the paper
-├── paper_plots_epoch028_overlay_finetune/         ttbar (in-distribution)
-└── paper_plots_dihiggs_epoch028_overlay_finetune/ dihiggs (out-of-distribution)
+├── e2e/                                           the evaluation driver: run_e2e.sh + configs/
+│   ├── configs/paper_{ttbar,dihiggs}.yaml         FULL eval (whole published samples)
+│   └── runs/<name>/                               H5 predictions + logs per run
+├── paper_plots_current/                           figures from the CURRENT code
+│   ├── ttbar/  dihiggs/                           written by run_e2e.sh configs/paper_*.yaml
+│   └── dataset_comparison/                        overlay vs full sim (model-free)
+└── archive/                                       nothing here is regenerated
+    ├── paper_plots_epoch028_overlay_finetune/         published ttbar figures
+    ├── paper_plots_dihiggs_epoch028_overlay_finetune/ published dihiggs figures
+    ├── paper_plots_restyled_archived_h5/          restyled re-render of the published
+    │                                              H5s (pre-d0)
+    ├── minpt20/                                   jet min pT 20 GeV eval + its script
+    ├── e2e_minpt20/  e2e_preview_plots/           superseded test variant / scratch
 ```
+
+**Full paper evaluation** (forward pass + all figures, both samples, current code):
+
+```bash
+cd /storage/agrp/barakma/odd_paper/e2e
+./run_e2e.sh configs/paper_ttbar.yaml   --stage 23
+./run_e2e.sh configs/paper_dihiggs.yaml --stage 23
+```
+
+Stage 1 is skipped by construction: the configs point `dataset.existing_dir` at
+the published evaluation samples, and new predictions are written under a new
+suffix in `e2e/runs/`, so the H5s the paper came from are never overwritten.
 
 Notes:
 
@@ -204,7 +228,11 @@ resumable.
 
 **Use `make_paper_plots.sh`.** It reproduces the paper figures directly — both
 evaluation samples, with the exact arguments the published figures came from,
-writing the 14 figures per sample that the paper actually uses:
+writing the 38 figures per sample (the 14 the paper uses, plus twenty-four added
+later: two jet $p_T$-residual variants, two multi-method jet comparisons, the per-class ID accuracy and object
+budget, the per-event HS energy recovery, four truth-vs-predicted HS track
+distributions, two for calorimeter clusters and two for Target vs GLOW-UP
+particle η/φ):
 
 ```bash
 ./make_paper_plots.sh                    # -> ./ttbar/ and ./dihiggs/
@@ -244,7 +272,7 @@ dropping PUPPI.
 **Backups.** Everything the paper results came from is archived at
 `/storage/agrp/barakma/odd_paper/` (§2), outside the repo and independent of
 `logs/`: the `epoch=028` checkpoint under `models/`, the PUPPI tuning in use
-under `puppi/`, and the original ttbar and dihiggs figure sets. Those two figure
+under `puppi/`, and the original ttbar and dihiggs figure sets (now under `archive/`). Those two figure
 directories keep their `merged_aggregate.pkl` and `state/`, so if you only want
 to restyle a figure, copy one somewhere writable and point
 `run_paper_performance_plots.py --out-dir` at the copy — it re-renders in
@@ -268,6 +296,24 @@ optuna_puppi_charged_subtract/puppi_charged_subtract_v2_antikt_R04_best.json
 falls back to `puppi_params = {}`, silently running PUPPI with the function's
 default parameters and producing different figures. It is force-added to git
 despite the `*.json` ignore rule; keep it that way.
+
+**Calo-jet tuning.** The calorimeter-level comparison (`jet_relative_pt_calo_vs_hscalo`,
+`jet_delta_{eta,phi}_calo_vs_hscalo`, `jet_residual_box_calo_*`, and the PUPPI calo curve in
+`jet_relative_pt_methods_linear`) uses its own tuning,
+`optuna_puppi_charged_subtract/puppi_calo_v3setup_best.json` (`DEFAULT_BEST_JSON_CALO`,
+`--best-json-calo`). Same algorithm, truth charged subtraction, search space and loss as v2;
+the objective compares PUPPI calo jets (clusters only, PUPPI-weighted neutral residual plus
+truth HS charged energy) with truth-HS calo jets, and it was run at v3 scale on
+`ttbar_pu200_all_vertices_paper_optuna` (7000 search / 2900 validation events, 200 trials,
+selected trial #135). Unlike `DEFAULT_BEST_JSON`, a missing calo JSON is an error. Like it,
+the file is `*.json` and needs `git add -f`. Reproduce with:
+
+```bash
+python -m hepattn.experiments.odd_pileup_reco.optuna_puppi_charged_subtract --target calo \
+  --parquet-dir /storage/agrp/barakma/PileupODD/data/ttbar_pu200_all_vertices_paper_optuna \
+  --jet-algorithm antikt --jet-R 0.4 --n-events 7000 --n-validation-events 3000 \
+  --n-trials 200 --top-k 10 --seed 42 --study-name puppi_calo_v3setup
+```
 
 Three tunings are kept: `v2_antikt_R04` (the one in use), `v3_10k` and
 `v4_10k_seeded`. Each has a `.json` (parameters + provenance: trial number,

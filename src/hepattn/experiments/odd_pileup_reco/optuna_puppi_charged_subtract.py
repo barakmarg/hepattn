@@ -17,6 +17,18 @@ Two-stage selection:
 
 The saved ``*_best.json`` contains the validation-selected params plus the
 full top-K validation table for transparency.
+
+``--target`` picks what the objective compares; everything else -- the data,
+the truth-based charged subtraction, the PUPPI weights, the search space, the
+two-stage selection and the score formula -- is identical between the two:
+
+  particle  PUPPI jets from LV tracks + PUPPI-weighted neutral residual clusters,
+            against truth-HS PARTICLE jets. The original tuning (v2, v3, v4).
+  calo      PUPPI calo jets -- clusters only, PUPPI-weighted neutral residual
+            plus truth HS charged deposit (cluster_puppi_calo_hs_charged_jets) --
+            against truth-HS CALO jets: every cluster at its HS target energy,
+            exactly as the training loader defines it. The setup of the paper's
+            jet_relative_pt_calo_vs_hscalo_linear figure.
 """
 from __future__ import annotations
 
@@ -43,9 +55,11 @@ def _quiet_tqdm() -> None:
 
 def _cluster_truth(events, args):
     from hepattn.experiments.odd_pileup_reco.puppi_charged_subtract import (
-        cluster_truth_hs_jets_from_events,
+        cluster_truth_hs_calo_jets_from_events, cluster_truth_hs_jets_from_events,
     )
-    tj = cluster_truth_hs_jets_from_events(
+    builder = (cluster_truth_hs_calo_jets_from_events if args.target == "calo"
+               else cluster_truth_hs_jets_from_events)
+    tj = builder(
         events, jet_R=args.jet_R,
         min_constituents=args.min_constituents, min_pt=args.min_pt,
         jet_algorithm=args.jet_algorithm,
@@ -66,7 +80,8 @@ def _evaluate_params(events, truth, params, *, subtract_pu, args) -> dict:
     from scipy.stats import iqr as scipy_iqr
 
     from hepattn.experiments.odd_pileup_reco.puppi_charged_subtract import (
-        cluster_puppi_charged_subtract_jets, compute_puppi_weights_charged_subtract,
+        cluster_puppi_calo_hs_charged_jets, cluster_puppi_charged_subtract_jets,
+        compute_puppi_weights_charged_subtract,
     )
     from hepattn.experiments.odd_pileup_reco.reco_analysis import (
         get_jet_residuals, match_jets,
@@ -75,18 +90,26 @@ def _evaluate_params(events, truth, params, *, subtract_pu, args) -> dict:
     weights = compute_puppi_weights_charged_subtract(
         events, subtract_pu_charged=subtract_pu, **params,
     )
-    puppi_jets = cluster_puppi_charged_subtract_jets(
-        events, jet_R=args.jet_R,
-        min_constituents=args.min_constituents, min_pt=args.min_pt,
-        weights=weights, subtract_pu_charged=subtract_pu,
-        jet_algorithm=args.jet_algorithm,
-    )
+    if args.target == "calo":
+        pc = cluster_puppi_calo_hs_charged_jets(
+            events, weights, jet_R=args.jet_R,
+            min_constituents=args.min_constituents, min_pt=args.min_pt,
+            subtract_pu_charged=subtract_pu, jet_algorithm=args.jet_algorithm,
+        )
+        puppi_jets = {k.replace("puppicalo_", "puppi_"): v for k, v in pc.items()}
+    else:
+        puppi_jets = cluster_puppi_charged_subtract_jets(
+            events, jet_R=args.jet_R,
+            min_constituents=args.min_constituents, min_pt=args.min_pt,
+            weights=weights, subtract_pu_charged=subtract_pu,
+            jet_algorithm=args.jet_algorithm,
+        )
 
     n_p = np.array([len(x) for x in puppi_jets["puppi_jet_pt"]])
     mask = (n_p > 0) & (truth["n"] > 0)
     if not mask.any():
         return {"value": 1e6, "bias": float("nan"), "iqr": float("nan"),
-                "nc_rel": float("nan"), "n_matched": 0}
+                "nc_rel": float("nan"), "n_matched": 0, "match_frac": 0.0}
     tr_ix, pr_ix, _ = match_jets(
         puppi_jets["puppi_jet_pt"][mask],
         puppi_jets["puppi_jet_eta"][mask],
@@ -104,7 +127,7 @@ def _evaluate_params(events, truth, params, *, subtract_pu, args) -> dict:
     d = res["dpt_over_truth"]
     if len(d) < 5:
         return {"value": 1e6, "bias": float("nan"), "iqr": float("nan"),
-                "nc_rel": float("nan"), "n_matched": int(len(d))}
+                "nc_rel": float("nan"), "n_matched": int(len(d)), "match_frac": float("nan")}
     bias = float(np.nanmedian(d))
     spread = float(scipy_iqr(d))
 
@@ -121,10 +144,15 @@ def _evaluate_params(events, truth, params, *, subtract_pu, args) -> dict:
     else:
         nc_rel = 0.0
 
+    n_ref = int(truth["n"].sum())
     return {
         "value": abs(bias) + spread + 0.5 * abs(nc_rel),
         "bias": bias, "iqr": spread, "nc_rel": nc_rel,
         "n_matched": int(len(d)),
+        # Fraction of reference jets matched. Recorded, NOT part of the score:
+        # watch it -- a drop would mean the optimiser is buying resolution by
+        # losing soft jets below min_pt.
+        "match_frac": len(d) / n_ref if n_ref else float("nan"),
     }
 
 
@@ -152,6 +180,9 @@ def main() -> int:
     p.add_argument("--study-name", default="puppi_charged_subtract_v3_10k")
     p.add_argument("--no-subtract-pu", action="store_true", default=False,
                    help="If set, subtract only HS-charged (= puppi_perfect mode) for sanity check.")
+    p.add_argument("--target", choices=["particle", "calo"], default="particle",
+                   help="What the objective compares (see module docstring). 'particle' "
+                        "is the original tuning; 'calo' the calo-jet comparison.")
     p.add_argument("--jet-algorithm", type=str, default="antikt", choices=["antikt", "kt"],
                    help="FastJet clustering algorithm (default anti-kT, LHC standard).")
     p.add_argument("--seed-json", type=str, action="append", default=None,
@@ -176,6 +207,7 @@ def main() -> int:
     print("  EXPERIMENT: PUPPI charged-subtract Optuna hyperparameter search", flush=True)
     print("=" * 72, flush=True)
     print(f"  study name        : {args.study_name}", flush=True)
+    print(f"  objective target  : {args.target}", flush=True)
     print(f"  parquet dir       : {args.parquet_dir}", flush=True)
     print(f"  jet clustering    : {args.jet_algorithm}  R={args.jet_R}  "
           f"min_pt={args.min_pt}  min_const={args.min_constituents}  dr_cut={args.dr_cut}",
@@ -228,6 +260,7 @@ def main() -> int:
         trial.set_user_attr("iqr", m["iqr"])
         trial.set_user_attr("nc_rel", m["nc_rel"])
         trial.set_user_attr("n_matched", m["n_matched"])
+        trial.set_user_attr("match_frac", m["match_frac"])
         return m["value"]
 
     sampler = optuna.samplers.TPESampler(seed=args.seed)
@@ -343,13 +376,15 @@ def main() -> int:
             "val_iqr": m["iqr"],
             "val_nc_rel": m["nc_rel"],
             "val_n_matched": m["n_matched"],
+            "val_match_frac": m["match_frac"],
+            "search_match_frac": tr.user_attrs.get("match_frac"),
         }
         val_table.append(row)
         print(f"  [{rank:2d}] trial #{tr.number:<4d}  "
               f"search={tr.value:.4f}  "
               f"val={m['value']:.4f}  "
               f"(bias={m['bias']:+.4f}  IQR={m['iqr']:.4f}  "
-              f"nc_rel={m['nc_rel']:+.4f}  N={m['n_matched']})",
+              f"nc_rel={m['nc_rel']:+.4f}  N={m['n_matched']}  f={m['match_frac']:.3f})",
               flush=True)
     print(f"  Validation pass took {time.time()-t1:.0f}s.", flush=True)
 
@@ -388,8 +423,15 @@ def main() -> int:
         "search_best_value": bt.value,
         "search_best_params": bt.params,
         "n_trials": len(study.trials),
+        "target": args.target,
+        "parquet_dir": str(args.parquet_dir),
+        "best_match_frac": chosen.get("val_match_frac"),
+        # Requested vs actually loaded: the dataset may end before the request
+        # (v3 asked for 3000 validation events and got 2900).
         "n_events": args.n_events,
+        "n_events_loaded": int(len(events["node_pt"])),
         "n_validation_events": args.n_validation_events,
+        "n_validation_events_loaded": int(len(val_events["node_pt"])),
         "top_k": args.top_k,
         "subtract_pu_charged": subtract_pu,
         "jet_algorithm": args.jet_algorithm,
