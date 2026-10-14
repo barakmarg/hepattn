@@ -837,7 +837,8 @@ class ODDDatasetPileup(Dataset):
         inputs = {
             "node_features": data_dict["node_inp_features"],
             "node_valid": data_dict["node_q_mask"],
-            "node_eta": data_dict["node_eta"],
+            # Physical eta: the posenc and IncidenceBasedRegressionTask scale it themselves.
+            "node_eta": data_dict["node_raw_features"]["node_eta"],
             "node_phi": data_dict["node_phi"],
             "node_deltaR_idx": data_dict["node_deltaR_idx"],
             "node_e": data_dict["node_raw_features"]["total_e"],

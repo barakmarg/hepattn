@@ -167,7 +167,8 @@ model:
                   init_args:
                     input_name: node
                     dim: *dim
-                    fields: [eta, phi]
+                    # phi as (sin, cos): periodic, so phi = +-pi encode identically
+                    fields: [eta, sinphi, cosphi]
                     scale: 0.1
 
       # Sort field for windowed attention

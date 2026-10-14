@@ -55,5 +55,5 @@ CKPT=/storage/agrp/barakma/hepattn/src/hepattn/experiments/odd_pileup_reco/logs/
 python main.py fit --config configs/base.yaml \
     --data.backend mmap \
     --data.unify_path "$DST_MMAP" \
-    --model.init_from_ckpt "$CKPT"
+    #--model.init_from_ckpt "$CKPT"
 popd
